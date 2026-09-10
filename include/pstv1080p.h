@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0100u      /* 1.0 */
+#define PSTV1080P_VERSION            0x0101u      /* 1.1 */
 
 /* Persistent kernel state (ur0 is always mounted when kernel plugins start). */
 #define PSTV1080P_CFG_PATH           "ur0:tai/pstv1080p.cfg"
@@ -86,7 +86,7 @@ typedef struct pstv1080p_info {
     uint32_t last_system_mode;    /* last mode Sony's code asked for via sceAVConfigHdmiSetResolution (0 = never seen) */
     int32_t  last_apply_result;   /* return value of the last sceAVConfigHdmiSetResolution we issued */
     uint32_t hooks_ok;            /* bitmask: bit0 AVConfig hook, bit1.. frame pacing hooks (see kernel) */
-    uint32_t reserved[7];
+    uint32_t reserved[7];         /* [0] apply attempts this episode, [1] this session, [2] learned alias readback, [3] attempt pending (v1.1) */
 } pstv1080p_info_t;               /* 64 bytes */
 
 #define PSTV1080P_STATIC_ASSERT(cond, name) typedef char pstv1080p_assert_##name[(cond) ? 1 : -1]

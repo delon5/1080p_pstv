@@ -42,6 +42,22 @@ for how they differ.
 - [Credits](#credits)
 - [License](#license)
 
+## Changelog
+
+- **1.1 (2026-09-11)** — first hardware test found that the entry and the
+  switch from Settings work, but after a reboot the console stayed at the
+  Sony-selected mode (480p) while Settings still showed 1080p. Cause: the
+  boot-time apply from the kernel worker thread did not take effect and v1.0
+  then recorded the unchanged 480p readback as "expected", so the watchdog
+  never retried. Fixed: an apply now only counts when the driver readback
+  actually changes; the boot-time attempt is executed from SceShell's own
+  display syscalls (a user-process context like the Settings path that works)
+  with a thread fallback after 10 s; ineffective attempts are retried with
+  backoff (3, 5, 8, 12, 20, 30, 45, 60 s), at most 10 per episode and 30 per
+  boot. `kernel.log` lines `apply(shell|thread|watchdog): attempt N ...
+  EFFECTIVE / not effective` show what happened.
+- **1.0 (2026-09-10)** — initial release.
+
 ## What it does
 
 The PS TV's HDMI encoder can output 1080p at 30 Hz, but Sony's Settings app

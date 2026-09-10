@@ -88,3 +88,8 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - All hooks are taiHEN runtime hooks (taiHookFunctionExportForKernel / taiHookFunctionImport) released in module_stop; no code patching of system modules on disk, no taiInject of persistent data.
 - Files this project creates (all our own, all safe to delete): `ur0:tai/pstv1080p.cfg` (64-byte state), `ur0:tai/pstv1080p.boot` (boot marker, normally deleted ~2 min after boot), optional `ur0:tai/pstv1080p_titles.txt` (user-authored), and diagnostics under `ux0:data/pstv1080p/`. Uninstall = remove the two config.txt lines and delete those files.
 - The README must contain a "What this touches" section stating exactly the above.
+
+## F. v1.1 change (after hardware test 1)
+- Settings-path apply works on hardware; the kernel-thread boot apply did not take effect (driver kept reporting 0x8300) and the v1.0 "expected readback" latch then suppressed retries.
+- New rule: an apply is EFFECTIVE only if ksceDisplayGetOutputMode changes (to hd_mode_code, or to a new plausible value which becomes the alias). Unchanged readback = not applied.
+- Boot-time attempt is scheduled by the thread and executed from SceShell's display syscalls (_sceDisplaySetFrameBuf, sceDisplayWaitVblankStart*, sceDisplayWaitSetFrameBufMulti*) via the existing kernel export hooks, i.e. in a user-process syscall context; thread fallback after 10 s. Retries with backoff, 10/episode, 30/session. Re-entrancy guard + try-lock so a frame flip never blocks behind the watchdog.

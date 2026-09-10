@@ -31,16 +31,19 @@
  *     call it records the applied code and what ksceDisplayGetOutputMode
  *     reports for it (g_applied_mode / g_applied_readback).
  *
- *  3. A low-priority kernel thread performs the boot-time apply (after
- *     SceShell exists + boot_apply_delay_ms), removes the safe-boot marker
- *     once the console survived safe_boot_seconds, and acts as a watchdog
- *     that re-applies the mode if it drifted.  "Drifted" means the driver
- *     reports neither hd_mode_code nor the readback the last successful apply
- *     of hd_mode_code produced (expected_hd_readback()).  Rate-limited: at
- *     most one apply per 5 s, and every apply that fails OR succeeds without
- *     the readback matching hd_mode_code ("ineffective") counts towards the
- *     5-failure budget, after which it gives up until the state changes.
- *     So the watchdog can never become a periodic HDMI renegotiation.
+ *  3. Boot-time apply (v1.1): a low-priority kernel thread waits for SceShell
+ *     + boot_apply_delay_ms and then SCHEDULES an attempt.  The attempt is
+ *     executed from SceShell's next _sceDisplaySetFrameBuf syscall (a user
+ *     process context, like the Settings-app path that is known to work on
+ *     hardware); if no shell frame picks it up within 10 s the thread runs it
+ *     itself.  An attempt counts as EFFECTIVE only if the driver readback
+ *     actually changed (to hd_mode_code, or to a new value that becomes the
+ *     "alias").  Ineffective attempts are retried with backoff (3,5,8,12,20,
+ *     30,45,60 s...), at most 10 per drift episode and 30 per boot session.
+ *     The same thread removes the safe-boot marker once the console survived
+ *     safe_boot_seconds and acts as a watchdog that starts a new (bounded)
+ *     episode if the driver later reports a non-HD mode.  Rate-limited to one
+ *     attempt per 5 s, so it can never become a periodic HDMI renegotiation.
  *
  *  4. Safe boot: at module_start, if 1080p is enabled and the marker file
  *     ur0:tai/pstv1080p.boot still exists, the previous boot in 1080p did not
@@ -74,15 +77,17 @@
  *      wiki.henkaku.xyz (0x10 = 30 Hz).  ksceDisplayGetRefreshRateInternal is
  *      used only as a logged cross-check, never as the source of truth.
  *  A3. ksceDisplayGetOutputMode(1, ...) reports the mode previously set via
- *      sceAVConfigHdmiSetResolution (used by the watchdog to detect drift).
- *      If it reports a different encoding (no 0x8000 flag, an internal VIC,
- *      the display-controller mode...), that readback is recorded after the
- *      first successful apply and treated as "1080p in effect" from then on
- *      (and the refresh rate is derived from the code we applied, not from
- *      the readback), so the watchdog does not re-apply every period; that
- *      first apply is still counted as ineffective, so at worst 5 applies
- *      happen per state change.  If the driver silently refuses the mode and
- *      keeps reporting a Sony code, the same logic stops after 5 tries.
+ *      sceAVConfigHdmiSetResolution (used to decide whether an apply took
+ *      effect and to detect drift).  If it uses a different encoding, the
+ *      readback that appears when an apply visibly changes the driver state
+ *      is learned as the alias of hd_mode_code (refresh rate then derived
+ *      from the code we applied).  A readback that does not change at all
+ *      means the apply did NOT work and is retried (v1.0 wrongly latched it).
+ *  A9. Hardware test 1 (v1.0): Settings-path apply works; the boot-time apply
+ *      from the kernel worker thread left the driver at 480p.  Whether that
+ *      is the calling context (no user process) or timing is unknown; v1.1
+ *      does the attempt from SceShell's SetFrameBuf syscall and retries with
+ *      backoff, which covers both explanations.  kernel.log shows which.
  *  A8. _sceDisplaySetFrameBuf (0xF51523CB) is hooked unconditionally at
  *      module_start (DESIGN A.3 lists it as "FORCE+inject only"); the hook
  *      passes straight through unless fps_mode == FORCE && fps_inject.  This
@@ -173,8 +178,10 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
-#define MAX_CONSECUTIVE_FAILURES      5
+#define APPLY_MAX_ATTEMPTS_EPISODE    10             /* attempts per drift episode */
+#define APPLY_MAX_TOTAL_SESSION       30             /* hard cap per boot session */
 #define APPLY_MIN_INTERVAL_US         (5u * 1000u * 1000u)
+#define APPLY_SHELL_FALLBACK_US       (10u * 1000u * 1000u) /* no SceShell frame took the job -> thread does it */
 #define SHELL_WAIT_POLL_US            (500u * 1000u)
 #define SHELL_WAIT_MAX_POLLS          120            /* 60 s */
 #define THREAD_TICK_US                (250u * 1000u)
@@ -221,6 +228,8 @@ static volatile uint32_t g_current_output_mode = 0;
 static volatile uint32_t g_last_system_mode = 0;   /* what Sony asked for (plausible, never our own code) */
 static volatile uint32_t g_applied_mode = 0;       /* last mode a successful SetResolution applied (anyone's call) */
 static volatile uint32_t g_applied_readback = 0;   /* what GetOutputMode reported right after that apply, 0 = unknown */
+static volatile uint32_t g_hd_alias = 0;           /* driver's own readback for hd_mode_code, learned only when an apply
+                                                    * visibly changed the readback to something other than our code */
 static volatile int32_t  g_last_apply_result = 0;  /* result of the last call WE issued */
 static volatile int32_t  g_last_setres_ret = 0;    /* result of the last call anyone issued */
 static volatile int      g_self_apply = 0;         /* set while we call the export ourselves */
@@ -244,8 +253,13 @@ static char g_titles[TITLE_LIST_MAX][TITLE_ID_LEN];
 /* Thread / watchdog */
 static SceUID g_thread_uid = -1;
 static volatile int g_thread_stop = 0;
-static uint32_t g_consecutive_failures = 0;
+static uint32_t g_apply_attempts = 0;              /* attempts in the current drift episode */
+static uint32_t g_apply_total = 0;                 /* attempts this boot session */
+static volatile SceInt64 g_apply_due_us = 0;       /* earliest time the scheduled attempt may run */
+static volatile int g_apply_pending = 0;           /* an attempt is scheduled (run from SceShell's syscall context when possible) */
+static volatile int g_in_apply = 0;                /* an apply is executing (re-entrancy guard for the SetFrameBuf hook) */
 static SceInt64 g_last_apply_time = 0;
+static const uint32_t k_apply_backoff_s[APPLY_MAX_ATTEMPTS_EPISODE] = { 3, 5, 8, 12, 20, 30, 45, 60, 60, 60 };
 static volatile int g_marker_pending = 0;   /* marker file exists and must be removed after safe_boot_seconds */
 static int g_boot_apply_done = 0;
 
@@ -372,8 +386,8 @@ static int refresh_display_cache(int do_log)
 
     if (ret >= 0) {
         g_current_output_mode = mode;
-        if (g_applied_mode != 0 && g_applied_readback != 0 && (uint32_t)mode == g_applied_readback)
-            g_refresh_hz = refresh_from_mode(g_applied_mode);
+        if (g_hd_alias != 0 && (uint32_t)mode == g_hd_alias)
+            g_refresh_hz = refresh_from_mode(g_cfg.hd_mode_code);
         else
             g_refresh_hz = refresh_from_mode(mode);
     }
@@ -685,9 +699,22 @@ static inline unsigned int pace_vcount(uint32_t mode, unsigned int vcount)
     return vcount;
 }
 
+static void run_pending_apply(const char *ctx);
+
+/* Boot / re-apply trigger (v1.1): when an attempt is scheduled, execute it
+ * from the first SceShell display syscall that comes along (frame flip or
+ * vblank wait), i.e. from a user-process syscall context.  One volatile load
+ * per call when nothing is pending. */
+static inline void shell_apply_check(void)
+{
+    if (g_apply_pending && g_shell_pid > 0 && ksceKernelGetProcessId() == g_shell_pid)
+        run_pending_apply("shell");
+}
+
 static int hook_WaitVblankStartMulti(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
     return HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
@@ -696,6 +723,7 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
 static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
     return HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
@@ -704,6 +732,7 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 static int hook_WaitVblankStart(void)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
         if (interval > 1)
@@ -716,6 +745,7 @@ static int hook_WaitVblankStart(void)
 static int hook_WaitVblankStartCB(void)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
         if (interval > 1)
@@ -727,6 +757,7 @@ static int hook_WaitVblankStartCB(void)
 static int hook_WaitSetFrameBufMulti(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
     return HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
@@ -735,6 +766,7 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
 static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    shell_apply_check();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
     return HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
@@ -745,6 +777,8 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
     int ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
     if (g_cfg.fps_inject && pacing_mode_for_caller() == PSTV1080P_FPS_FORCE)
         ksceDisplayWaitVblankStartMulti(force_interval());
+    /* After the flip: run a scheduled HD apply from SceShell's context (A9). */
+    shell_apply_check();
     return ret;
 }
 
@@ -781,15 +815,42 @@ static uint32_t record_applied(uint32_t mode, int do_log)
     return g_applied_readback;
 }
 
-/* The readback value the watchdog treats as "1080p is in effect": if the last
- * successful apply of hd_mode_code produced a different readback, that value
- * (the driver's own encoding of our mode, or its silent refusal - we cannot
- * tell), otherwise hd_mode_code itself.  Caller holds the lock. */
-static uint32_t expected_hd_readback(void)
+/* "1080p is in effect" = the driver reports our code, or the alias readback
+ * we learned from an apply that visibly changed the driver state. */
+static int hd_in_effect(uint32_t cur)
 {
-    if (g_applied_mode == g_cfg.hd_mode_code && g_applied_readback != 0)
-        return g_applied_readback;
-    return g_cfg.hd_mode_code;
+    if (cur == g_cfg.hd_mode_code)
+        return 1;
+    if (g_hd_alias != 0 && cur == g_hd_alias)
+        return 1;
+    return 0;
+}
+
+static void apply_clear_schedule(void)
+{
+    g_apply_pending = 0;
+    g_apply_due_us = 0;
+}
+
+/* Schedule the next attempt of the current episode with backoff; give up
+ * when the episode or session budget is exhausted.  Caller holds the lock. */
+static void apply_schedule_retry(void)
+{
+    uint32_t n = g_apply_attempts;   /* attempts already made in this episode, >= 1 */
+    uint32_t idx = n ? n - 1 : 0;
+
+    if (n >= APPLY_MAX_ATTEMPTS_EPISODE || g_apply_total >= APPLY_MAX_TOTAL_SESSION) {
+        apply_clear_schedule();
+        klog("apply: giving up (episode %u/%u, session %u/%u); select the mode again in Settings to restart",
+             (unsigned)n, (unsigned)APPLY_MAX_ATTEMPTS_EPISODE,
+             (unsigned)g_apply_total, (unsigned)APPLY_MAX_TOTAL_SESSION);
+        return;
+    }
+    if (idx >= APPLY_MAX_ATTEMPTS_EPISODE)
+        idx = APPLY_MAX_ATTEMPTS_EPISODE - 1;
+    g_apply_due_us = now_us() + (SceInt64)k_apply_backoff_s[idx] * 1000000LL;
+    g_apply_pending = 1;
+    klog("apply: retry %u scheduled in %u s", (unsigned)(n + 1), (unsigned)k_apply_backoff_s[idx]);
 }
 
 static int hook_HdmiSetResolution(int mode)
@@ -835,57 +896,102 @@ static int call_set_resolution(uint32_t mode)
  * Returns 0 on success or nothing to do, <0 on error.  Caller holds the lock. */
 static int apply_hd_mode(const char *why)
 {
-    unsigned int cur = 0, pf = 0;
-    int gret, ret;
+    unsigned int before = 0, after = 0, pf = 0;
+    int gb, ga, ret, effective;
 
     if (!g_cfg.mode_1080p)
         return 0;
 
-    gret = ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf);
-    if (gret >= 0 && (cur == g_cfg.hd_mode_code || cur == expected_hd_readback())) {
-        /* Already there (or at the readback the last successful apply of
-         * this code produced, e.g. SceShell's own apply went through the
-         * hook a moment ago): nothing to do, no extra HDMI renegotiation. */
+    gb = ksceDisplayGetOutputMode(HDMI_HEAD, &before, &pf);
+    if (gb >= 0 && hd_in_effect(before)) {
+        /* Already there: nothing to do, no extra HDMI renegotiation. */
         refresh_display_cache(0);
-        g_consecutive_failures = 0;
+        g_apply_attempts = 0;
+        apply_clear_schedule();
         return 0;
     }
 
-    ret = call_set_resolution(g_cfg.hd_mode_code);
-    klog("apply(%s): cur=0x%04X (get=0x%08X) -> SetResolution(0x%04X) ret=0x%08X",
-         why, cur, (unsigned)gret, (unsigned)g_cfg.hd_mode_code, (unsigned)ret);
-
-    if (ret < 0) {
-        g_consecutive_failures++;
-        if (g_consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
-            klog("apply: %u consecutive failures, retries suspended until state changes",
-                 (unsigned)g_consecutive_failures);
-        return ret;
+    if (g_apply_total >= APPLY_MAX_TOTAL_SESSION) {
+        apply_clear_schedule();
+        return PSTV1080P_ERR_APPLY_FAILED;
     }
+    g_apply_attempts++;
+    g_apply_total++;
 
-    /* The call succeeded.  Read back what the driver now reports (the hook
-     * already did this if it is installed; harmless to repeat, and it is the
-     * only readback when the hook failed to install).  A readback that still
-     * differs from hd_mode_code is either the driver's own encoding of our
-     * mode or a silent refusal - we cannot tell, so it counts as a failure
-     * for the retry budget: the watchdog then leaves that readback alone and
-     * at most MAX_CONSECUTIVE_FAILURES re-applies ever happen until the state
-     * changes.  Never fight the system or hammer the TV. */
-    {
-        uint32_t rb = record_applied(g_cfg.hd_mode_code, !(g_hooks_ok & HOOK_BIT_AVCONFIG));
-        if (rb != 0 && rb != g_cfg.hd_mode_code) {
-            g_consecutive_failures++;
-            klog("apply(%s): success but driver reports 0x%04X, not 0x%04X; counted as ineffective (%u/%u), watchdog now expects 0x%04X",
-                 why, (unsigned)rb, (unsigned)g_cfg.hd_mode_code,
-                 (unsigned)g_consecutive_failures, (unsigned)MAX_CONSECUTIVE_FAILURES, (unsigned)rb);
-            if (g_consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
-                klog("apply: %u consecutive failures, retries suspended until state changes",
-                     (unsigned)g_consecutive_failures);
-            return 0;   /* the syscall itself succeeded */
+    g_in_apply = 1;
+    ret = call_set_resolution(g_cfg.hd_mode_code);
+    g_in_apply = 0;
+
+    ga = ksceDisplayGetOutputMode(HDMI_HEAD, &after, &pf);
+
+    /* An apply counts only if the driver state actually changed: either it
+     * now reports our code, or it reports something new that is neither the
+     * mode it had before nor the mode Sony last asked for (then that value is
+     * the driver's own encoding of our mode and becomes the alias).  A call
+     * that "succeeds" but leaves the readback untouched is NOT a success:
+     * this is exactly what happened on the first hardware test (boot apply
+     * from the kernel thread, readback stayed 0x8300, v1.0 latched it). */
+    effective = 0;
+    if (ret >= 0 && ga >= 0) {
+        if ((uint32_t)after == g_cfg.hd_mode_code) {
+            effective = 1;
+        } else if (gb >= 0 && after != before && (uint32_t)after != g_last_system_mode
+                   && mode_code_plausible((uint32_t)after)) {
+            effective = 1;
+            g_hd_alias = (uint32_t)after;
         }
     }
-    g_consecutive_failures = 0;
-    return 0;
+
+    klog("apply(%s): attempt %u (session %u): before=0x%04X -> SetResolution(0x%04X) ret=0x%08X, after=0x%04X (get=0x%08X/0x%08X) %s%s",
+         why, (unsigned)g_apply_attempts, (unsigned)g_apply_total, before,
+         (unsigned)g_cfg.hd_mode_code, (unsigned)ret, after, (unsigned)gb, (unsigned)ga,
+         effective ? "EFFECTIVE" : "not effective",
+         (effective && (uint32_t)after != g_cfg.hd_mode_code) ? " (alias learned)" : "");
+
+    if (effective) {
+        g_apply_attempts = 0;
+        apply_clear_schedule();
+        refresh_display_cache(1);
+        return 0;
+    }
+
+    apply_schedule_retry();
+    if (ret < 0)
+        return ret;
+    return 0;   /* the syscall itself succeeded; the retry schedule covers the rest */
+}
+
+/* Execute a scheduled attempt if it is due.  Safe to call from the SetFrameBuf
+ * hook (SceShell's syscall context) and from the worker thread.  Uses a
+ * try-lock so a frame flip never blocks behind the watchdog, and skips while
+ * another apply is in progress (re-entrancy guard). */
+static void run_pending_apply(const char *ctx)
+{
+    int locked;
+
+    if (!g_apply_pending || g_in_apply)
+        return;
+    if (now_us() < g_apply_due_us)
+        return;
+
+    if (g_mutex >= 0) {
+        if (ksceKernelTryLockMutex(g_mutex, 1) < 0)
+            return;
+        locked = 1;
+    } else {
+        locked = 0;
+    }
+
+    if (g_apply_pending && !g_in_apply && now_us() >= g_apply_due_us) {
+        g_apply_pending = 0;
+        if (g_cfg.mode_1080p)
+            apply_hd_mode(ctx);      /* reschedules itself if not effective */
+        else
+            apply_clear_schedule();
+    }
+
+    if (locked)
+        ksceKernelUnlockMutex(g_mutex, 1);
 }
 
 /* Return to the Sony-selected mode after the user turned 1080p off.
@@ -924,7 +1030,8 @@ static int state_changed(int old_enabled, const char *why)
     int save_ret = config_save();
     int ret = 0;
 
-    g_consecutive_failures = 0;
+    g_apply_attempts = 0;
+    apply_clear_schedule();
 
     if (!g_cfg.mode_1080p) {
         /* Disabled at runtime: the marker must not survive into the next boot. */
@@ -988,19 +1095,24 @@ static void watchdog_tick(void)
 
     gret = ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf);
     if (gret >= 0) {
-        uint32_t expect = expected_hd_readback();
         if (cur != g_current_output_mode) {
             klog("watchdog: output mode changed 0x%04X -> 0x%04X", (unsigned)g_current_output_mode, cur);
             refresh_display_cache(1);
         }
-        /* Drift = the driver reports neither our code nor the readback our
-         * last successful apply of it produced.  Every apply that fails or
-         * proves ineffective counts against MAX_CONSECUTIVE_FAILURES, so
-         * this can never turn into a periodic HDMI renegotiation. */
-        if (cur != g_cfg.hd_mode_code && cur != expect
-            && g_consecutive_failures < MAX_CONSECUTIVE_FAILURES
-            && (now_us() - g_last_apply_time) >= (SceInt64)APPLY_MIN_INTERVAL_US) {
-            apply_hd_mode("watchdog");
+        if (hd_in_effect(cur)) {
+            if (g_apply_attempts != 0 || g_apply_pending) {
+                klog("watchdog: HD mode in effect (0x%04X)", cur);
+                g_apply_attempts = 0;
+                apply_clear_schedule();
+            }
+        } else if (!g_apply_pending && g_apply_attempts == 0
+                   && g_apply_total < APPLY_MAX_TOTAL_SESSION
+                   && (now_us() - g_last_apply_time) >= (SceInt64)APPLY_MIN_INTERVAL_US) {
+            /* New drift episode (e.g. the system re-applied its own mode after
+             * an HDMI re-plug).  Bounded by the episode and session budgets. */
+            klog("watchdog: drift, driver reports 0x%04X; scheduling re-apply", cur);
+            g_apply_due_us = now_us();
+            g_apply_pending = 1;
         }
     }
     unlock();
@@ -1035,8 +1147,18 @@ static int pstv1080p_thread(SceSize args, void *argp)
 
     lock();
     refresh_display_cache(1);
-    if (g_cfg.mode_1080p)
-        apply_hd_mode("boot");
+    if (g_cfg.mode_1080p) {
+        unsigned int cur = 0, pf = 0;
+        if (ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf) >= 0 && hd_in_effect(cur)) {
+            klog("boot: HD mode already in effect (0x%04X)", cur);
+        } else {
+            g_apply_attempts = 0;
+            g_apply_due_us = now_us();
+            g_apply_pending = 1;
+            klog("boot: apply scheduled, waiting for a SceShell frame (thread fallback after %u s)",
+                 (unsigned)(APPLY_SHELL_FALLBACK_US / 1000000u));
+        }
+    }
     g_boot_apply_done = 1;
     unlock();
 
@@ -1047,6 +1169,11 @@ static int pstv1080p_thread(SceSize args, void *argp)
             break;
 
         marker_tick();
+
+        /* Fallback: if no SceShell frame flip picked up the scheduled attempt
+         * within APPLY_SHELL_FALLBACK_US of it becoming due, do it from here. */
+        if (g_apply_pending && (now_us() - g_apply_due_us) >= (SceInt64)APPLY_SHELL_FALLBACK_US)
+            run_pending_apply("thread");
 
         if (g_shell_pid <= 0) {
             SceUID sp = ksceKernelSysrootGetShellPid();
@@ -1120,7 +1247,8 @@ int pstv1080pSetConfig(const pstv1080p_config_t *in)
         ret = state_changed(old_enabled, "SetConfig");
     } else {
         ret = config_save();
-        g_consecutive_failures = 0;   /* hd_mode_code may have changed: allow retries */
+        g_apply_attempts = 0;         /* hd_mode_code may have changed: allow a fresh episode */
+        apply_clear_schedule();
     }
     unlock();
     return ret;
@@ -1140,7 +1268,8 @@ int pstv1080pSetMode1080p(int enable)
     } else if (want) {
         /* Already on: persist and make sure the output really is in HD mode. */
         ret = config_save();
-        g_consecutive_failures = 0;
+        g_apply_attempts = 0;
+        apply_clear_schedule();
         {
             int a = apply_hd_mode("SetMode1080p(re-apply)");
             if (ret == 0)
@@ -1178,6 +1307,10 @@ int pstv1080pGetInfo(pstv1080p_info_t *out)
     info.last_system_mode    = g_last_system_mode;
     info.last_apply_result   = g_last_apply_result;
     info.hooks_ok            = g_hooks_ok;
+    info.reserved[0]         = g_apply_attempts;
+    info.reserved[1]         = g_apply_total;
+    info.reserved[2]         = g_hd_alias;
+    info.reserved[3]         = (uint32_t)g_apply_pending;
     unlock();
 
     ret = ksceKernelCopyToUser(out, &info, sizeof(info));
