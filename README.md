@@ -1,0 +1,624 @@
+# pstv1080p — a native "1080p (30 Hz)" option for the PlayStation TV
+
+> **Status: built, NOT yet tested on real hardware.**
+> The author does not currently own a PS TV. Everything below describes what the
+> code is designed to do, verified only by compiling it and by reverse engineering
+> the original plugin and Sony's modules. Please read
+> [First test on hardware](#first-test-on-hardware) before installing, keep a way
+> to reach `ur0:tai/` without the Settings app (FTP/VitaShell, safe mode), and
+> send back the log files described there.
+
+`pstv1080p` is a pair of taiHEN plugins for the PlayStation TV (PS TV / Vita TV)
+that add a real **"1080p (30 Hz)"** entry to
+*Settings > Sound & Display > HDMI resolution*, remember your choice, apply it
+automatically at every boot, and keep games' frame pacing correct while the
+console is outputting 30 Hz.
+
+It grew out of gameblabla's `1080p_pstv` (which silently turned every
+resolution change into 1080p30) and the "480p → 1080p30" remap variant that
+was built from it. This version is a rewrite; see the
+[technical appendix](#appendix-how-the-original-plugin-worked-and-what-changed)
+for how they differ.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Things to know before enabling 1080p](#things-to-know-before-enabling-1080p)
+- [What this touches (and how to uninstall)](#what-this-touches-and-how-to-uninstall)
+- [Frame pacing (SCALE / FORCE)](#frame-pacing)
+- [Compatibility with Framecapper and Sharpscale](#compatibility-with-other-plugins)
+- [Diagnostics and reporting issues](#diagnostics-and-reporting-issues)
+- [First test on hardware](#first-test-on-hardware)
+- [Developer section](#developer-section)
+  - [Building](#building)
+  - [Repository layout](#repository-layout)
+  - [Config file `ur0:tai/pstv1080p.cfg`](#config-file-ur0taipstv1080pcfg)
+  - [Frame-pacing model](#frame-pacing-model)
+  - [Safe-boot revert rule](#safe-boot-revert-rule)
+  - [Kernel syscall API](#kernel-syscall-api)
+- [Appendix: how the original plugin worked and what changed](#appendix-how-the-original-plugin-worked-and-what-changed)
+- [Credits](#credits)
+- [License](#license)
+
+## What it does
+
+The PS TV's HDMI encoder can output 1080p at 30 Hz, but Sony's Settings app
+only offers 480p, 720p and 1080i. This project:
+
+1. **Adds a native Settings entry.** A user-side plugin loaded into the Settings
+   app (`pstv1080p_settings.suprx`) inserts an extra `list_item` into the HDMI
+   resolution list and shows it as **"1080p (30 Hz)"**. Existing entries are
+   left exactly as they are — this is not a remap of 480p or any other mode.
+2. **Remembers the choice in its own state file**, never in Sony's registry.
+   The value the Settings app sees for the "1080p" item is served by the plugin;
+   Sony's `/CONFIG/DISPLAY/hdmi_resolution_mode` registry key is never written
+   with a value Sony's firmware does not know about.
+3. **Applies 1080p30 automatically at boot** and re-applies it if the output
+   mode drifts (HDMI re-plug, a system component switching modes), from a
+   kernel plugin (`pstv1080p.skprx`).
+4. **Keeps frame pacing sane at 30 Hz.** At 30 Hz there are only 30 vblanks per
+   second, so a game that "waits 2 vblanks" to run at 30 fps would drop to
+   15 fps. The kernel plugin rescales those waits so a 30 fps title stays at
+   30 fps (and can optionally act as a refresh-rate-aware Framecapper).
+5. **Reverts itself if a 1080p boot goes wrong** (see
+   [safe-boot revert](#things-to-know-before-enabling-1080p)).
+
+## Requirements
+
+- A PlayStation TV (VTE-1000 series). This does nothing useful on a handheld Vita.
+- HENkaku / taiHEN (Enso recommended) on firmware **3.60 – 3.74**.
+- A display that accepts **1080p at 30 Hz** over HDMI (most TVs do; see below).
+- A way to edit `ur0:tai/config.txt` and to delete files from `ur0:tai/`
+  (VitaShell, FTP, etc.).
+
+## Install
+
+1. Copy the two built modules to `ur0:tai/`:
+   - `pstv1080p.skprx`
+   - `pstv1080p_settings.suprx`
+2. Edit `ur0:tai/config.txt` and add the lines shown below. `*KERNEL` and
+   `*NPXS10015` sections usually already exist (HENkaku's own `henkaku.suprx` is
+   listed under `*NPXS10015`); just add the new line inside each section.
+
+   ```
+   *KERNEL
+   ur0:tai/pstv1080p.skprx
+
+   *NPXS10015
+   ur0:tai/pstv1080p_settings.suprx
+   ```
+
+3. **Remove** any other plugin that hooks the HDMI resolution or caps frame
+   rate: the old `1080p.skprx` / `1080p_480phook.skprx`, and every
+   `Framecapper*.suprx` line (see
+   [compatibility](#compatibility-with-other-plugins)).
+4. Reboot.
+5. Open *Settings > Sound & Display > HDMI resolution*. The list should now
+   contain **"1080p (30 Hz)"** after Sony's entries. Select it. The picture
+   should switch to 1080p30 right away and stay 1080p30 across reboots.
+
+To go back, simply select one of Sony's resolutions in the same list.
+
+## Things to know before enabling 1080p
+
+- **It is 30 Hz only.** The PS TV's HDMI output path cannot do 1080p at 60 Hz
+  (1080p60 is expected to fail on this hardware; 1080p30 is the mode gameblabla
+  verified). The system UI and all games therefore refresh at 30 Hz. Games
+  designed for 60 fps will run at 30 fps; games designed for 30 fps should
+  keep running at 30 fps thanks to the frame pacing below. Input latency is
+  slightly higher than at 60 Hz.
+- **Some displays will not sync 1080p30.** Reported problem cases are some PC
+  monitors (notably FreeSync models) and some capture cards. If your screen
+  goes black after selecting 1080p, wait for the safe-boot revert (next point)
+  or force-disable the mode (point after).
+- **Safe-boot revert.** When the console boots with 1080p enabled, the kernel
+  plugin writes a marker file and deletes it after 120 seconds of uptime
+  (configurable, `safe_boot_seconds`). If the console reboots or is powered
+  off within that window, the next boot finds the marker and **turns the 1080p
+  option off automatically** (falling back to whatever Sony's registry says,
+  usually the mode you had before). So: if you get a black screen after a
+  reboot, hold the power button, boot again, and you are back on a Sony mode.
+  Then re-select "1080p (30 Hz)" in Settings if it was just an accident (for
+  example a quick reboot after installing another plugin).
+- **Force-disable.** Delete `ur0:tai/pstv1080p.cfg` (via FTP/VitaShell, or from
+  safe mode) and reboot; the plugin starts with 1080p off. Removing the
+  `*KERNEL` line from `config.txt` has the same effect. If you cannot see
+  anything at all, connect the PS TV to a different TV first, or boot into
+  safe mode (which does not load plugins).
+- **HDMI-CEC / hot-plug.** The plugin re-checks the output mode every 2 seconds
+  and re-applies 1080p30 if it changed (rate limited to once per 5 seconds,
+  and it gives up after 5 failed or ineffective applies until you change the
+  setting again, so it can never turn into a periodic HDMI renegotiation).
+  This is meant to survive TV power cycles and cable re-plugs; it is one of
+  the untested assumptions.
+
+## What this touches (and how to uninstall)
+
+Nothing is changed permanently; everything runs inside taiHEN and goes away
+with the two `config.txt` lines.
+
+- **No system file is ever modified.** Nothing is written to `vs0:`, `os0:`,
+  `sa0:` or `pd0:`, and the Settings app's RCO/XML files on disk are never
+  touched. The HDMI resolution page is patched **in RAM only**, at the moment
+  the Settings app loads it, through a taiHEN import hook. Remove the plugin
+  line and the stock page is back, with no residue.
+- **Sony's registry is never written by this project.** The only registry
+  writes that happen are the Settings app's own writes of a Sony-defined value
+  (0/1/2) when you pick 480p/720p/1080i, which are passed through unchanged.
+  Selecting "1080p (30 Hz)" stores nothing in the registry.
+- **All hooks are taiHEN runtime hooks** (`taiHookFunctionExportForKernel` in
+  the kernel module, `taiHookFunctionImport` in the Settings plugin), released
+  in `module_stop`. There is no code patching of system modules on disk and no
+  `taiInject` of persistent data.
+- **Files this project creates** (all its own, all safe to delete):
+  - `ur0:tai/pstv1080p.cfg` — the 64-byte state file;
+  - `ur0:tai/pstv1080p.boot` — the safe-boot marker, normally deleted about
+    2 minutes after every boot;
+  - `ur0:tai/pstv1080p_titles.txt` — optional, written by you, never by the
+    plugin;
+  - `ux0:data/pstv1080p/` — diagnostics (`kernel.log`, `settings.log`,
+    `settings_page_orig.xml`).
+- **Uninstall:** remove the two lines from `ur0:tai/config.txt`
+  (`ur0:tai/pstv1080p.skprx` under `*KERNEL` and
+  `ur0:tai/pstv1080p_settings.suprx` under `*NPXS10015`), then delete
+  `ur0:tai/pstv1080p.skprx`, `ur0:tai/pstv1080p_settings.suprx`,
+  `ur0:tai/pstv1080p.cfg`, `ur0:tai/pstv1080p.boot`,
+  `ur0:tai/pstv1080p_titles.txt` and the `ux0:data/pstv1080p/` folder.
+  Reboot; the HDMI resolution is whatever Sony's registry says.
+
+## Frame pacing
+
+In the default SCALE mode nothing changes at 60 Hz: the rescaling is
+mathematically an identity there, so a PS TV that is not in 1080p behaves
+exactly as before. (FORCE mode caps at 60 Hz too, by design.)
+
+There are three modes, chosen by the `fps_mode` field of the config file (there
+is no config app yet, see [Config file](#config-file-ur0taipstv1080pcfg)):
+
+| `fps_mode` | Name  | Behaviour |
+|-----------:|-------|-----------|
+| 0 | OFF   | Pacing hooks pass everything through untouched. At 30 Hz, games that wait 2 vblanks run at 15 fps (the problem the original remap had). |
+| 1 | SCALE (default) | Each game's own vblank-wait count is rescaled to the current refresh rate, so the game keeps its intended frame rate where the refresh rate allows it. A "wait 2 vblanks" (30 fps at 60 Hz) becomes "wait 1 vblank" at 30 Hz. 60 fps titles become 30 fps (unavoidable at 30 Hz). |
+| 2 | FORCE | Framecapper-style fixed target: every wait becomes "one frame at `fps_target` fps", computed from the *current* refresh rate. With `fps_target = 30`: 2 vblanks at 60 Hz, 1 vblank at 30 Hz. `fps_inject = 1` additionally waits after every `SetFrameBuf`, like Framecapper's "Inject" builds. An optional title list `ur0:tai/pstv1080p_titles.txt` (one title id per line, or a single line `*ALL`) limits FORCE mode to the listed games (see the config section for the no-file case). |
+
+The pacing never touches the kernel itself or SceShell (the LiveArea / system
+UI), only application processes.
+
+## Compatibility with other plugins
+
+- **Framecapper (Rinnegatamante) — do not run both.** Framecapper hooks the same
+  `sceDisplayWaitVblankStart*` calls inside each game and forces a fixed vblank
+  count that assumes 60 Hz. With 1080p30 that gives 15 fps, and combined with
+  this plugin's hooks the two would cap on top of each other. Remove every
+  `Framecapper*.suprx` line from `config.txt` and use `fps_mode = 2` (FORCE)
+  with `fps_target` / `fps_inject` if you want Framecapper-like behaviour.
+- **Sharpscale (cuevavirus / CBPS) — compatible.** Sharpscale changes how the
+  framebuffer is *scaled* onto the output and hooks different functions.
+  1080p30 gives Sharpscale a 1920x1080 target, so 960x544 content can be shown
+  at an exact 2x integer scale. Sharpscale's "unlock framebuffer sizes" option is
+  unrelated to this plugin and can stay whichever way you have it.
+- **The old `1080p.skprx` / `1080p_480phook.skprx` — remove them.** They hook the
+  same function and would fight with the watchdog.
+- **HENkaku's `henkaku.suprx` under `*NPXS10015`** stays. Both plugins hook the
+  Settings app's XML loader; taiHEN chains them and this plugin only edits the
+  HDMI resolution list, never the pages HENkaku replaces.
+
+## Diagnostics and reporting issues
+
+Both modules write plain-text logs (best effort; failures to write are ignored):
+
+| File | Written by | Contents |
+|------|-----------|----------|
+| `ux0:data/pstv1080p/kernel.log` | `pstv1080p.skprx` | config load, hook install results, **every** `sceAVConfigHdmiSetResolution` call (mode requested by the system / mode actually applied / return code), boot applies, watchdog re-applies, safe-boot reverts. |
+| `ux0:data/pstv1080p/settings.log` | `pstv1080p_settings.suprx` | the HDMI resolution list Sony ships (id / title / value of each entry), the value chosen for the injected item, every registry get/set the Settings page makes for `hdmi_resolution_mode`, every resolution code Sony's code passes down. |
+| `ux0:data/pstv1080p/settings_page_orig.xml` | `pstv1080p_settings.suprx` | a one-time dump of the unmodified Settings page XML that contains the HDMI resolution list. |
+
+When reporting a problem, please attach all three files plus your firmware
+version, TV/monitor model, and `ur0:tai/config.txt`. The XML dump and the
+`settings.log` value→mode evidence are what is needed to make the next version
+more robust (they reveal Sony's registry value → screen-mode mapping, which is
+currently unknown, see the appendix).
+
+## First test on hardware
+
+Nobody has run this on a PS TV yet. If you are the first, please test in this
+order and stop at the first step that fails. Steps 1–3 cannot change the video
+mode; only step 4 does.
+
+**Preparation**
+
+- Have FTP (VitaShell) working *before* you start, so you can delete
+  `ur0:tai/pstv1080p.cfg` blind if the screen goes dark.
+- Use a TV known to accept 1080p30 (any recent TV; avoid PC monitors for the
+  first test).
+- Note which HDMI resolution is currently selected in Settings.
+
+**Step 1 — kernel module loads (no visible change expected).**
+Add only the `*KERNEL` line, reboot. Check that the console boots normally
+and that `ux0:data/pstv1080p/kernel.log` exists. Look for the config-load line
+(should report defaults / `mode_1080p=0`) and the hook install results: the
+`SceAVConfig` hook and the frame-pacing hooks should all report success
+(`uid >= 0`). If any hook failed, its line says so; the module still runs.
+Untested assumptions checked here: the `SceAVConfig` export hook installs
+(same as gameblabla's plugin, so this one is low risk); hooking the
+`SceDisplay` user-library exports (`0x5ED8F994`) with
+`taiHookFunctionExportForKernel` succeeds for the seven `SceDisplay` hooks
+(six vblank waits plus `_sceDisplaySetFrameBuf`, which is always installed
+and passes straight through unless `fps_mode = 2` with `fps_inject = 1`).
+Expect seven `hook: ... ok` lines after the `SceAVConfig` one.
+
+**Step 2 — pacing at 60 Hz is a no-op.**
+Still at your usual resolution, play a 60 fps and a 30 fps game for a minute.
+Both must behave exactly as before (SCALE mode is an identity at 60 Hz). If
+anything stutters here, set `fps_mode = 0` (see config section) and report it.
+
+**Step 3 — Settings plugin (still no mode change).**
+Add the `*NPXS10015` line, reboot, open *Settings > Sound & Display >
+HDMI resolution* but do **not** select anything yet. Check:
+- the list shows Sony's entries unchanged plus **"1080p (30 Hz)"** at the end;
+- the currently selected entry is still the one you noted;
+- `settings_page_orig.xml` and `settings.log` exist; `settings.log` lists the
+  original items with their `value=` numbers and the value chosen for the new
+  item (default 3, or the next free number).
+If the text shows as `msg_pstv1080p_1080p` the text hook failed (report). If the
+entry is missing, `settings.log` should say why (page not found, buffer too
+small, etc.).
+Untested assumptions: the HDMI list lives in a page loaded through
+`scePafMiscLoadXmlLayout` in `SceSettings` and contains the literal string
+`hdmi_resolution_mode`; Sony's list uses `<list_item ... value="N"/>` children;
+the page framework tolerates a value that is not in the registry.
+
+**Step 4 — select 1080p (the real test).**
+Select "1080p (30 Hz)". Expected: the picture switches to 1920x1080 at 30 Hz
+(your TV's info overlay should say 1080p/30 or 1080p/29.97). Now check
+`kernel.log`: there must be a line for the `SetMode1080p(1)` request and for a
+`sceAVConfigHdmiSetResolution` call with applied mode `0x8710` and return `0`.
+Also check `settings.log`: the `sceRegMgrSetKeyInt` line for the new value
+must say it was *not* forwarded to the registry.
+Then go back to the list: the "1080p (30 Hz)" entry must show as selected.
+Untested assumptions: `0x8710` is accepted by `sceAVConfigHdmiSetResolution`
+when it arrives from the Settings app's context (gameblabla's plugin proved the
+value works when substituted for 480p); the Settings page re-reads the value
+through `sceRegMgrGetKeyInt` and therefore shows our entry as selected.
+
+**Step 5 — survives a reboot, safe-boot works.**
+Reboot and *wait at least 3 minutes* before touching anything. Expected: the
+console comes up in 1080p30 within a few seconds after the LiveArea appears
+(`boot_apply_delay_ms`, default 3 s, after SceShell starts). `kernel.log`
+should show the boot apply. Then reboot again *immediately* (within 2 minutes):
+this must trigger the safe-boot revert — the console boots in your previous
+Sony mode and `kernel.log` says `reverted`. Re-select 1080p in Settings.
+Untested assumptions: `ur0:` is writable when the kernel module starts (needed
+for the marker and config); SceShell's own boot-time resolution apply either
+goes through the hooked export (so it is substituted) or happens before our
+delayed apply (so it is overridden), and it does not fight back afterwards.
+
+**Step 6 — frame pacing at 30 Hz.**
+In 1080p30, run a known 30 fps title (it must feel like 30 fps, not 15) and a
+known 60 fps title (it will be 30 fps). Then try `fps_mode = 2`,
+`fps_target = 30` to check FORCE mode. Report anything that runs at 15 fps
+with the game's name.
+
+**Step 7 — return to a Sony mode.**
+Select 480p/720p/1080i again. Expected: the mode switches immediately,
+`kernel.log` shows `SetMode1080p(0)` followed by Sony's own
+`sceAVConfigHdmiSetResolution` call passed through unchanged, and the choice
+persists across a reboot.
+
+What to send back: `settings_page_orig.xml`, `kernel.log`, `settings.log`, the
+step you reached, firmware version, display model.
+
+---
+
+## Developer section
+
+### Building
+
+Requirements: [VitaSDK](https://vitasdk.org) with the taiHEN package, and GNU
+make. No CMake is needed (the `CMakeLists.txt` in the root is gameblabla's
+original and is not used by this branch).
+
+```sh
+export VITASDK=/usr/local/vitasdk
+export PATH=$VITASDK/bin:$PATH
+vdpm taihen          # installs taihen.h, libtaihen_stub.a, libtaihenForKernel_stub.a, libtaihenModuleUtils_stub.a
+
+git clone -b native-1080p https://github.com/delon5/1080p_pstv
+cd 1080p_pstv
+make                 # builds build/pstv1080p.skprx and build/pstv1080p_settings.suprx
+```
+
+Targets: `make kernel` (skprx), `make stubs` (generates `libpstv1080p_stub.a`
+from the kernel ELF's exports so the user plugin can call the syscalls),
+`make user` (suprx; depends on `stubs`), `make clean`.
+
+Both modules are freestanding C: no libc, no heap, no floating point across
+function boundaries (the toolchain is softfp). The kernel side uses
+`psp2kern` headers and `SceSysclibForDriver` string helpers; the user side is
+compiled with `-fshort-wchar` because the Settings app expects UTF-16 titles.
+
+### Repository layout
+
+```
+include/pstv1080p.h            shared contract: config/info structs, constants, syscall prototypes
+kernel/main.c                  pstv1080p.skprx  (mode apply, watchdog, safe boot, frame pacing, syscalls, kernel.log)
+kernel/pstv1080p.yml           module/export definition (library "pstv1080p", syscall: true)
+user/main.c                    pstv1080p_settings.suprx (Settings-app XML/registry/text hooks, settings.log)
+user/pstv1080p_settings.yml
+Makefile                       all / kernel / stubs / user / clean
+docs/DESIGN.md                 the specification this code implements
+docs/RESEARCH_NOTES.md         verified facts: NIDs, screen-mode codes, registry keys, API availability
+docs/reversing/                disassembly / decompilation of the original 1080p_480phook.skprx
+main.c, 1080p.yml, 1080p.skprx, CMakeLists.txt, README.txt, taihen.json
+                               gameblabla's original files (branch "simp"), unmodified, for reference
+```
+
+### Config file `ur0:tai/pstv1080p.cfg`
+
+The kernel module keeps all state in a **binary, little-endian, 64-byte**
+file. It is created/overwritten on every change (the first time you select
+"1080p (30 Hz)" in Settings, or via the syscalls). If it is missing or fails
+validation, defaults are used and `mode_1080p` is 0.
+
+| Offset | Field | Type | Default | Meaning |
+|-------:|-------|------|--------:|---------|
+| 0x00 | `magic` | u32 | `0x50383150` (`"P18P"`) | file identification |
+| 0x04 | `version` | u32 | 1 | layout version |
+| 0x08 | `mode_1080p` | u32 | 0 | 1 = the "1080p" entry is selected and gets applied at boot / by the watchdog; 0 = plugin is passive |
+| 0x0C | `hd_mode_code` | u32 | `0x8710` | SceDisplay screen-mode code applied when `mode_1080p` = 1. `0x8710` = 1080p30 (the one that works). Advanced/experimental: `0x8720` = 1080p24 (untested), `0x8700` = 1080p60 (expected to fail). Must have bit 0x8000 set and a resolution field in 0x300..0x700. |
+| 0x10 | `settings_item_value` | u32 | 3 | the `value="N"` number of the injected `list_item`. The Settings plugin bumps it to the smallest free number ≥ 3 if Sony's list already uses it (allowed range 1..255). |
+| 0x14 | `fps_mode` | u32 | 1 | 0 = OFF, 1 = SCALE, 2 = FORCE (see [frame-pacing model](#frame-pacing-model)) |
+| 0x18 | `fps_target` | u32 | 30 | FORCE mode target fps: 20, 30 or 60 |
+| 0x1C | `fps_inject` | u32 | 0 | FORCE mode: 1 = also wait one interval after every `sceDisplaySetFrameBuf` (Framecapper "Inject") |
+| 0x20 | `safe_boot_seconds` | u32 | 120 | how long a 1080p boot must survive before it is considered good; 0 disables the safe-boot revert. Clamp: values above 3600 are lowered to 3600. |
+| 0x24 | `boot_apply_delay_ms` | u32 | 3000 | delay after SceShell appears before the first apply at boot. Clamp: values above 60000 are lowered to 60000. |
+| 0x28 | `watchdog_period_ms` | u32 | 2000 | how often the watchdog re-checks the output mode; 0 disables the watchdog (boot apply still happens). Clamp: a non-zero value below 500 is raised to 500. |
+| 0x2C | `reserved[5]` | 5 × u32 | 0 | keep zero (zeroed by the module on load/set) |
+
+**Editing it.** There is no config app yet. The Settings entry only toggles
+`mode_1080p`; everything else has to be changed with a hex editor for now (or
+by a future config app calling `pstv1080pSetConfig`). To switch to FORCE mode
+at 30 fps, for example, set the u32 at offset `0x14` to `02 00 00 00` and keep
+`0x18` at `1E 00 00 00` (30). Edit the file with the console off or reboot
+afterwards: the module reads it once at start and rewrites it on every change,
+so an edit made while a change is pending would be lost.
+
+**Validation — be careful with the hex editor.** Every field is validated
+both when the file is read at boot and when `pstv1080pSetConfig` is called.
+If **any** field is out of range, the **whole file is ignored**, defaults are
+used and **1080p is OFF** (the console boots in a Sony mode); the only hint is
+a `config: state file invalid` line in `kernel.log`, and the next successful
+change made through Settings overwrites the file with defaults plus that
+change. The checks are: `magic` = `0x50383150`, `version` = 1,
+`mode_1080p` ≤ 1, `hd_mode_code` with bit `0x8000` set, a resolution field
+(`& 0x0700`) between `0x0300` and `0x0700` and no bits above `0xFFFF`,
+`settings_item_value` in 1..255, `fps_mode` ≤ 2, `fps_target` in
+{20, 30, 60}, `fps_inject` ≤ 1. A typo such as `fps_target = 25` therefore
+silently turns 1080p off. The three timing fields are never rejected, only
+clamped as noted in the table, and `reserved[]` is zeroed.
+
+`ur0:tai/pstv1080p_titles.txt` (optional, FORCE mode only): one title id per
+line (`PCSE00001`); lines starting with `#` are ignored; a line `*ALL` means
+every application. If the file is missing, or contains `*ALL`, or has no valid
+entries, FORCE pacing applies to **every** application. Up to 32 title ids are
+read (ids must be shorter than 16 characters). The file is read at boot (when
+`fps_mode` is 2) and when `fps_mode` is switched to 2 through
+`pstv1080pSetConfig`; creating or editing it while already in FORCE mode has
+no effect until you reboot. `kernel.log` reports the result on a line starting
+with `titles:`. SCALE mode ignores the list.
+
+### Frame-pacing model
+
+Games regulate their frame rate with the SceDisplay syscalls
+`sceDisplayWaitVblankStart[Multi][CB]` and `sceDisplayWaitSetFrameBufMulti[CB]`,
+whose `vcount` argument means "wait this many vblanks". Game code assumes a
+60 Hz vblank (Vita OLED/LCD, and the PS TV in every Sony mode). The kernel
+module hooks the kernel-side implementations of those syscalls (library
+`SceDisplay` `0x5ED8F994`) and keeps an integer `refresh_hz` derived from the
+current HDMI output mode (screen-mode flag bits `0xF0`: `0x00` → 60,
+`0x10` → 30, `0x20` → 24, `0x80` → 50, `0x40` → 25 assumed; fallback 60). The
+cache is refreshed by the watchdog thread and after each successful
+`sceAVConfigHdmiSetResolution`, and cross-checked once with
+`ksceDisplayGetRefreshRateInternal`. The hot path uses only that cached
+integer: no I/O, no allocation, no floats.
+
+Process filter: calls from the kernel itself and from SceShell pass through
+untouched, so the system UI is never paced. The pacing hooks run in the
+calling process's context; per-process title ids (for the FORCE title list)
+are cached in a small 8-entry table so the hot path never queries sysroot.
+
+**SCALE (default):** `new_vcount = max(1, vcount * refresh_hz / 60)`, integer
+floor.
+
+| game asks for | intended fps | at 60 Hz | at 30 Hz | resulting fps at 30 Hz |
+|--------------:|-------------:|---------:|---------:|-----------------------:|
+| 1 vblank | 60 | 1 | max(1, 0) = 1 | 30 (best possible) |
+| 2 vblanks | 30 | 2 | 1 | **30** |
+| 3 vblanks | 20 | 3 | 1 | 30 (rounded up, 20 is not representable at 30 Hz) |
+| 4 vblanks | 15 | 4 | 2 | 15 |
+
+The no-argument `sceDisplayWaitVblankStart[CB]` variants imply `vcount = 1` and
+always pass through. At 60 Hz the formula is the identity, so SCALE is a no-op
+whenever 1080p is off.
+
+**FORCE:** `interval = max(1, refresh_hz / fps_target)`; the `Multi` variants
+get their `vcount` replaced by `interval`; the no-argument variants pass
+through when `interval == 1` and otherwise wait `interval` vblanks through
+the kernel `ksceDisplayWaitVblankStartMulti[CB]`. The `_sceDisplaySetFrameBuf`
+syscall is always hooked (installed once at `module_start`, so no hook has to
+be added or removed while games are running); with `fps_mode = 2` and
+`fps_inject = 1` the hook additionally waits `interval` vblanks after each
+buffer flip, otherwise it passes straight through.
+
+| `fps_target` | at 60 Hz | at 30 Hz | at 24 Hz |
+|-------------:|---------:|---------:|---------:|
+| 60 | 1 | 1 (→ 30 fps) | 1 (→ 24 fps) |
+| 30 | 2 | 1 | 1 (→ 24 fps) |
+| 20 | 3 | 1 (→ 30 fps, 20 not representable) | 1 |
+
+So "a 30 fps game waits 2 vblanks at 60 Hz and 1 vblank at 30 Hz" holds in
+both modes; the difference is that SCALE respects each game's own choice
+while FORCE imposes one target on every (listed) game.
+
+**OFF:** every hook returns to the original immediately. Hooks that fail to
+install are logged and skipped; the module still starts and reports which
+hooks are active in `pstv1080p_info_t.hooks_ok`: bit 0 = the `SceAVConfig`
+export hook, bits 1–6 = `WaitVblankStartMulti`, `WaitVblankStartMultiCB`,
+`WaitVblankStart`, `WaitVblankStartCB`, `WaitSetFrameBufMulti`,
+`WaitSetFrameBufMultiCB`, bit 7 = `_sceDisplaySetFrameBuf` (all eight set =
+`0xFF`).
+
+### Safe-boot revert rule
+
+At `module_start`, *before* anything is applied:
+
+1. If `mode_1080p` is 1 **and** `ur0:tai/pstv1080p.boot` exists, the previous
+   boot with 1080p enabled did not reach `safe_boot_seconds` of uptime. The
+   module sets `mode_1080p = 0`, persists the config, and logs `reverted`.
+   Nothing is applied this boot; Sony's registry value wins.
+2. Otherwise, if `mode_1080p` is 1, the marker file is created. The watchdog
+   thread deletes it once uptime reaches `safe_boot_seconds` (immediately if
+   that is 0, which effectively disables the rule).
+3. If `mode_1080p` is 0, a leftover marker is removed.
+
+A crash, a power cut, or a deliberate quick reboot inside the window therefore
+costs you one re-selection in Settings, never a boot loop into a mode the TV
+cannot display.
+
+Turning 1080p off through Settings or the syscall does not use the marker: the
+kernel re-applies the last mode Sony's code requested (`last_system_mode`) if
+it has seen one, otherwise it does nothing and lets the Settings app apply the
+mode it writes to the registry. Only plausible Sony codes are recorded there
+(bit `0x8000` set, resolution field `0x0300`..`0x0700`, never our own
+`hd_mode_code`), so the revert can never re-apply 1080p by mistake.
+
+The watchdog (and the boot apply) compares the driver's reported output mode
+with `hd_mode_code`, **or** with whatever the driver reported right after the
+last successful apply of that code — the driver may encode the mode
+differently (untested assumption A3 in `kernel/main.c`). An apply whose
+readback still differs from `hd_mode_code` is logged and counted as a
+failure, so at most 5 re-applies ever happen per state change; the plugin
+never renegotiates HDMI periodically.
+
+### Kernel syscall API
+
+Library `pstv1080p` (syscall exports, see `include/pstv1080p.h`), usable from
+any user-mode module linked against `libpstv1080p_stub.a` (`make stubs`):
+
+```c
+int pstv1080pGetConfig(pstv1080p_config_t *out);       // copy of the live config
+int pstv1080pSetConfig(const pstv1080p_config_t *in);  // validate, persist; apply/revert if mode_1080p changed
+int pstv1080pSetMode1080p(int enable);                 // persist + apply/revert now; returns the apply result
+int pstv1080pGetInfo(pstv1080p_info_t *out);           // version, current output mode, refresh_hz, last system mode,
+                                                        // last apply result, hooks_ok bitmask, settings item value
+```
+
+Errors: `PSTV1080P_ERR_INVALID_ARG` (`0x80F18001`), `PSTV1080P_ERR_NOT_READY`
+(`0x80F18002`), `PSTV1080P_ERR_APPLY_FAILED` (`0x80F18003`), or a negative SCE
+error passed through. A config app can be built on these four calls; the
+struct layouts are fixed (64 bytes each, static-asserted in the header).
+
+## Appendix: how the original plugin worked and what changed
+
+### gameblabla's `1080p.skprx` and the `1080p_480phook.skprx` variant
+
+Two binaries, one idea:
+
+- **gameblabla's `1080p.skprx`** (root of this repo, module name `1080p`,
+  4.5 KiB, built from the root `main.c` / `CMakeLists.txt` with the HENkaku
+  CMake template) forces `0x8710` for **every** requested mode, unconditionally.
+- **The user's `1080p_480phook.skprx`** (`docs/reversing/*.orig`, 2 KiB,
+  module name literally `ds4vita` because it was built from xerpi's `ds4vita`
+  template; fully reversed in `docs/reversing/`) is the same hook with the
+  `mode == 0x8300` check added, i.e. only 480p is remapped.
+
+The 480phook variant, reconstructed:
+
+```c
+uid = taiHookFunctionExportForKernel(KERNEL_PID, &ref, "SceAVConfig",
+                                     0x79E0F03F /* SceAVConfig user lib */,
+                                     0x4D37F036 /* sceAVConfigHdmiSetResolution */, hook);
+
+static int hook(int mode, ...) {
+    if (mode == 0x8300)   /* 480p60 requested ... */
+        mode = 0x8710;    /* ... becomes 1080p30 */
+    return TAI_CONTINUE(int, ref, mode, ...);
+}
+```
+
+`sceAVConfigHdmiSetResolution(int screenMode)` is the kernel-side
+implementation of the syscall Sony's Settings app and SceShell call to change
+the HDMI mode; it reprograms both the display controller and the HDMI
+transmitter. Every time anything asked for 480p (`0x8300`), the hook silently
+substituted 1080p30 (`0x8710`). gameblabla's earlier `1080p.skprx` on the
+`simp` branch did the same for *every* mode, unconditionally; the `480phook`
+build is gameblabla's "TODO: add a check" done.
+
+Consequences of that approach:
+
+- No real "1080p" choice: you selected **480p** in Settings and got 1080p.
+  The registry said 480p, the UI said 480p.
+- If the TV refused the mode there was no way back except removing the plugin.
+- Frame pacing was ignored: at 30 Hz, every 30 fps game (and every Framecapper
+  cap) ran at 15 fps — the problem that motivated this rewrite.
+- The template's logging code was dead; there was no way to see what happened.
+
+### What this version does differently
+
+| | original hook | pstv1080p |
+|-|---------------|-----------|
+| Settings UI | remaps the 480p entry | adds a native **"1080p (30 Hz)"** list item; 480p stays 480p |
+| State | none (implicit: 480p selected) | own file `ur0:tai/pstv1080p.cfg`; Sony's `hdmi_resolution_mode` key is **never** written with an unknown value |
+| Boot | relied on Sony re-applying 480p at boot and the hook catching it | explicit apply from a kernel thread after SceShell is up, plus a watchdog that re-applies if the mode drifts |
+| Recovery | remove the plugin | safe-boot revert (marker file + 120 s window), force-disable by deleting the cfg |
+| Frame pacing | none | refresh-rate-aware SCALE (default) or FORCE modes on the SceDisplay vblank syscalls |
+| Other modes | only 480p affected | all of Sony's modes pass through unchanged when 1080p is off; the requested mode is logged as mapping evidence |
+| Diagnostics | none | `kernel.log`, `settings.log`, XML dump |
+
+The `sceAVConfigHdmiSetResolution` export hook is still the core mechanism —
+it is the one thing the original plugin proved works on real hardware. The
+difference is *when* the substitution happens (only while our own state says
+1080p is selected, regardless of which Sony mode was requested) and that the
+plugin remembers what the system wanted (`last_system_mode`) so it can restore
+it when 1080p is switched off.
+
+The Settings-app side uses the technique HENkaku's `henkaku.suprx` uses for
+its own settings page: hook `scePafMiscLoadXmlLayout` to patch the page XML,
+`sceRegMgrGetKeyInt` / `sceRegMgrSetKeyInt` to intercept the one key the list
+is bound to, and `scePafToplevelGetText` to supply the entry's text. The
+plugin only edits the list that contains `hdmi_resolution_mode` and passes
+every other page through, so it coexists with HENkaku (and with plugins such
+as SettingsPlus / ineedsettings as long as they do not also rewrite that list).
+
+Sony's mapping from registry value (0/1/2) to screen-mode code is done in
+Sony's code and is still unknown; the injected item uses a value Sony does not
+use (3 by default) that never reaches the registry. `settings.log` records the
+original items and every code Sony passes to `sceAVConfigHdmiSetResolution`,
+so the mapping can be documented from the first on-device reports.
+
+## Credits
+
+- **gameblabla** — [1080p_pstv](https://github.com/gameblabla/1080p_pstv): discovered that
+  the PS TV HDMI encoder accepts 1080p30 and wrote the original hook this
+  project descends from.
+- **HENkaku / molecule** — the Settings-app XML / registry / text hooking
+  technique (`plugin/user.c`).
+- **SKGleba** — ineedsettings (Settings-app extension reference).
+- **Rinnegatamante** — Framecapper (the frame-cap hook set the FORCE mode mirrors).
+- **CBPS / cuevavirus** — Sharpscale and the SceDisplay reverse engineering it documents.
+- **wiki.henkaku.xyz** — SceDisplay screen-mode flags, SceAVConfig, registry documentation.
+- **xerpi** — the ds4vita template the original binary was built from.
+- **Team Molecule / yifanlu** — taiHEN.
+
+## License
+
+New code on this branch (`include/`, `kernel/`, `user/`, `Makefile`, `docs/`)
+is licensed under the **GNU General Public License v3.0 or later**
+(`SPDX-License-Identifier: GPL-3.0-or-later`); see [LICENSE](LICENSE).
+
+The files inherited from gameblabla's `simp` branch (`main.c`, `1080p.yml`,
+`1080p.skprx`, `CMakeLists.txt`, `README.txt`, `taihen.json`) were published
+without a license statement. They are kept unmodified for reference and
+credited to gameblabla; the GPL notice does not cover them.

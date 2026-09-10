@@ -4,7 +4,17 @@ $(error VITASDK is not set. Example: export VITASDK=/usr/local/vitasdk)
 endif
 export PATH := $(VITASDK)/bin:$(PATH)
 
-CC        := arm-vita-eabi-gcc
+# Tools are referenced by absolute path: GNU Make 3.81 (macOS default) ignores a Makefile-level
+# `export PATH` when locating recipe commands, so a bare `arm-vita-eabi-gcc` fails there.
+# The stub `makefile` written by vita-libs-gen-2 already prefixes $(VITASDK)/bin/ itself.
+# Note: vita-libs-gen-2 takes `-yml=<file> -output=<dir>` options (not positional arguments as
+# DESIGN.md first wrote it); it accepts the yml vita-elf-export emits unmodified.
+TOOLBIN   := $(VITASDK)/bin
+CC        := $(TOOLBIN)/arm-vita-eabi-gcc
+ELFCREATE := $(TOOLBIN)/vita-elf-create
+MAKEFSELF := $(TOOLBIN)/vita-make-fself
+ELFEXPORT := $(TOOLBIN)/vita-elf-export
+LIBSGEN   := $(TOOLBIN)/vita-libs-gen-2
 BUILD     := build
 STUBDIR   := $(BUILD)/stubs
 
@@ -31,25 +41,25 @@ $(BUILD)/kernel.elf: kernel/main.c include/pstv1080p.h | $(BUILD)
 	$(CC) $(KCFLAGS) kernel/main.c -o $@ $(KLIBS)
 
 $(BUILD)/kernel.velf: $(BUILD)/kernel.elf kernel/pstv1080p.yml
-	vita-elf-create -e kernel/pstv1080p.yml $< $@
+	$(ELFCREATE) -e kernel/pstv1080p.yml $< $@
 
 $(BUILD)/pstv1080p.skprx: $(BUILD)/kernel.velf
-	vita-make-fself -c $< $@
+	$(MAKEFSELF) -c $< $@
 
 $(STUBDIR)/libpstv1080p_stub.a: $(BUILD)/kernel.elf kernel/pstv1080p.yml
-	vita-elf-export k $(BUILD)/kernel.elf kernel/pstv1080p.yml $(BUILD)/pstv1080p_imports.yml
+	$(ELFEXPORT) k $(BUILD)/kernel.elf kernel/pstv1080p.yml $(BUILD)/pstv1080p_imports.yml
 	rm -rf $(STUBDIR) && mkdir -p $(STUBDIR)
-	vita-libs-gen $(BUILD)/pstv1080p_imports.yml $(STUBDIR)
+	$(LIBSGEN) -yml=$(BUILD)/pstv1080p_imports.yml -output=$(STUBDIR)
 	$(MAKE) -C $(STUBDIR)
 
 $(BUILD)/user.elf: user/main.c include/pstv1080p.h $(STUBDIR)/libpstv1080p_stub.a | $(BUILD)
 	$(CC) $(UCFLAGS) user/main.c -o $@ $(ULIBS)
 
 $(BUILD)/user.velf: $(BUILD)/user.elf user/pstv1080p_settings.yml
-	vita-elf-create -e user/pstv1080p_settings.yml $< $@
+	$(ELFCREATE) -e user/pstv1080p_settings.yml $< $@
 
 $(BUILD)/pstv1080p_settings.suprx: $(BUILD)/user.velf
-	vita-make-fself -c $< $@
+	$(MAKEFSELF) -c $< $@
 
 clean:
 	rm -rf $(BUILD)
