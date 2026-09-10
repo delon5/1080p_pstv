@@ -81,3 +81,10 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - Diagnostics: log files in ux0:data/pstv1080p/, please share `settings_page_orig.xml` + logs when reporting issues.
 - Credits: gameblabla (1080p_pstv), HENkaku/molecule (settings XML technique), SKGleba (ineedsettings), Rinnegatamante (Framecapper), CBPS/cuevavirus (Sharpscale, SceDisplay RE), wiki.henkaku.xyz.
 - Status: built but NOT yet tested on hardware (no PS TV available to the author); list exactly which assumptions need a first on-device test.
+
+## E. Footprint and safety constraints (user requirement: nothing permanently changed; runs only inside taiHEN)
+- NO system file is ever modified: nothing is written to vs0:, os0:, sa0:, pd0:, or the Settings app's RCO/XML files. The Settings XML is patched in RAM only, at the moment the page is loaded, by the taiHEN import hook; removing the plugin line restores stock behaviour with no residue.
+- Sony's registry is never written by this project. The only registry writes that happen are the Settings app's own writes of a Sony-defined value (0/1/2) when the user picks 480p/720p/1080i, which we pass through unchanged. Selecting our "1080p" item does NOT store anything in the registry.
+- All hooks are taiHEN runtime hooks (taiHookFunctionExportForKernel / taiHookFunctionImport) released in module_stop; no code patching of system modules on disk, no taiInject of persistent data.
+- Files this project creates (all our own, all safe to delete): `ur0:tai/pstv1080p.cfg` (64-byte state), `ur0:tai/pstv1080p.boot` (boot marker, normally deleted ~2 min after boot), optional `ur0:tai/pstv1080p_titles.txt` (user-authored), and diagnostics under `ux0:data/pstv1080p/`. Uninstall = remove the two config.txt lines and delete those files.
+- The README must contain a "What this touches" section stating exactly the above.
