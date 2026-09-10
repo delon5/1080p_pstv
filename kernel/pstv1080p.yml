@@ -6,7 +6,7 @@ pstv1080p:
   main:
     start: module_start
     stop: module_stop
-  modules:
+  libraries:
     pstv1080p:
       syscall: true
       functions:
