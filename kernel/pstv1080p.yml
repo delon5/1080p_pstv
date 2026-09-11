@@ -15,3 +15,5 @@ pstv1080p:
         - pstv1080pSetMode1080p
         - pstv1080pGetInfo
         - pstv1080pLog
+        - pstv1080pReadGames
+        - pstv1080pWriteGames

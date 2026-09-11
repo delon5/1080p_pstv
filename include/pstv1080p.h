@@ -12,8 +12,8 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0160u      /* 1.6.0 (0xMMmp: major, minor, patch) */
-#define PSTV1080P_VERSION_STR        "1.6.0"
+#define PSTV1080P_VERSION            0x0161u      /* 1.6.1 (0xMMmp: major, minor, patch) */
+#define PSTV1080P_VERSION_STR        "1.6.1"
 
 /* 1.6: everything the plugin owns lives in ONE directory on ur0 (always
  * mounted when kernel plugins start).  Users of 1.x move their files from
@@ -23,6 +23,7 @@ extern "C" {
 #define PSTV1080P_BOOT_MARKER_PATH   "ur0:data/pstv1080p/pstv1080p.boot"
 #define PSTV1080P_TITLES_PATH        "ur0:data/pstv1080p/pstv1080p_titles.txt"
 #define PSTV1080P_GAMES_PATH         "ur0:data/pstv1080p/pstv1080p_games.txt"  /* per-title overrides: "TITLEID mode" */
+#define PSTV1080P_GAMES_TMP_PATH     "ur0:data/pstv1080p/pstv1080p_games.tmp"  /* staging file of pstv1080pWriteGames */
 #define PSTV1080P_DEBUG_PATH         "ur0:data/pstv1080p/pstv1080p_debug.txt"  /* exists at boot -> logging on; absent -> NO log is written */
 /* The log itself goes to the memory card (easy to fetch, no wear on ur0). */
 #define PSTV1080P_LOG_DIR            "ux0:data/pstv1080p"
@@ -111,11 +112,28 @@ int pstv1080pGetInfo(pstv1080p_info_t *out);
 /* 1.6: append one line (NUL-terminated, <= 199 bytes used) to the plugin log.
  * A no-op unless debug logging is on, so callers may call it freely. */
 int pstv1080pLog(const char *line);
+/* 1.6.1 (configurator app): read / replace the per-title override file
+ * ur0:data/pstv1080p/pstv1080p_games.txt through the kernel, so a plain
+ * user app needs no ur0 permission.
+ * Read: copies at most size-1 bytes into buf and NUL-terminates; returns the
+ * byte count (0 if the file does not exist), a negative SCE error if the read
+ * fails, or PSTV1080P_ERR_TOO_LARGE if the file does not fit in size-1 bytes
+ * (nothing is copied in either error case).
+ * Write: stages buf[0..size) (size <= PSTV1080P_GAMES_MAX_BYTES) in a
+ * temporary file, renames it over the real one only after a complete write,
+ * and reloads the override table; returns 0 or a negative error (the previous
+ * file is untouched on failure).
+ * The kernel applies at most PSTV1080P_GAMES_MAX_ENTRIES lines, in file order. */
+#define PSTV1080P_GAMES_MAX_BYTES    4096u
+#define PSTV1080P_GAMES_MAX_ENTRIES  128u
+int pstv1080pReadGames(char *buf, uint32_t size);
+int pstv1080pWriteGames(const char *buf, uint32_t size);
 
 /* Error codes returned by the kernel exports (besides negative SCE errors passed through). */
 #define PSTV1080P_ERR_INVALID_ARG    ((int)0x80F18001)
 #define PSTV1080P_ERR_NOT_READY      ((int)0x80F18002)
 #define PSTV1080P_ERR_APPLY_FAILED   ((int)0x80F18003)
+#define PSTV1080P_ERR_TOO_LARGE      ((int)0x80F18004)   /* pstv1080pReadGames: file does not fit the buffer */
 
 #ifdef __cplusplus
 }

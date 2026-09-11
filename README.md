@@ -30,6 +30,7 @@ for how they differ.
 - [Install](#install)
 - [Things to know before enabling 1080p](#things-to-know-before-enabling-1080p)
 - [What this touches (and how to uninstall)](#what-this-touches-and-how-to-uninstall)
+- [Configurator app](#configurator-app-161)
 - [Frame pacing (SCALE / FORCE)](#frame-pacing)
 - [Compatibility with Framecapper and Sharpscale](#compatibility-with-other-plugins)
 - [Diagnostics and reporting issues](#diagnostics-and-reporting-issues)
@@ -47,6 +48,14 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.1 (2026-09-12)** — **Configurator app.** New `pstv1080p_configurator.vpk`
+  (LiveArea, unsafe homebrew): lists installed games with their per-game
+  override, change / pick / remove / save (`pstv1080p_games.txt`), plus a
+  global options screen; see [Configurator app](#configurator-app-161). The
+  kernel module gained two syscalls for it, `pstv1080pReadGames` and
+  `pstv1080pWriteGames`, which read and replace the override file inside the
+  plugin's own directory and reload the override table immediately. Settings
+  plugin unchanged apart from the version.
 - **1.6.0 (2026-09-11)** — **one directory, no logs unless asked.** Everything
   the plugin owns now lives in `ur0:data/pstv1080p/`: `pstv1080p.cfg`,
   `pstv1080p_games.txt`, `pstv1080p_titles.txt`, the safe-boot marker
@@ -370,6 +379,8 @@ with the two `config.txt` lines.
     and `ur0:tai/pstv1080p_verbose.txt` you find there (the 1.5 verbose switch
     is replaced by `pstv1080p_debug.txt` in this folder); the plugin never
     touches `ur0:tai/`.
+  - `ux0:app/PSTV1080C/` — the optional Configurator app, if you installed the VPK
+    (remove it from the LiveArea like any app).
   - `ux0:data/pstv1080p/` — only while the debug file exists: the log
     `pstv1080p.log` and the developer dumps (`settings_page_orig.xml`, `dump_*`).
 
@@ -436,6 +447,40 @@ line now says `override=frameskip`, then check that the game speed is normal
 (a timer, a run cycle, music sync) and that motion looks like 30 fps. If the
 picture shows tearing or stutter, try `nowait` instead; if the speed is still
 wrong, report the title and the log.
+
+## Configurator app (1.6.1)
+
+`pstv1080p_configurator.vpk` is a LiveArea app that edits the per-game
+overrides without FTP or a text editor. It lists every installed title
+(`ux0:app`, `ur0:app`, `gro0:app` and `ur0:appmeta`, names from each game's
+`param.sfo`), shows the override each one has in
+`ur0:data/pstv1080p/pstv1080p_games.txt`, and lets you change, add or remove
+overrides and save the file. A second screen edits the global options
+(1080p on/off, frame pacing mode, FORCE target fps, inject, safe-boot window,
+boot delay, watchdog). Everything is read and written **through the kernel
+module** (`pstv1080pReadGames` / `pstv1080pWriteGames` / `pstv1080pGetConfig`
+/ `pstv1080pSetConfig`), so the app never touches `ur0:` itself; only the game
+list needs the app folders, which is why the VPK must be installed as
+**unsafe homebrew** (HENkaku settings › Enable unsafe homebrew, as for
+VitaShell).
+
+| Button | Games screen |
+|---|---|
+| Up / Down, L / R | move the selection (L/R by a page) |
+| Left / Right | cycle the override (`none` → `frameskip` → `nowait` → `off` → `inject` → `force` → `scale` → `spoof720` → `trace`) |
+| Cross | pick the override from a list with a one-line description of each |
+| Square | remove the override (back to `none`) |
+| Start | **save** to `pstv1080p_games.txt` (the kernel reloads it at once; the change applies the next time that game starts) |
+| Triangle | global options screen (Left/Right change, Start apply, Circle back) |
+| Select | help |
+| Circle | exit (asks what to do with unsaved changes) |
+
+A `*` after an override marks an unsaved change. Titles that have an entry in
+the file but are not installed are listed at the end as "(not installed)" so
+their lines are preserved. Comment lines you wrote in the file by hand are
+kept; the app only rewrites the `TITLEID mode` lines. The header shows the
+plugin version, whether 1080p is on and the current output mode; if the
+kernel module is not loaded the app says so and does nothing else.
 
 ## Frame pacing
 
@@ -629,11 +674,23 @@ function boundaries (the toolchain is softfp). The kernel side uses
 `psp2kern` headers and `SceSysclibForDriver` string helpers; the user side is
 compiled with `-fshort-wchar` because the Settings app expects UTF-16 titles.
 
+**Configurator VPK.** `make configurator` (part of `make all`) needs the
+vendored `third_party/vita2d/libvita2d.a` (built from xerpi/libvita2d with the
+same soft-float toolchain, core + PGF members only; see
+`third_party/vita2d/SOURCE_COMMIT.txt`). Do not replace it with the `vdpm`
+`libvita2d` package: that one is hard-float and cannot be linked against the
+snapshot toolchain's soft-float C library. The Makefile also regenerates two
+stale SDK stub archives from the NID database (`build/stubs_appmgr/`). The
+LiveArea images were rendered once with `configurator/assets/make_assets.swift`
+(macOS) and are committed.
+
 ### Repository layout
 
 ```
 include/pstv1080p.h            shared contract: config/info structs, constants, syscall prototypes
 kernel/main.c                  pstv1080p.skprx  (mode apply, watchdog, safe boot, frame pacing, syscalls, the log)
+configurator/main.c            pstv1080p_configurator.vpk (LiveArea app: per-game overrides + global options, vita2d)
+third_party/vita2d/            vendored soft-float libvita2d.a + vita2d.h (MIT, see SOURCE_COMMIT.txt)
 kernel/pstv1080p.yml           module/export definition (library "pstv1080p", syscall: true)
 user/main.c                    pstv1080p_settings.suprx (Settings-app XML/registry/text hooks, native ladder patch)
 user/pstv1080p_settings.yml
@@ -808,6 +865,8 @@ int pstv1080pSetMode1080p(int enable);                 // persist + apply/revert
 int pstv1080pGetInfo(pstv1080p_info_t *out);           // version, current output mode, refresh_hz, last system mode,
                                                         // last apply result, hooks_ok bitmask, settings item value,
                                                         // reserved[5] = debug logging on
+int pstv1080pReadGames(char *buf, uint32_t size);      // (1.6.1) copy the override file (<= size-1 bytes, NUL-terminated); returns bytes read, 0 if none
+int pstv1080pWriteGames(const char *buf, uint32_t size); // (1.6.1) replace the override file with buf[0..size) (size <= 4096) and reload it
 int pstv1080pLog(const char *line);                    // (1.6) append "settings: <line>" to pstv1080p.log; no-op (returns 0)
                                                         // unless the debug switch existed at boot. The kernel copies a fixed
                                                         // 199 bytes from `line`, so pass a buffer readable for >= 199 bytes.
@@ -815,7 +874,7 @@ int pstv1080pLog(const char *line);                    // (1.6) append "settings
 
 Errors: `PSTV1080P_ERR_INVALID_ARG` (`0x80F18001`), `PSTV1080P_ERR_NOT_READY`
 (`0x80F18002`), `PSTV1080P_ERR_APPLY_FAILED` (`0x80F18003`), or a negative SCE
-error passed through. A config app can be built on these five calls; the
+error passed through. A config app can be built on these seven calls (the bundled Configurator is one); the
 struct layouts are fixed (64 bytes each, static-asserted in the header).
 
 ## Appendix: how the original plugin worked and what changed

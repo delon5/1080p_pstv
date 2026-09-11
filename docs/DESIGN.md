@@ -202,3 +202,31 @@ over user memory), NUL-terminates, strips trailing newlines and logs
 it before it has learned the debug state from `pstv1080pGetInfo`
 (`reserved[5]`). Developer dumps (page XML, module dumps) are written by the
 plugin itself to `ux0:data/pstv1080p/`, only in debug mode.
+
+
+## O. Configurator app (1.6.1)
+
+`configurator/main.c`, a vita2d LiveArea app (title id `PSTV1080C`, packed by
+the Makefile target `configurator` with vita-mksfoex / vita-pack-vpk; assets
+rendered once by `configurator/assets/make_assets.swift` and committed).
+
+**No file access of its own to the plugin's data.** The app calls
+`pstv1080pReadGames` / `pstv1080pWriteGames` (new 1.6.1 syscalls, 4 KiB
+bound, kernel-side `tbl_lock`, checked user copies) for the override file and
+`pstv1080pGetConfig` / `pstv1080pSetConfig` for the global options. The
+kernel reloads the override table right after a write, so a change applies to
+the next launch of that game. The app's only direct I/O is reading
+`<root>/<id>/sce_sys/param.sfo` (ux0:app, ur0:app, gro0:app) and
+`ur0:appmeta/<id>/param.sfo` for game names, which needs the unsafe-homebrew
+permission.
+
+**Round trip.** `#` lines and lines the kernel would ignore are kept verbatim
+and written back first; then one `TITLEID mode` line per game whose override is
+not `none`. Titles present in the file but not installed are kept as
+"(not installed)" rows. Mode names and their meaning mirror
+`games_list_load` in kernel/main.c exactly (`k_mode_name`).
+
+**Build notes.** The vdpm `libvita2d` package is hard-float (`-mfloat-abi=hard
+-mfpu=neon`) and needs `SceSharedFb` (a library of the SceAppMgr module whose
+stub the SDK snapshot lacks: the Makefile generates it from the NID database
+into build/stubs_appmgr as a regenerated libSceAppMgr_stub.a) and `sceAppMgrGetBudgetInfo` (SceDriverUser).

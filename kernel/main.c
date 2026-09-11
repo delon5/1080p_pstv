@@ -345,7 +345,7 @@ static proc_entry_t g_procs[PROC_ENTRIES];
 static SceUID g_tbl_mutex = -1;
 
 /* Per-title overrides (ur0:data/pstv1080p/pstv1080p_games.txt: "TITLEID mode" per line) */
-#define GAMES_LIST_MAX                32
+#define GAMES_LIST_MAX                PSTV1080P_GAMES_MAX_ENTRIES   /* 1.6.1: shared with the configurator (was 32) */
 typedef struct {
     char title[TITLE_ID_LEN];
     uint32_t mode;                  /* OVR_* */
@@ -942,6 +942,11 @@ static void games_list_load(int do_log)
                 memcpy(g_games[count].title, buf + s0, (unsigned int)(t_end - s0));
                 g_games[count].mode = mode;
                 count++;
+            } else {
+                bad++;
+                if (do_log)
+                    klog("games: ignored line '%.*s' (more than %u entries)", (int)(e - s0), buf + s0,
+                         (unsigned)GAMES_LIST_MAX);
             }
         }
     }
@@ -2443,6 +2448,83 @@ int pstv1080pLog(const char *line)
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
         buf[--n] = 0;
     klog("settings: %s", buf);
+    return 0;
+}
+
+/* 1.6.1: the configurator app edits the per-title override file through the
+ * kernel (a user app cannot touch ur0).  Both calls run in the caller's
+ * syscall context and share the parse buffer's lock with the loader. */
+static char g_games_io[PSTV1080P_GAMES_MAX_BYTES];
+
+int pstv1080pReadGames(char *buf, uint32_t size)
+{
+    SceUID fd;
+    int n = 0, ret;
+
+    if (!buf || size < 2 || size > PSTV1080P_GAMES_MAX_BYTES)
+        return PSTV1080P_ERR_INVALID_ARG;
+    tbl_lock();
+    fd = ksceIoOpen(PSTV1080P_GAMES_PATH, SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        n = ksceIoRead(fd, g_games_io, size - 1);
+        if (n < 0) {                          /* open ok but read failed: not "no file" */
+            ksceIoClose(fd);
+            tbl_unlock();
+            return n;
+        }
+        if (n == (int)size - 1) {             /* buffer full: is there more? */
+            char c;
+            if (ksceIoRead(fd, &c, 1) > 0) {
+                ksceIoClose(fd);
+                tbl_unlock();
+                return PSTV1080P_ERR_TOO_LARGE;
+            }
+        }
+        ksceIoClose(fd);
+    }
+    g_games_io[n] = 0;
+    ret = ksceKernelCopyToUser(buf, g_games_io, (SceSize)n + 1);
+    tbl_unlock();
+    return ret < 0 ? ret : n;
+}
+
+int pstv1080pWriteGames(const char *buf, uint32_t size)
+{
+    SceUID fd;
+    int ret, w;
+
+    if (!buf || size > PSTV1080P_GAMES_MAX_BYTES)
+        return PSTV1080P_ERR_INVALID_ARG;
+    tbl_lock();
+    ret = ksceKernelCopyFromUser(g_games_io, buf, size);
+    if (ret < 0) {
+        tbl_unlock();
+        return ret;
+    }
+    /* Stage in a temporary file so a short or failed write can never destroy
+     * the existing overrides; the real file is replaced only afterwards. */
+    ensure_dir();
+    fd = ksceIoOpen(PSTV1080P_GAMES_TMP_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    if (fd < 0) {
+        tbl_unlock();
+        return (int)fd;
+    }
+    w = size ? ksceIoWrite(fd, g_games_io, size) : 0;
+    ksceIoClose(fd);
+    if (w != (int)size) {
+        ksceIoRemove(PSTV1080P_GAMES_TMP_PATH);      /* real file untouched */
+        tbl_unlock();
+        return w < 0 ? w : PSTV1080P_ERR_APPLY_FAILED;
+    }
+    ksceIoRemove(PSTV1080P_GAMES_PATH);              /* rename refuses an existing destination */
+    ret = ksceIoRename(PSTV1080P_GAMES_TMP_PATH, PSTV1080P_GAMES_PATH);
+    games_list_load(1);                 /* the table always mirrors what is on disk */
+    tbl_unlock();
+    if (ret < 0) {
+        klog("games: rename of the staging file failed (0x%08X); new content is in " PSTV1080P_GAMES_TMP_PATH, (unsigned)ret);
+        return ret;
+    }
+    klog("games: file replaced by the configurator (%u bytes)", (unsigned)size);
     return 0;
 }
 
