@@ -48,6 +48,16 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.3 (2026-09-12)** — **`novsync` switch.** A game can now carry any of
+  the existing options *plus* `novsync` (`PCSE00080 nowait novsync inject`).
+  `novsync` makes every `sceDisplaySetFrameBuf` flip immediate, exactly what
+  `novsync.suprx` does; on its own it also drops all vblank waits (the full
+  novsync.suprx behaviour). Games that throttle themselves through the flip
+  were untouched by every earlier option; the old `novsync.suprx` +
+  `Framecapper60Inject.suprx` pair is `nowait novsync inject`. `inject` is now
+  honoured with any option when given explicitly. The Configurator's picker
+  has the switch as a checkbox under the options. Single-word lines are
+  unchanged.
 - **1.6.2 (2026-09-12)** — `trace` override: while the traced game runs, the
   kernel logs a **display-call profile** every 5 s (flips with next-frame vs
   immediate sync, `WaitVblankStart*`, `WaitSetFrameBuf*`, `GetVcount`, whether
@@ -442,6 +452,7 @@ PCSB01206    frameskip
 | `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
 | `trace` | Diagnostic only: logs the title's process lifecycle, every memory block allocation with its result, free-memory queries and (1.6.2) a display-call profile every 5 s to `pstv1080p.log` (debug logging must be on). Slows that game's start-up slightly. Remove the line when done. |
+| `novsync` | Switch that attaches to any option (or stands alone): every flip is made immediate (`SCE_DISPLAY_SETBUF_IMMEDIATE`), which is what `novsync.suprx` does; alone it also returns every vblank wait at once. For games that throttle themselves through the flip rather than through a wait call, which no other option can reach. The old `novsync.suprx` + `Framecapper60Inject.suprx` pair = `nowait novsync inject`. |
 | `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`, `sceDisplayGetRefreshRate`) answer as if the output were 720p60. For games that crash with C2-12828-1 before drawing anything under 1080p30 but run under 720p (Tales of Hearts R). |
 
 How to find a title id: launch the game once and read `ux0:data/pstv1080p/pstv1080p.log`;

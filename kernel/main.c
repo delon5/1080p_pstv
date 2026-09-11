@@ -315,22 +315,25 @@ static volatile SceUID g_shell_pid = 0;
 #define PROC_ENTRIES                  8
 #define VS_IDLE_PERIODS_X2            9              /* inject if no sync activity for > 4.5 refresh periods */
 enum {
-    OVR_NONE = 0,   /* no per-title entry: global rules apply */
-    OVR_OFF,        /* "off":       no pacing change, no inject */
+    /* 1.6.3: one PACING rule per title (this enum) plus any combination of
+     * EXTRAS (OVRF_* flags below); a line reads "TITLEID rule extra extra". */
+    OVR_NONE = 0,   /* no rule given: global rules apply */
+    OVR_OFF,        /* "off":       no pacing change (inject only if asked for explicitly) */
     OVR_SCALE,      /* "scale":     SCALE rule + global inject setting, whatever the global mode */
     OVR_FRAMESKIP,  /* "frameskip": fractional vsync for frame-locked 60 fps games (2 logic frames per 30 Hz vblank) */
-    OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once (like novsync), no inject */
-    OVR_INJECT,     /* "inject":    always wait one period after each flip (Framecapper Inject) */
-    OVR_FORCE,      /* "force":     FORCE rule for this title, whatever the global mode */
-    OVR_SPOOF720,   /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head
-                     *              (for games that crash at start-up under a 1080p30 head) */
-    OVR_TRACE       /* "trace":     default pacing; DIAGNOSTIC: log the process lifecycle, every memory block
-                     *              allocation (name/type/size/result) and free-memory queries of this title */
+    OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once */
+    OVR_FORCE       /* "force":     FORCE rule for this title, whatever the global mode */
 };
+#define OVRF_INJECT    0x1u   /* "inject":   always wait one period after each flip (Framecapper Inject) */
+#define OVRF_NOVSYNC   0x2u   /* "novsync":  every flip is made IMMEDIATE (what novsync.suprx does); with no
+                               *             rule given it also implies "nowait" (novsync.suprx behaviour) */
+#define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
+#define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
     volatile SceUID pid;
     volatile uint32_t allowed;      /* FORCE title-filter verdict */
-    volatile uint32_t override;     /* OVR_* */
+    volatile uint32_t override;     /* OVR_* pacing rule */
+    volatile uint32_t flags;        /* OVRF_* extras (1.6.3) */
     volatile uint32_t acc;          /* frameskip credit, units of 1/60 vblank */
     volatile SceInt64 last_sync_us; /* last vsync-related syscall entry/exit */
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
@@ -356,7 +359,8 @@ static SceUID g_tbl_mutex = -1;
 #define GAMES_LIST_MAX                PSTV1080P_GAMES_MAX_ENTRIES   /* 1.6.1: shared with the configurator (was 32) */
 typedef struct {
     char title[TITLE_ID_LEN];
-    uint32_t mode;                  /* OVR_* */
+    uint32_t mode;                  /* OVR_* pacing rule */
+    uint32_t flags;                 /* OVRF_* extras */
 } game_override_t;
 static game_override_t g_games[GAMES_LIST_MAX];
 static uint32_t g_games_count = 0;
@@ -753,6 +757,7 @@ static void proc_clear(void)
         g_procs[i].pid = 0;
         g_procs[i].allowed = 0;
         g_procs[i].override = OVR_NONE;
+        g_procs[i].flags = 0;
         g_procs[i].acc = 0;
         g_procs[i].last_sync_us = 0;
         g_procs[i].cb_synced = 0;
@@ -858,12 +863,25 @@ static const char *ovr_name(uint32_t m)
     case OVR_SCALE:     return "scale";
     case OVR_FRAMESKIP: return "frameskip";
     case OVR_NOWAIT:    return "nowait";
-    case OVR_INJECT:    return "inject";
     case OVR_FORCE:     return "force";
-    case OVR_SPOOF720:  return "spoof720";
-    case OVR_TRACE:     return "trace";
     default:            return "none";
     }
+}
+
+/* "rule+extra+extra" for the log ("none" when nothing is set). */
+static const char *ovr_desc(uint32_t mode, uint32_t flags, char *buf, int len)
+{
+    int n = 0;
+    buf[0] = 0;
+    if (mode != OVR_NONE)
+        n += snprintf(buf + n, (unsigned)(len - n), "%s", ovr_name(mode));
+    if (flags & OVRF_NOVSYNC)  n += snprintf(buf + n, (unsigned)(len - n), "%snovsync",  n ? "+" : "");
+    if (flags & OVRF_INJECT)   n += snprintf(buf + n, (unsigned)(len - n), "%sinject",   n ? "+" : "");
+    if (flags & OVRF_SPOOF720) n += snprintf(buf + n, (unsigned)(len - n), "%sspoof720", n ? "+" : "");
+    if (flags & OVRF_TRACE)    n += snprintf(buf + n, (unsigned)(len - n), "%strace",    n ? "+" : "");
+    if (n == 0)
+        snprintf(buf, (unsigned)len, "none");
+    return buf;
 }
 
 static int str_ieq(const char *a, int alen, const char *b)
@@ -906,7 +924,8 @@ static void games_list_load(int do_log)
     for (i = 0; i <= len; i++) {
         if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == 0) {
             int s0 = start, e = i, t_end, m_start, m_end;
-            uint32_t mode = OVR_NONE;
+            uint32_t mode = OVR_NONE, flags = 0;
+            int unknown = 0, ntok = 0;
             start = i + 1;
             while (s0 < e && (buf[s0] == ' ' || buf[s0] == '\t'))
                 s0++;
@@ -931,24 +950,42 @@ static void games_list_load(int do_log)
                          (int)(e - s0), buf + s0);
                 continue;
             }
-            if (str_ieq(buf + m_start, m_end - m_start, "off"))            mode = OVR_OFF;
-            else if (str_ieq(buf + m_start, m_end - m_start, "scale"))     mode = OVR_SCALE;
-            else if (str_ieq(buf + m_start, m_end - m_start, "frameskip")) mode = OVR_FRAMESKIP;
-            else if (str_ieq(buf + m_start, m_end - m_start, "nowait"))    mode = OVR_NOWAIT;
-            else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
-            else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
-            else if (str_ieq(buf + m_start, m_end - m_start, "spoof720"))  mode = OVR_SPOOF720;
-            else if (str_ieq(buf + m_start, m_end - m_start, "trace"))     mode = OVR_TRACE;
-            else {
+            /* 1.6.3: every word after the id is a pacing rule (last one wins)
+             * or an extra flag; any unknown word rejects the line. */
+            while (m_start < e) {
+                int tl = m_end - m_start;
+                if      (str_ieq(buf + m_start, tl, "off"))       mode = OVR_OFF;
+                else if (str_ieq(buf + m_start, tl, "scale"))     mode = OVR_SCALE;
+                else if (str_ieq(buf + m_start, tl, "frameskip")) mode = OVR_FRAMESKIP;
+                else if (str_ieq(buf + m_start, tl, "nowait"))    mode = OVR_NOWAIT;
+                else if (str_ieq(buf + m_start, tl, "force"))     mode = OVR_FORCE;
+                else if (str_ieq(buf + m_start, tl, "inject"))    flags |= OVRF_INJECT;
+                else if (str_ieq(buf + m_start, tl, "novsync"))   flags |= OVRF_NOVSYNC;
+                else if (str_ieq(buf + m_start, tl, "spoof720"))  flags |= OVRF_SPOOF720;
+                else if (str_ieq(buf + m_start, tl, "trace"))     flags |= OVRF_TRACE;
+                else { unknown = 1; break; }
+                ntok++;
+                m_start = m_end;
+                while (m_start < e && (buf[m_start] == ' ' || buf[m_start] == '\t'))
+                    m_start++;
+                m_end = m_start;
+                while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t')
+                    m_end++;
+            }
+            if (unknown || ntok == 0) {
                 bad++;
                 if (do_log)
-                    klog("games: ignored line '%.*s' (unknown mode)", (int)(e - s0), buf + s0);
+                    klog("games: ignored line '%.*s' (unknown word)", (int)(e - s0), buf + s0);
                 continue;
             }
+            /* "novsync" with no rule = the novsync.suprx behaviour (waits too). */
+            if (mode == OVR_NONE && (flags & OVRF_NOVSYNC))
+                mode = OVR_NOWAIT;
             if (count < GAMES_LIST_MAX) {
                 memset(g_games[count].title, 0, TITLE_ID_LEN);
                 memcpy(g_games[count].title, buf + s0, (unsigned int)(t_end - s0));
                 g_games[count].mode = mode;
+                g_games[count].flags = flags;
                 count++;
             } else {
                 bad++;
@@ -974,7 +1011,9 @@ static void games_list_load(int do_log)
                 pos = snprintf(line, sizeof(line), "games:  ");
                 if (pos < 0) pos = 0;
             }
-            n = snprintf(line + pos, sizeof(line) - (unsigned)pos, " %s=%s", g_games[k].title, ovr_name(g_games[k].mode));
+            char d[48];
+            n = snprintf(line + pos, sizeof(line) - (unsigned)pos, " %s=%s", g_games[k].title,
+                         ovr_desc(g_games[k].mode, g_games[k].flags, d, sizeof(d)));
             if (n < 0 || pos + n >= (int)sizeof(line))
                 break;
             pos += n;
@@ -989,7 +1028,7 @@ static int trace_configured(void)
 {
     uint32_t i;
     for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++)
-        if (g_games[i].mode == OVR_TRACE)
+        if (g_games[i].flags & OVRF_TRACE)
             return 1;
     return 0;
 }
@@ -1014,18 +1053,22 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
 
     games_list_load(0);
     e->override = OVR_NONE;
+    e->flags = 0;
     for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
         if (strncmp(e->title, g_games[i].title, TITLE_ID_LEN) == 0) {
             e->override = g_games[i].mode;
+            e->flags = g_games[i].flags;
             break;
         }
     }
     /* Quiet mode: games and homebrew only (system apps NPXS* and the shell
      * are noise for the user; they still show up in verbose mode). */
-    if (g_verbose || (pid != g_shell_pid && strncmp(e->title, "NPXS", 4) != 0))
+    if (g_verbose || (pid != g_shell_pid && strncmp(e->title, "NPXS", 4) != 0)) {
+        char d[48];
         klog("process: pid=0x%08X title=%s override=%s%s", (unsigned)pid,
-             e->title[0] ? e->title : "?", ovr_name(e->override),
+             e->title[0] ? e->title : "?", ovr_desc(e->override, e->flags, d, sizeof(d)),
              (pid == g_shell_pid) ? " (shell, never paced)" : "");
+    }
 }
 
 /* v1.4.1: process lifecycle events.  A finished process's entry is dropped
@@ -1068,7 +1111,7 @@ static int pid_is_trace_title(SceUID pid, char *title_out)
         return 0;
     tid[sizeof(tid) - 1] = 0;
     for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
-        if (g_games[i].mode == OVR_TRACE && strncmp(tid, g_games[i].title, TITLE_ID_LEN) == 0) {
+        if ((g_games[i].flags & OVRF_TRACE) && strncmp(tid, g_games[i].title, TITLE_ID_LEN) == 0) {
             if (title_out)
                 memcpy(title_out, tid, TITLE_ID_LEN);
             return 1;
@@ -1130,12 +1173,15 @@ static void trace_profile_tick(void)
         d[i] = now[i] - g_prof_snap[i];
         g_prof_snap[i] = now[i];
     }
-    klog("trace: display %u ms: flips next=%u imm=%u (%u/s) | WaitVblank=%u cb=%u multi=%u (max n=%u) | WaitSetFB=%u multi=%u | GetVcount=%u | vblank callback=%s | override=%s hz=%u",
-         ms, d[PF_SETFB_NEXT], d[PF_SETFB_IMM],
-         ms ? (unsigned)(((uint64_t)(d[PF_SETFB_NEXT] + d[PF_SETFB_IMM]) * 1000u) / ms) : 0u,
-         d[PF_WAITVB], d[PF_WAITVBCB], d[PF_WAITVBMULTI], now[PF_MULTI_MAX],
-         d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
-         e->cb_synced ? "yes" : "no", ovr_name(e->override), (unsigned)g_refresh_hz);
+    {
+        char od[48];
+        klog("trace: display %u ms: flips next=%u imm=%u (%u/s) | WaitVblank=%u cb=%u multi=%u (max n=%u) | WaitSetFB=%u multi=%u | GetVcount=%u | vblank callback=%s | override=%s hz=%u",
+             ms, d[PF_SETFB_NEXT], d[PF_SETFB_IMM],
+             ms ? (unsigned)(((uint64_t)(d[PF_SETFB_NEXT] + d[PF_SETFB_IMM]) * 1000u) / ms) : 0u,
+             d[PF_WAITVB], d[PF_WAITVBCB], d[PF_WAITVBMULTI], now[PF_MULTI_MAX],
+             d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
+             e->cb_synced ? "yes" : "no", ovr_desc(e->override, e->flags, od, sizeof(od)), (unsigned)g_refresh_hz);
+    }
 }
 
 static void trace_event(SceUID pid, const char *what)
@@ -1304,15 +1350,29 @@ static inline void proc_mark_sync(proc_entry_t *e)
 #define PACE_NOWAIT                   4u
 typedef struct {
     uint32_t mode;      /* PSTV1080P_FPS_OFF / SCALE / FORCE, PACE_FRAMESKIP, PACE_NOWAIT */
-    uint32_t inject;    /* 0 off, 1 auto, 2 always */
+    uint32_t inject;    /* 0 off, 1 auto, 2 always (explicit: honoured with every rule) */
+    uint32_t novsync;   /* 1.6.3: make every flip IMMEDIATE (novsync.suprx) */
 } pace_t;
 
+static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out);
+
 static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
+{
+    pace_base(pid, pe, out);
+    if (*pe) {                              /* 1.6.3 extras on top of the rule */
+        uint32_t f = (*pe)->flags;
+        if (f & OVRF_INJECT)  out->inject = 2;
+        if (f & OVRF_NOVSYNC) out->novsync = 1;
+    }
+}
+
+static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
 {
     proc_entry_t *e;
 
     out->mode = PSTV1080P_FPS_OFF;
     out->inject = 0;
+    out->novsync = 0;
     *pe = NULL;
     if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return;
@@ -1327,22 +1387,16 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         out->inject = g_cfg.fps_inject;
         return;
     case OVR_FRAMESKIP:
-        out->mode = PACE_FRAMESKIP;     /* such games sync themselves: never inject */
+        out->mode = PACE_FRAMESKIP;     /* such games sync themselves: no automatic inject */
         return;
     case OVR_NOWAIT:
         out->mode = PACE_NOWAIT;
-        return;
-    case OVR_INJECT:
-        out->mode = (g_cfg.fps_mode == PSTV1080P_FPS_FORCE) ? PSTV1080P_FPS_FORCE : PSTV1080P_FPS_SCALE;
-        out->inject = 2;
         return;
     case OVR_FORCE:
         out->mode = PSTV1080P_FPS_FORCE;
         out->inject = g_cfg.fps_inject;
         return;
-    case OVR_SPOOF720:  /* pacing follows the global rules; only the info queries differ */
-    case OVR_TRACE:     /* pacing follows the global rules; diagnostics only */
-    default:
+    default:                            /* no rule: the global rules below */
         break;
     }
 
@@ -1695,7 +1749,7 @@ static inline proc_entry_t *spoof_entry_for(SceUID pid)
     if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return NULL;
     e = proc_lookup(pid, 1);
-    return (e && e->override == OVR_SPOOF720) ? e : NULL;
+    return (e && (e->flags & OVRF_SPOOF720)) ? e : NULL;
 }
 
 static int hook_GetMaximumFrameBufResolution(uint32_t *pWidth, uint32_t *pHeight)
@@ -1754,11 +1808,11 @@ static int hook_GetRefreshRate(float *pFps)
         if (e && ret >= 0 && pFps) {
             uint32_t ob = 0;
             ksceKernelCopyFromUser(&ob, pFps, sizeof(ob));
-            if (e->override == OVR_SPOOF720) {
+            if (e->flags & OVRF_SPOOF720) {
                 uint32_t sb = 0x426FC28Fu;           /* 59.94f */
                 ksceKernelCopyToUser(pFps, &sb, sizeof(sb));
             }
-            if (!(e->acc & 0x20000000u) && e->override == OVR_SPOOF720) {
+            if (!(e->acc & 0x20000000u) && (e->flags & OVRF_SPOOF720)) {
                 e->acc |= 0x20000000u;
                 klog("spoof720: %s GetRefreshRate bits=0x%08X -> 0x426FC28F (59.94)", e->title, ob);
             }
@@ -1836,12 +1890,21 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
 
     pace_for(pid, &e, &pc);
     PF_INC(e, sync ? PF_SETFB_NEXT : PF_SETFB_IMM);
+    /* 1.6.3 "novsync": the flip never waits for the next frame, exactly what
+     * novsync.suprx does; a game that throttles itself through the flip is
+     * otherwise capped at the output rate no matter what the wait hooks do. */
+    if (pc.novsync && sync != 0)
+        sync = 0;                                   /* SCE_DISPLAY_SETBUF_IMMEDIATE */
     ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
 
-    if (pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT && pc.mode != PACE_FRAMESKIP
-        && pc.inject != 0u && inject_wanted(e, pc.inject)) {
+    /* Inject: an explicit "inject" extra applies with any rule (Framecapper
+     * Inject); the automatic kind only where the rule allows it. */
+    if (pc.inject == 2u ||
+        (pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT && pc.mode != PACE_FRAMESKIP
+         && pc.inject != 0u && inject_wanted(e, pc.inject))) {
         unsigned int n = (pc.mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
         ksceDisplayWaitVblankStartMulti(n);
+        proc_mark_sync(e);
     }
     /* After the flip: run a scheduled HD apply from SceShell's context (A9). */
     shell_apply_check_pid(pid);

@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.2"
+#define APP_VERSION      "1.6.3"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -132,9 +132,14 @@ typedef struct {
     char tail[TAIL_LEN];   /* whatever followed the mode on its line (a note), written back */
     int  mode;
     int  orig_mode;
+    int  novsync;          /* 1.6.3: the "novsync" switch attached to the option */
+    int  orig_novsync;
     int  installed;
     int  from_file;        /* this title had a line in the file (first line wins, like the kernel) */
 } game_t;
+
+static const char k_novsync_desc[] =
+    "novsync: every flip is immediate and (with no option) all vblank waits return at once, like novsync.suprx.";
 
 static game_t g_games[MAX_GAMES];
 static int g_ngames;
@@ -163,11 +168,21 @@ static void set_status(unsigned color, const char *fmt, ...)
     g_status_frames = 60 * 5;
 }
 
+static int game_changed(const game_t *g)
+{
+    return g->mode != g->orig_mode || g->novsync != g->orig_novsync;
+}
+
+static int game_active(const game_t *g)
+{
+    return g->mode != M_NONE || g->novsync;
+}
+
 static int dirty(void)
 {
     int i;
     for (i = 0; i < g_ngames; i++)
-        if (g_games[i].mode != g_games[i].orig_mode)
+        if (game_changed(&g_games[i]))
             return 1;
     return 0;
 }
@@ -176,9 +191,35 @@ static int active_count(void)
 {
     int i, n = 0;
     for (i = 0; i < g_ngames; i++)
-        if (g_games[i].mode != M_NONE)
+        if (game_active(&g_games[i]))
             n++;
     return n;
+}
+
+/* Remove the first whole-word, case-insensitive occurrence of word from s
+ * (collapsing the surrounding blank).  Returns 1 if it was there. */
+static int strip_word(char *s, const char *word)
+{
+    int wl = (int)strlen(word), i, n = (int)strlen(s);
+    for (i = 0; i + wl <= n; i++) {
+        int j;
+        if (i > 0 && s[i - 1] != ' ' && s[i - 1] != '\t')
+            continue;
+        for (j = 0; j < wl; j++)
+            if (tolower((unsigned char)s[i + j]) != word[j])
+                break;
+        if (j != wl || (s[i + wl] != 0 && s[i + wl] != ' ' && s[i + wl] != '\t'))
+            continue;
+        {
+            int end = i + wl;
+            while (s[end] == ' ' || s[end] == '\t') end++;
+            memmove(s + i, s + end, (size_t)(n - end + 1));
+            n = (int)strlen(s);
+            while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static game_t *find_game(const char *id)
@@ -269,6 +310,10 @@ static void load_games_file(void)
             m_end = m_start;
             while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t') m_end++;
             mode = (m_start < e) ? mode_from_name(buf + m_start, m_end - m_start) : -1;
+            /* "TITLEID novsync ..." (no option): the switch alone. */
+            if (mode < 0 && m_start < e && (m_end - m_start) == 7 &&
+                strncasecmp(buf + m_start, "novsync", 7) == 0)
+                mode = M_NONE;
             if ((t_end - s0) != 9 || mode < 0) {
                 /* The kernel ignores such a line too; keep it so nothing is lost. */
                 comments_append(buf + s0, e - s0);
@@ -295,8 +340,9 @@ static void load_games_file(void)
                 g->from_file = 1;
                 g->mode = mode;
                 g->orig_mode = mode;
-                /* Anything after the mode (a note) is written back on the same line. */
-                ts = m_end;
+                /* Everything after the option is kept and written back on the
+                 * same line; the "novsync" word in it is our switch. */
+                ts = (mode == M_NONE) ? m_start : m_end;   /* line was "ID novsync ..." */
                 while (ts < e && (buf[ts] == ' ' || buf[ts] == '\t'))
                     ts++;
                 tl = e - ts;
@@ -304,6 +350,9 @@ static void load_games_file(void)
                     tl = TAIL_LEN - 1;
                 memcpy(g->tail, buf + ts, (size_t)tl);
                 g->tail[tl] = 0;
+                if (strip_word(g->tail, "novsync"))
+                    g->novsync = 1;
+                g->orig_novsync = g->novsync;
             }
         }
     }
@@ -357,18 +406,22 @@ static int save_games_file(void)
     }
     for (i = 0; i < g_ngames; i++) {
         const game_t *g = &g_games[i];
-        int need;
-        if (g->mode == M_NONE)
+        char line[9 + 1 + 12 + 8 + TAIL_LEN + 4];
+        int n = 0;
+        if (!game_active(g))
             continue;
-        need = 9 + 1 + (int)strlen(k_mode_name[g->mode]) + (g->tail[0] ? 1 + (int)strlen(g->tail) : 0) + 2;
-        if (pos + need >= (int)sizeof(buf)) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, "%s", g->id);
+        if (g->mode != M_NONE)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_mode_name[g->mode]);
+        if (g->novsync)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " novsync");
+        if (g->tail[0])
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", g->tail);
+        if (pos + n + 2 >= (int)sizeof(buf)) {
             set_status(C_ERR, "Too many overrides for one file (limit reached after %d): nothing saved", count);
             return -1;
         }
-        if (g->tail[0])
-            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%s %s %s\n", g->id, k_mode_name[g->mode], g->tail);
-        else
-            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%s %s\n", g->id, k_mode_name[g->mode]);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%s\n", line);
         count++;
     }
     buf[pos] = 0;
@@ -378,8 +431,10 @@ static int save_games_file(void)
         set_status(C_ERR, "Save failed: 0x%08X", (unsigned)r);
         return r;
     }
-    for (i = 0; i < g_ngames; i++)
+    for (i = 0; i < g_ngames; i++) {
         g_games[i].orig_mode = g_games[i].mode;
+        g_games[i].orig_novsync = g_games[i].novsync;
+    }
     g_file_present = 1;
     set_status(C_OK, "Saved %d override(s) to ur0:data/pstv1080p/pstv1080p_games.txt", count);
     return 0;
@@ -680,8 +735,10 @@ static void draw_games(void)
         fit_text(nm, sizeof(nm), g->name, NAME_MAX_W);
         text(COL_NAME_X, y + 20, name_col, nm);
         text(COL_ID_X, y + 20, C_DIM, g->id);
-        textf(COL_MODE_X, y + 20, mode_color(g->mode), "%s%s", k_mode_name[g->mode],
-              (g->mode != g->orig_mode) ? " *" : "");
+        textf(COL_MODE_X, y + 20, game_active(g) ? mode_color(g->mode == M_NONE ? M_NOWAIT : g->mode) : (unsigned)C_DIM,
+              "%s%s%s", (g->mode == M_NONE && g->novsync) ? "" : k_mode_name[g->mode],
+              g->novsync ? ((g->mode == M_NONE) ? "novsync" : "+novsync") : "",
+              game_changed(g) ? " *" : "");
     }
     if (g_ngames > LIST_ROWS) {
         /* scrollbar */
@@ -712,9 +769,11 @@ static void draw_popup_box(int w, int h, const char *title)
     text(x + 20, y + 32, C_TEXT, title);
 }
 
+#define PICK_ROWS (M_COUNT + 1)          /* the options + the novsync switch */
+
 static void draw_modepick(void)
 {
-    int w = 760, h = 24 + 40 + M_COUNT * 30 + 70, x = (SCREEN_W - w) / 2, y = (SCREEN_H - h) / 2, i;
+    int w = 760, h = 24 + 40 + PICK_ROWS * 30 + 80, x = (SCREEN_W - w) / 2, y = (SCREEN_H - h) / 2, i;
     char title[160];
     const game_t *g = &g_games[g_sel];
     draw_games();
@@ -728,8 +787,16 @@ static void draw_modepick(void)
         if (i == g->mode)
             text(x + 160, ry + 20, C_DIM, "(current)");
     }
-    text(x + 20, y + h - 40, C_DIM, k_mode_desc[g_pick_sel]);
-    text(x + 20, y + h - 14, C_DIM, "X choose   O cancel");
+    {
+        int ry = y + 50 + M_COUNT * 30 + 6;
+        vita2d_draw_rectangle(x + 12, ry - 4, w - 24, 1, C_POPUP_BRD);
+        if (g_pick_sel == M_COUNT)
+            vita2d_draw_rectangle(x + 12, ry, w - 24, 28, C_SEL);
+        textf(x + 24, ry + 20, g->novsync ? C_WARN : C_DIM, "[%s] novsync", g->novsync ? "X" : " ");
+        text(x + 160, ry + 20, C_DIM, "attach to any option (X toggles)");
+    }
+    text(x + 20, y + h - 40, C_DIM, g_pick_sel == M_COUNT ? k_novsync_desc : k_mode_desc[g_pick_sel]);
+    text(x + 20, y + h - 14, C_DIM, "X choose / toggle   O close");
 }
 
 static void draw_confirm_exit(void)
@@ -743,12 +810,15 @@ static void draw_help(void)
 {
     int y = 120, i;
     draw_games();
-    draw_popup_box(860, 340, "Per-game overrides (saved to ur0:data/pstv1080p/pstv1080p_games.txt)");
+    draw_popup_box(860, 372, "Per-game overrides (saved to ur0:data/pstv1080p/pstv1080p_games.txt)");
     for (i = 1; i < M_COUNT; i++) {
         textf(70, y, mode_color(i), "%-10s", k_mode_name[i]);
         text(190, y, C_TEXT, k_mode_desc[i]);
         y += 28;
     }
+    textf(70, y, C_WARN, "%-10s", "novsync");
+    text(190, y, C_TEXT, "Switch on top of any option: immediate flips (+ no waits when alone). Old novsync+Framecapper60Inject = nowait+novsync+inject.");
+    y += 28;
     text(70, y + 12, C_DIM, "Changes apply the next time the game is started; no reboot needed.");
     text(70, y + 40, C_DIM, "O close");
 }
@@ -906,6 +976,7 @@ static void input_games(unsigned b)
     if (g && (b & SCE_CTRL_LEFT))  g->mode = (g->mode + M_COUNT - 1) % M_COUNT;
     if (g && (b & SCE_CTRL_SQUARE)) {
         g->mode = M_NONE;
+        g->novsync = 0;
         set_status(C_DIM, "Override removed for %s (press START to save)", g->id);
     }
     if (g && (b & SCE_CTRL_CROSS)) { g_pick_sel = g->mode; g_screen = SCR_MODEPICK; }
@@ -920,11 +991,15 @@ static void input_games(unsigned b)
 
 static void input_modepick(unsigned b)
 {
-    if (b & SCE_CTRL_UP)   g_pick_sel = (g_pick_sel + M_COUNT - 1) % M_COUNT;
-    if (b & SCE_CTRL_DOWN) g_pick_sel = (g_pick_sel + 1) % M_COUNT;
+    if (b & SCE_CTRL_UP)   g_pick_sel = (g_pick_sel + PICK_ROWS - 1) % PICK_ROWS;
+    if (b & SCE_CTRL_DOWN) g_pick_sel = (g_pick_sel + 1) % PICK_ROWS;
     if (b & SCE_CTRL_CROSS) {
-        g_games[g_sel].mode = g_pick_sel;
-        g_screen = SCR_GAMES;
+        if (g_pick_sel == M_COUNT) {
+            g_games[g_sel].novsync = !g_games[g_sel].novsync;   /* toggle, stay open */
+        } else {
+            g_games[g_sel].mode = g_pick_sel;
+            g_screen = SCR_GAMES;
+        }
     }
     if (b & SCE_CTRL_CIRCLE) g_screen = SCR_GAMES;
 }
