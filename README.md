@@ -44,6 +44,15 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.4 (2026-09-11)** — fixes "switching from 1080i to 1080p sometimes
+  does not change the output". Sony's Settings code switches the head to
+  "automatic" just before the plugin asks for 1080p30; if the driver is still
+  in that transition the request is dropped, and the plugin's retries were
+  only executed from SceShell's display calls, which do not happen while the
+  Settings app is open, so they timed out through the kernel-thread fallback
+  the driver refuses. Retries now run from any process's display call, the
+  plugin waits up to 0.5 s after a system-initiated switch before issuing its
+  own, and the first retries come after 1 s and 2 s instead of 3 s and 5 s.
 - **1.4.3 (2026-09-11)** — diagnostic per-game mode `trace`: for a listed
   title, `kernel.log` records the process create/start/exit/kill events with
   timings, every `sceKernelAllocMemBlock` request (name, type, size, result)

@@ -282,6 +282,8 @@ static volatile uint32_t g_hd_alias = 0;           /* driver's own readback for 
                                                     * visibly changed the readback to something other than our code */
 static volatile int32_t  g_last_apply_result = 0;  /* result of the last call WE issued */
 static volatile int32_t  g_last_setres_ret = 0;    /* result of the last call anyone issued */
+static volatile SceInt64 g_last_sys_setres_us = 0; /* when Sony's code last called SetResolution (v1.4.4) */
+#define SYS_SETRES_SETTLE_US          (500u * 1000u)
 static volatile int      g_self_apply = 0;         /* set while we call the export ourselves */
 
 /* Process filter */
@@ -345,7 +347,7 @@ static volatile SceInt64 g_apply_due_us = 0;       /* earliest time the schedule
 static volatile int g_apply_pending = 0;           /* an attempt is scheduled (run from SceShell's syscall context when possible) */
 static volatile int g_in_apply = 0;                /* an apply is executing (re-entrancy guard for the SetFrameBuf hook) */
 static SceInt64 g_last_apply_time = 0;
-static const uint32_t k_apply_backoff_s[APPLY_MAX_ATTEMPTS_EPISODE] = { 3, 5, 8, 12, 20, 30, 45, 60, 60, 60 };
+static const uint32_t k_apply_backoff_s[APPLY_MAX_ATTEMPTS_EPISODE] = { 1, 2, 4, 8, 12, 20, 30, 45, 60, 60 };
 static volatile int g_marker_pending = 0;   /* marker file exists and must be removed after safe_boot_seconds */
 static int g_boot_apply_done = 0;
 
@@ -1188,10 +1190,14 @@ static void run_pending_apply(const char *ctx);
  * from the first SceShell display syscall that comes along (frame flip or
  * vblank wait), i.e. from a user-process syscall context.  One volatile load
  * per call when nothing is pending. */
+/* v1.4.4: a pending apply runs from the display syscall of ANY user process
+ * (the export only refuses kernel-thread callers).  Inside the Settings app
+ * SceShell is not drawing, so restricting this to the shell made retries
+ * time out there (1080i -> 1080p "does not change"). */
 static inline void shell_apply_check_pid(SceUID pid)
 {
-    if (g_apply_pending && g_shell_pid > 0 && pid == g_shell_pid)
-        run_pending_apply("shell");
+    if (g_apply_pending && pid > 0 && pid != KERNEL_PID)
+        run_pending_apply(pid == g_shell_pid ? "shell" : "user process");
 }
 
 /* Common prologue of the wait hooks. */
@@ -1683,6 +1689,8 @@ static int hook_HdmiSetResolution(int mode)
 
     ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode);
     g_last_setres_ret = ret;
+    if (!g_self_apply)
+        g_last_sys_setres_us = now_us();
 
     klog("avconfig: SetResolution requested=0x%04X applied=0x%04X ret=0x%08X self=%d",
          (unsigned)requested, (unsigned)mode, (unsigned)ret, g_self_apply);
@@ -1731,6 +1739,16 @@ static int apply_hd_mode(const char *why)
     }
     g_apply_attempts++;
     g_apply_total++;
+
+    /* Sony's Settings code switches the head to "automatic" right before the
+     * plugin gets its turn; a request issued while the driver is still in
+     * that transition is silently dropped.  Let it settle first (we are on a
+     * user thread inside a syscall: sleeping here is fine). */
+    {
+        SceInt64 since = now_us() - g_last_sys_setres_us;
+        if (g_last_sys_setres_us != 0 && since >= 0 && since < (SceInt64)SYS_SETRES_SETTLE_US)
+            ksceKernelDelayThread((SceUInt)(SYS_SETRES_SETTLE_US - (uint32_t)since));
+    }
 
     g_in_apply = 1;
     ret = call_set_resolution(g_cfg.hd_mode_code);
