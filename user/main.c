@@ -776,6 +776,94 @@ static void release_page_hooks(void)
     release_hook(HOOK_GETTEXT, "scePafToplevelGetText");
 }
 
+/* v1.4.8 one-shot module dump (for locating Sony's value->mode table so the
+ * core can be patched in memory to know our value natively).  Writes the
+ * segments of the given module, as mapped in this process, to
+ * ux0:data/pstv1080p/dump_<tag>_seg<i>.bin plus a .txt with the layout. */
+#define DUMP_DONE_MARKER PSTV1080P_LOG_DIR "/dump_done"
+
+static void dump_module(SceUID modid, const char *tag)
+{
+    SceKernelModuleInfo info;
+    tai_module_info_t tinfo;
+    char path[128];
+    int i, r;
+    SceUID fd;
+
+    sceClibMemset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    r = sceKernelGetModuleInfo(modid, &info);
+    if (r < 0) {
+        LOG("dump: sceKernelGetModuleInfo(0x%08X) failed 0x%08X", (unsigned)modid, (unsigned)r);
+        return;
+    }
+    sceClibMemset(&tinfo, 0, sizeof(tinfo));
+    tinfo.size = sizeof(tinfo);
+    taiGetModuleInfo(info.module_name, &tinfo);
+
+    sceClibSnprintf(path, sizeof(path), PSTV1080P_LOG_DIR "/dump_%s.txt", tag);
+    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    if (fd >= 0) {
+        char line[256];
+        int n = sceClibSnprintf(line, sizeof(line), "module=%s path=%s modid=0x%08X nid=0x%08X ver=%u.%u\n",
+                                info.module_name, info.path, (unsigned)modid, (unsigned)tinfo.module_nid,
+                                info.modver[0], info.modver[1]);
+        sceIoWrite(fd, line, (SceSize)n);
+        for (i = 0; i < 4; i++) {
+            n = sceClibSnprintf(line, sizeof(line), "seg%d vaddr=0x%08X memsz=0x%08X filesz=0x%08X perms=0x%X\n",
+                                i, (unsigned)(uintptr_t)info.segments[i].vaddr, (unsigned)info.segments[i].memsz,
+                                (unsigned)info.segments[i].filesz, (unsigned)info.segments[i].perms);
+            sceIoWrite(fd, line, (SceSize)n);
+        }
+        sceIoClose(fd);
+    }
+
+    for (i = 0; i < 4; i++) {
+        const char *base = (const char *)info.segments[i].vaddr;
+        SceSize left = info.segments[i].memsz, off = 0;
+        if (!base || left == 0)
+            continue;
+        sceClibSnprintf(path, sizeof(path), PSTV1080P_LOG_DIR "/dump_%s_seg%d.bin", tag, i);
+        fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+        if (fd < 0) {
+            LOG("dump: cannot create %s (0x%08X)", path, (unsigned)fd);
+            continue;
+        }
+        while (left > 0) {
+            SceSize chunk = left > 0x10000 ? 0x10000 : left;
+            int w = sceIoWrite(fd, base + off, chunk);
+            if (w <= 0)
+                break;
+            off += (SceSize)w;
+            left -= (SceSize)w;
+        }
+        sceIoClose(fd);
+        LOG("dump: %s seg%d vaddr=0x%08X size=0x%08X -> %s (%u bytes written)", info.module_name, i,
+            (unsigned)(uintptr_t)base, (unsigned)info.segments[i].memsz, path, (unsigned)off);
+    }
+}
+
+static void dump_settings_modules_once(void)
+{
+    SceIoStat st;
+    tai_module_info_t tinfo;
+    SceUID fd;
+
+    if (sceIoGetstat(DUMP_DONE_MARKER, &st) >= 0)
+        return;                                   /* already dumped on this console */
+    ensure_log_dir();
+    LOG("dump: writing Settings modules once (delete " DUMP_DONE_MARKER " to repeat)");
+    if (g_settings_core_modid >= 0)
+        dump_module(g_settings_core_modid, "core");
+    sceClibMemset(&tinfo, 0, sizeof(tinfo));
+    tinfo.size = sizeof(tinfo);
+    if (taiGetModuleInfo("SceSettings", &tinfo) >= 0)
+        dump_module(tinfo.modid, "settings");
+    fd = sceIoOpen(DUMP_DONE_MARKER, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    if (fd >= 0)
+        sceIoClose(fd);
+}
+
 static SceUID sceKernelLoadStartModule_patched(const char *path, SceSize args, void *argp,
                                                int flags, SceKernelLMOption *option, int *status)
 {
@@ -786,6 +874,7 @@ static SceUID sceKernelLoadStartModule_patched(const char *path, SceSize args, v
         LOG("system_settings_core.suprx loaded (modid 0x%08X), installing page hooks", (unsigned)ret);
         g_settings_core_modid = ret;
         install_page_hooks();
+        dump_settings_modules_once();
     }
     return ret;
 }

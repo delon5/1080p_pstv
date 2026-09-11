@@ -44,6 +44,12 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.8 (2026-09-11)** — Settings plugin: one-shot dump of the Settings
+  app's two modules (`SceSettings`, `SceSystemSettingsCore`) as mapped in
+  memory, to `ux0:data/pstv1080p/dump_*.bin` + `.txt`, the first time the
+  resolution page is opened (marker `dump_done`). Purpose: locate Sony's
+  value-to-mode table so the core can be patched in memory to recognise the
+  plugin's value natively. Kernel module unchanged apart from the version.
 - **1.4.7 (2026-09-11)** — mode switches from Settings are now a single
   transition. Sony's Settings code commands the driver before it writes the
   registry, so selecting "1080p (30 Hz)" used to produce 1080i -> 720p ->

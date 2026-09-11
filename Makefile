@@ -25,7 +25,7 @@ KLIBS     := -ltaihenForKernel_stub -ltaihenModuleUtils_stub -lSceSysclibForDriv
 
 UCFLAGS   := -Wl,-q -Wall -Wextra -Wno-unused-parameter -Wno-attribute-alias -O2 -nostdlib -fno-builtin -fshort-wchar -Iinclude
 ULIBS     := -L$(STUBDIR) -ltaihen_stub -lpstv1080p_stub -lSceLibKernel_stub -lSceIofilemgr_stub \
-             -lSceRegistryMgr_stub -lSceAVConfig_stub_weak -lgcc
+             -lSceRegistryMgr_stub -lSceKernelModulemgr_stub -lSceAVConfig_stub_weak -lgcc
 
 .PHONY: all kernel user stubs clean
 all: kernel user
