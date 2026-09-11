@@ -44,6 +44,19 @@ for how they differ.
 
 ## Changelog
 
+- **1.5.2 (2026-09-11)** — **fixes the reboots introduced by 1.5.1.** 1.5.1's
+  launch tracer hooked `ksceKernelCreateProcess`, `ksceKernelStartProcess(Ext)`
+  and `ksceKernelKillProcess` and wrote log lines (file I/O on `ux0:`) from
+  inside those kernel paths, with a 232-byte process-info block on the
+  caller's kernel stack. That is what rebooted the console, and the same run
+  left the state file with `hd_mode_code = 0x8700` (1080p60, which the PS TV
+  cannot output; the driver answers `0x803A0101` every time), so 1080p never
+  came back and the plugin retried the impossible mode for the whole session.
+  1.5.2 removes the tracer entirely, accepts only hardware-deliverable HD
+  modes (1080p30, 1080p24), repairs a bad state file at boot, and stops
+  retrying when the driver refuses a mode outright. **Delete
+  `ur0:tai/pstv1080p.cfg` after installing** if you want a guaranteed clean
+  start; otherwise the plugin repairs it itself on first boot.
 - **1.5.1 (2026-09-11)** — diagnostics only, no behaviour change. The
   `proc: start` lines (one per resume phase, dozens per app) now appear only
   for the traced title or in verbose mode. New **launch tracer**, installed
