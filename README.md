@@ -44,6 +44,11 @@ for how they differ.
 
 ## Changelog
 
+- **1.3.2 (2026-09-11)** — the override parser now rejects title ids that are
+  not exactly 9 characters and logs the ignored line (a real config had
+  `PCSG000009` instead of `PCSG00009`, which silently never matched); the
+  loaded overrides are listed in `kernel.log` at boot. No behaviour change
+  otherwise.
 - **1.3.1 (2026-09-11)** — review fixes for 1.3 (confirmed by a 46-agent
   adversarial review, no behaviour change for titles without an override):
   changing the FORCE mode from Settings no longer wipes the per-game tracker

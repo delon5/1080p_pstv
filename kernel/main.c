@@ -791,8 +791,12 @@ static void games_list_load(int do_log)
             m_end = m_start;
             while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t')
                 m_end++;
-            if ((t_end - s0) >= TITLE_ID_LEN || (t_end - s0) < 4 || m_start >= e) {
+            if ((t_end - s0) != 9 || m_start >= e) {
+                /* Vita title ids are exactly 9 characters (e.g. PCSE00429). */
                 bad++;
+                if (do_log)
+                    klog("games: ignored line '%.*s' (title id must be 9 characters, then a mode)",
+                         (int)(e - s0), buf + s0);
                 continue;
             }
             if (str_ieq(buf + m_start, m_end - m_start, "off"))            mode = OVR_OFF;
@@ -801,7 +805,12 @@ static void games_list_load(int do_log)
             else if (str_ieq(buf + m_start, m_end - m_start, "nowait"))    mode = OVR_NOWAIT;
             else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
             else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
-            else { bad++; continue; }
+            else {
+                bad++;
+                if (do_log)
+                    klog("games: ignored line '%.*s' (unknown mode)", (int)(e - s0), buf + s0);
+                continue;
+            }
             if (count < GAMES_LIST_MAX) {
                 memset(g_games[count].title, 0, TITLE_ID_LEN);
                 memcpy(g_games[count].title, buf + s0, (unsigned int)(t_end - s0));
@@ -811,8 +820,12 @@ static void games_list_load(int do_log)
         }
     }
     g_games_count = count;
-    if (do_log)
+    if (do_log) {
+        uint32_t k;
         klog("games: %u override(s) loaded, %u line(s) ignored", (unsigned)count, (unsigned)bad);
+        for (k = 0; k < count; k++)
+            klog("games:   %s %s", g_games[k].title, ovr_name(g_games[k].mode));
+    }
 }
 
 /* Fill a fresh per-process entry: title id, FORCE-filter verdict, override. */
