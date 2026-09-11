@@ -102,5 +102,5 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 ## H. v1.3 change (per-title overrides)
 - ur0:tai/pstv1080p_games.txt: "TITLEID mode" lines, modes off/scale/frameskip/nowait/inject/force. Loaded at module_start and re-read on every new process (proc_resolve), so no reboot is needed.
 - Unified per-process table g_procs[8] {pid, allowed, override, acc, last_sync_us, cb_synced, title}; resolved once per process (sysroot title id + list lookups + one log line).
-- frameskip: credit accumulator acc += n*hz; wait floor(acc/60) vblanks when acc >= 60 else return 0 (n=1 @30 Hz alternates; n=2 @30 Hz waits 1 each; identity @60 Hz). GetVcount/GetVcountInternal return v*60/hz masked to 16 bits for frameskip titles. Never injected.
+- frameskip: credit accumulator acc += n*hz; wait floor(acc/60) vblanks when acc >= 60 else return 0 (n=1 @30 Hz alternates; n=2 @30 Hz waits 1 each; identity @60 Hz). GetVcount/GetVcountInternal return v*60/hz (monotonic, no artificial wrap) for frameskip titles. Never injected.
 - nowait: all wait hooks return 0; no inject. off: nothing. inject: inject=2. force: FORCE rule. scale: SCALE rule.

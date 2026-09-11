@@ -289,10 +289,15 @@ typedef struct {
     volatile uint32_t acc;          /* frameskip credit, units of 1/60 vblank */
     volatile SceInt64 last_sync_us; /* last vsync-related syscall entry/exit */
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
+    volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     char title[TITLE_ID_LEN];
 } proc_entry_t;
 static proc_entry_t g_procs[PROC_ENTRIES];
-static volatile uint32_t g_procs_next = 0;
+/* Serialises the table's miss path (resolve + publish), games_list_load() and
+ * title_list_load().  Held for the few ms of a once-per-process resolve only;
+ * never taken while g_mutex is needed from a hook path, so it cannot block a
+ * frame behind the HDMI apply. */
+static SceUID g_tbl_mutex = -1;
 
 /* Per-title overrides (ur0:tai/pstv1080p_games.txt: "TITLEID mode" per line) */
 #define GAMES_LIST_MAX                32
@@ -343,6 +348,18 @@ static void unlock(void)
 {
     if (g_mutex >= 0)
         ksceKernelUnlockMutex(g_mutex, 1);
+}
+
+static void tbl_lock(void)
+{
+    if (g_tbl_mutex >= 0)
+        ksceKernelLockMutex(g_tbl_mutex, 1, NULL);
+}
+
+static void tbl_unlock(void)
+{
+    if (g_tbl_mutex >= 0)
+        ksceKernelUnlockMutex(g_tbl_mutex, 1);
 }
 
 static void ensure_log_dir(void)
@@ -609,9 +626,33 @@ static void proc_clear(void)
         g_procs[i].acc = 0;
         g_procs[i].last_sync_us = 0;
         g_procs[i].cb_synced = 0;
+        g_procs[i].created_us = 0;
         g_procs[i].title[0] = 0;
     }
-    g_procs_next = 0;
+}
+
+/* Recompute the FORCE-filter verdict of every live entry from its stored
+ * title.  The table itself is never cleared at runtime (only at module_start):
+ * a game suspended behind the Settings app keeps its cb_synced / last_sync_us,
+ * so a callback-synced title is not double-paced after a mode change.
+ * Caller holds g_tbl_mutex. */
+static void proc_refilter(void)
+{
+    int i;
+    uint32_t j;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        proc_entry_t *e = &g_procs[i];
+        uint32_t allowed = 0;
+        if (e->pid == 0)
+            continue;
+        for (j = 0; j < g_title_count && j < TITLE_LIST_MAX; j++) {
+            if (strncmp(e->title, g_titles[j], TITLE_ID_LEN) == 0) {
+                allowed = 1;
+                break;
+            }
+        }
+        e->allowed = allowed;
+    }
 }
 
 static void title_list_load(void)
@@ -622,14 +663,16 @@ static void title_list_load(void)
     uint32_t count = 0;
     int all = 0;
 
+    tbl_lock();
     g_title_filter_active = 0;   /* disable the filter while we rebuild it */
     g_title_count = 0;
     memset(g_titles, 0, sizeof(g_titles));
 
     fd = ksceIoOpen(PSTV1080P_TITLES_PATH, SCE_O_RDONLY, 0);
     if (fd < 0) {
-        proc_clear();
+        proc_refilter();
         klog("titles: no list file, FORCE mode applies to all titles");
+        tbl_unlock();
         return;
     }
     len = ksceIoRead(fd, buf, sizeof(buf) - 1);
@@ -664,7 +707,7 @@ static void title_list_load(void)
     }
 
     g_title_count = count;
-    proc_clear();
+    proc_refilter();
     if (all || count == 0) {
         g_title_filter_active = 0;
         klog("titles: list has *ALL or no entries (%u), FORCE mode applies to all titles", (unsigned)count);
@@ -672,10 +715,12 @@ static void title_list_load(void)
         g_title_filter_active = 1;
         klog("titles: filter active with %u title id(s), first='%s'", (unsigned)count, g_titles[0]);
     }
+    tbl_unlock();
 }
 
 /* Slow path, once per new pid: resolve the title id and decide.  Runs in the
- * caller's context of a display syscall; sysroot lookup only, no file I/O. */
+ * caller's context of a display syscall with g_tbl_mutex held: one sysroot
+ * lookup, one small file read, one log line. */
 static const char *ovr_name(uint32_t m)
 {
     switch (m) {
@@ -703,7 +748,8 @@ static int str_ieq(const char *a, int alen, const char *b)
 
 /* Load ur0:tai/pstv1080p_games.txt.  Lines: "TITLEID mode", '#' comments.
  * Cheap enough to be called on every new process (once per game start), so
- * edits take effect on the next launch without a reboot. */
+ * edits take effect on the next launch without a reboot.  Caller holds
+ * g_tbl_mutex (the parse buffer and g_games[] are shared). */
 static void games_list_load(int do_log)
 {
     static char buf[4096];
@@ -800,29 +846,57 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
          (pid == g_shell_pid) ? " (shell, never paced)" : "");
 }
 
-/* pid -> entry, O(PROC_ENTRIES) scan.  On a miss (first display syscall of a
- * process) the entry is resolved once: one sysroot call, a small file read
- * and one log line.  Two threads missing at once may create two entries for
- * the same pid; harmless. */
+/* pid -> entry.  Hits are a lock-free O(PROC_ENTRIES) scan.  A miss (first
+ * display syscall of a process) takes g_tbl_mutex, re-checks the table (a
+ * sibling thread of the same process may have just published this pid),
+ * takes a free slot or evicts the entry idle for the longest, resolves it
+ * once (one sysroot call, a small file read and one log line) and only then
+ * publishes the pid.  A pid never has two entries, so cb_synced / acc /
+ * override cannot be split across slots, and a live game is not pushed out
+ * by newly started background processes. */
 static proc_entry_t *proc_lookup(SceUID pid, int create)
 {
     uint32_t i, slot;
     proc_entry_t *e;
+    SceInt64 oldest = 0;
     for (i = 0; i < PROC_ENTRIES; i++) {
         if (g_procs[i].pid == pid)
             return &g_procs[i];
     }
     if (!create)
         return NULL;
-    slot = g_procs_next % PROC_ENTRIES;
-    g_procs_next = slot + 1;
+
+    tbl_lock();
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        if (g_procs[i].pid == pid) {
+            tbl_unlock();
+            return &g_procs[i];
+        }
+    }
+    slot = 0;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        SceInt64 t;
+        if (g_procs[i].pid == 0) {
+            slot = i;
+            break;
+        }
+        t = g_procs[i].last_sync_us;
+        if (g_procs[i].created_us > t)
+            t = g_procs[i].created_us;
+        if (i == 0 || t < oldest) {
+            oldest = t;
+            slot = i;
+        }
+    }
     e = &g_procs[slot];
     e->pid = 0;                 /* invalidate first: readers never pair a new pid with old data */
     e->acc = 0;
     e->last_sync_us = 0;
     e->cb_synced = 0;
+    e->created_us = now_us();
     proc_resolve(e, pid);
     e->pid = pid;
+    tbl_unlock();
     return e;
 }
 
@@ -894,16 +968,19 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
 static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
 {
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
-    uint32_t acc, w;
+    uint32_t old, acc, w, nw;
     if (hz >= 60 || n > 0x00FFFFFFu || !e)
         return n;
-    acc = e->acc + n * hz;
-    if (acc < 60) {
-        e->acc = acc;
-        return 0;
-    }
-    w = acc / 60;
-    e->acc = acc - w * 60;
+    /* Two threads of one process may wait at the same instant: update the
+     * accumulator with a CAS (ldrex/strex) so no credit is counted twice or
+     * lost.  acc < 60 + n*hz < 2^31, no overflow. */
+    old = e->acc;
+    do {
+        acc = old + n * hz;
+        w = acc / 60;
+        nw = acc - w * 60;
+    } while (!__atomic_compare_exchange_n(&e->acc, &old, nw, 0,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
     return w;
 }
 
@@ -982,8 +1059,10 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
-    if (pc.mode == PACE_NOWAIT)
+    if (pc.mode == PACE_NOWAIT) {
+        ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
+    }
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
         if (vcount == 0)
@@ -1029,8 +1108,10 @@ static int hook_WaitVblankStartCB(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
-    if (pc.mode == PACE_NOWAIT)
+    if (pc.mode == PACE_NOWAIT) {
+        ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
+    }
     if (pc.mode == PACE_FRAMESKIP) {
         unsigned int w = frameskip_count(e, 1);
         if (w == 0)
@@ -1075,8 +1156,10 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
-    if (pc.mode == PACE_NOWAIT)
+    if (pc.mode == PACE_NOWAIT) {
+        ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
+    }
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
         if (vcount == 0)
@@ -1108,8 +1191,10 @@ static int hook_WaitSetFrameBufCB(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
-    if (pc.mode == PACE_NOWAIT)
+    if (pc.mode == PACE_NOWAIT) {
+        ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
+    }
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
@@ -1118,14 +1203,19 @@ static int hook_WaitSetFrameBufCB(void)
 }
 
 /* Vcount hooks: tracking, plus for "frameskip" titles a count scaled to what
- * the game expects at 60 Hz (x2 at 30 Hz), 16-bit wrap preserved, so games
- * that measure elapsed frames by reading the counter keep their speed. */
+ * the game expects at 60 Hz (x2 at 30 Hz), so games that measure elapsed
+ * frames by reading the counter keep their speed.  The native counter is a
+ * plain "vblanks since boot" int, so the scaled value stays monotonic too
+ * (no artificial 16-bit wrap: a game computing now - last must never see a
+ * negative delta the stock driver would not produce). */
 static inline int vcount_for(proc_entry_t *e, int v)
 {
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
     if (!e || e->override != OVR_FRAMESKIP || hz >= 60 || v < 0)
         return v;
-    return (int)((((uint32_t)v) * 60u / hz) & 0xFFFFu);
+    if ((uint32_t)v > 0x03FFFFFFu)          /* keep v*60 inside 32 bits (years of uptime) */
+        return v;
+    return (int)(((uint32_t)v) * 60u / hz);
 }
 
 static int hook_GetVcount(void)
@@ -1865,15 +1955,20 @@ int module_start(SceSize argc, const void *args)
     proc_clear();
 
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
+    g_tbl_mutex = ksceKernelCreateMutex("pstv1080p_tbl", 0, 0, NULL);
 
     klog("pstv1080p kernel module v%u.%u starting",
          (unsigned)(PSTV1080P_VERSION >> 8), (unsigned)(PSTV1080P_VERSION & 0xFF));
+    if (g_tbl_mutex < 0)
+        klog("table mutex create failed 0x%08X (miss path unserialised)", (unsigned)g_tbl_mutex);
 
     config_load();
     safe_boot_check();
     if (g_cfg.fps_mode == PSTV1080P_FPS_FORCE)
         title_list_load();
+    tbl_lock();
     games_list_load(1);
+    tbl_unlock();
 
     /* Refresh cache before hooks go live so the hot path never sees stale 60. */
     refresh_display_cache(1);
@@ -1914,6 +2009,10 @@ int module_stop(SceSize argc, const void *args)
     if (g_mutex >= 0) {
         ksceKernelDeleteMutex(g_mutex);
         g_mutex = -1;
+    }
+    if (g_tbl_mutex >= 0) {
+        ksceKernelDeleteMutex(g_tbl_mutex);
+        g_tbl_mutex = -1;
     }
 
     klog("stopped");

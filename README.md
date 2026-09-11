@@ -44,6 +44,16 @@ for how they differ.
 
 ## Changelog
 
+- **1.3.1 (2026-09-11)** — review fixes for 1.3 (confirmed by a 46-agent
+  adversarial review, no behaviour change for titles without an override):
+  changing the FORCE mode from Settings no longer wipes the per-game tracker
+  (a callback-synced game could have been double-paced afterwards); the
+  doubled vblank counter for `frameskip` titles is monotonic (1.3 wrapped it
+  at 16 bits, which could stall frame timers); the override file reload and
+  the per-process table's miss path are serialised by a mutex; the frameskip
+  credit is updated atomically; `nowait` still delivers thread callbacks in
+  the CB variants; the table evicts the longest-idle process instead of
+  round-robin.
 - **1.3 (2026-09-11)** — per-game overrides in `ur0:tai/pstv1080p_games.txt`
   for the few titles that misbehave at 30 Hz. Motivation: Bloodstained:
   Curse of the Moon runs at half speed with vsync and double speed without
@@ -246,7 +256,7 @@ PCSB01206    frameskip
 | Mode | Effect for that title |
 |---|---|
 | `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Never injected. |
-| `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. |
+| `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
 | `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
