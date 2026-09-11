@@ -190,6 +190,11 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define NID_GETMAXFBRES               0x2EBFC7CBu   /* v1.4: _sceDisplayGetMaximumFrameBufResolution (spoof720) */
 #define NID_GETRESINFOINTERNAL        0xFEFEB240u   /* v1.4: _sceDisplayGetResolutionInfoInternal (spoof720) */
 #define NID_GETREFRESHRATE            0xA08CA60Du   /* v1.4.1: sceDisplayGetRefreshRate (spoof720 + logging) */
+/* v1.4.3 "trace" diagnostics: SceSysmem user library exports (kernel module, hookable) */
+#define SYSMEM_MODULE                 "SceSysmem"
+#define SYSMEM_USER_LIB_NID           0x37FE725Au
+#define NID_ALLOCMEMBLOCK             0xB9D5EBDEu
+#define NID_GETFREEMEMORYSIZE         0x87CC580Bu
 
 /* hooks_ok bitmask reported by pstv1080pGetInfo */
 #define HOOK_BIT_AVCONFIG             (1u << 0)
@@ -208,6 +213,8 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define HOOK_BIT_GETMAXFBRES          (1u << 13)
 #define HOOK_BIT_GETRESINFO           (1u << 14)
 #define HOOK_BIT_GETREFRESHRATE       (1u << 15)
+#define HOOK_BIT_ALLOCMEMBLOCK        (1u << 16)
+#define HOOK_BIT_GETFREEMEM           (1u << 17)
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
@@ -256,6 +263,8 @@ enum {
     PH_GETMAXFBRES,
     PH_GETRESINFO,
     PH_GETREFRESHRATE,
+    PH_ALLOCMEMBLOCK,
+    PH_GETFREEMEM,
     PH_COUNT
 };
 static SceUID g_pacing_uid[PH_COUNT];
@@ -291,8 +300,10 @@ enum {
     OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once (like novsync), no inject */
     OVR_INJECT,     /* "inject":    always wait one period after each flip (Framecapper Inject) */
     OVR_FORCE,      /* "force":     FORCE rule for this title, whatever the global mode */
-    OVR_SPOOF720    /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head
+    OVR_SPOOF720,   /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head
                      *              (for games that crash at start-up under a 1080p30 head) */
+    OVR_TRACE       /* "trace":     default pacing; DIAGNOSTIC: log the process lifecycle, every memory block
+                     *              allocation (name/type/size/result) and free-memory queries of this title */
 };
 typedef struct {
     volatile SceUID pid;
@@ -757,6 +768,7 @@ static const char *ovr_name(uint32_t m)
     case OVR_INJECT:    return "inject";
     case OVR_FORCE:     return "force";
     case OVR_SPOOF720:  return "spoof720";
+    case OVR_TRACE:     return "trace";
     default:            return "none";
     }
 }
@@ -833,6 +845,7 @@ static void games_list_load(int do_log)
             else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
             else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
             else if (str_ieq(buf + m_start, m_end - m_start, "spoof720"))  mode = OVR_SPOOF720;
+            else if (str_ieq(buf + m_start, m_end - m_start, "trace"))     mode = OVR_TRACE;
             else {
                 bad++;
                 if (do_log)
@@ -914,21 +927,76 @@ static void proc_forget(SceUID pid)
     }
 }
 
+/* "trace" diagnostics: lifecycle of the traced process, timed from create. */
+static volatile SceUID g_trace_pid = 0;
+static SceInt64 g_trace_t0 = 0;
+
+static int pid_is_trace_title(SceUID pid, char *title_out)
+{
+    char tid[TITLE_ID_LEN];
+    uint32_t i;
+    memset(tid, 0, sizeof(tid));
+    if (ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) < 0)
+        return 0;
+    tid[sizeof(tid) - 1] = 0;
+    for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
+        if (g_games[i].mode == OVR_TRACE && strncmp(tid, g_games[i].title, TITLE_ID_LEN) == 0) {
+            if (title_out)
+                memcpy(title_out, tid, TITLE_ID_LEN);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void trace_event(SceUID pid, const char *what)
+{
+    char tid[TITLE_ID_LEN];
+    if (g_trace_pid == pid && pid != 0) {
+        klog("trace: pid=0x%08X %s (+%d ms)", (unsigned)pid, what, (int)((now_us() - g_trace_t0) / 1000));
+        return;
+    }
+    if (g_trace_pid == 0 && pid_is_trace_title(pid, tid)) {
+        g_trace_pid = pid;
+        g_trace_t0 = now_us();
+        klog("trace: %s pid=0x%08X %s (t0)", tid, (unsigned)pid, what);
+    }
+}
+
 static int procevent_create(SceUID pid, SceProcEventInvokeParam2 *a2, int a3)
 {
     proc_forget(pid);       /* a pid being (re)used: never start from a stale entry */
+    trace_event(pid, "created");
+    return 0;
+}
+
+static int procevent_start(SceUID pid, int event_type, SceProcEventInvokeParam1 *a3, int a4)
+{
+    if (g_trace_pid == pid && pid != 0)
+        klog("trace: pid=0x%08X started, event_type=%d (+%d ms)", (unsigned)pid, event_type,
+             (int)((now_us() - g_trace_t0) / 1000));
+    else
+        trace_event(pid, "started");
     return 0;
 }
 
 static int procevent_exit(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
     proc_forget(pid);
+    if (g_trace_pid == pid && pid != 0) {
+        klog("trace: pid=0x%08X EXITED by itself (+%d ms)", (unsigned)pid, (int)((now_us() - g_trace_t0) / 1000));
+        g_trace_pid = 0;
+    }
     return 0;
 }
 
 static int procevent_kill(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
     proc_forget(pid);
+    if (g_trace_pid == pid && pid != 0) {
+        klog("trace: pid=0x%08X KILLED by the system (+%d ms)", (unsigned)pid, (int)((now_us() - g_trace_t0) / 1000));
+        g_trace_pid = 0;
+    }
     return 0;
 }
 
@@ -938,7 +1006,7 @@ static const SceProcEventHandler g_procevent_handler = {
     .exit = procevent_exit,
     .kill = procevent_kill,
     .stop = NULL,
-    .start = NULL,
+    .start = procevent_start,
     .switch_process = NULL,
 };
 
@@ -1044,6 +1112,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         out->inject = g_cfg.fps_inject;
         return;
     case OVR_SPOOF720:  /* pacing follows the global rules; only the info queries differ */
+    case OVR_TRACE:     /* pacing follows the global rules; diagnostics only */
     default:
         break;
     }
@@ -1443,6 +1512,42 @@ static int hook_GetRefreshRate(float *pFps)
                 klog("spoof720: %s GetRefreshRate bits=0x%08X -> 0x426FC28F (59.94)", e->title, ob);
             }
         }
+    }
+    return ret;
+}
+
+/* v1.4.3 "trace" diagnostics: memory block allocations and free-memory
+ * queries of the traced title.  Pass-through (one pid compare) for every
+ * other process; the traced pid is known from the process-create event so no
+ * table lookup is needed here. */
+static int hook_AllocMemBlock(const char *name, int type, SceSize size, void *opt)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    int ret = HOOK_NEXT(hook_AllocMemBlock, g_pacing_ref[PH_ALLOCMEMBLOCK], name, type, size, opt);
+    if (pid != 0 && pid == g_trace_pid) {
+        char nm[32];
+        nm[0] = 0;
+        if (name) {
+            if (ksceKernelStrncpyFromUser(nm, name, sizeof(nm) - 1) < 0)
+                nm[0] = 0;
+            nm[sizeof(nm) - 1] = 0;
+        }
+        klog("trace: alloc '%s' type=0x%08X size=%u (%u KB) -> 0x%08X%s (+%d ms)",
+             nm, (unsigned)type, (unsigned)size, (unsigned)(size >> 10), (unsigned)ret,
+             ret < 0 ? " FAILED" : "", (int)((now_us() - g_trace_t0) / 1000));
+    }
+    return ret;
+}
+
+static int hook_GetFreeMemorySize(void *info)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    int ret = HOOK_NEXT(hook_GetFreeMemorySize, g_pacing_ref[PH_GETFREEMEM], info);
+    if (pid != 0 && pid == g_trace_pid && ret >= 0 && info) {
+        int32_t v[4] = { 0, 0, 0, 0 };   /* size, user, cdram, phycont */
+        if (ksceKernelCopyFromUser(v, info, sizeof(v)) >= 0)
+            klog("trace: free memory user=%d KB cdram=%d KB phycont=%d KB (+%d ms)",
+                 v[1] >> 10, v[2] >> 10, v[3] >> 10, (int)((now_us() - g_trace_t0) / 1000));
     }
     return ret;
 }
@@ -2081,6 +2186,19 @@ static void install_hooks(void)
     install_pacing_hook(PH_GETMAXFBRES,       NID_GETMAXFBRES,            hook_GetMaximumFrameBufResolution, HOOK_BIT_GETMAXFBRES, "_sceDisplayGetMaximumFrameBufResolution");
     install_pacing_hook(PH_GETRESINFO,        NID_GETRESINFOINTERNAL,     hook_GetResolutionInfoInternal,    HOOK_BIT_GETRESINFO,  "_sceDisplayGetResolutionInfoInternal");
     install_pacing_hook(PH_GETREFRESHRATE,    NID_GETREFRESHRATE,         hook_GetRefreshRate,               HOOK_BIT_GETREFRESHRATE, "sceDisplayGetRefreshRate");
+    {
+        SceUID u;
+        u = taiHookFunctionExportForKernel(KERNEL_PID, &g_pacing_ref[PH_ALLOCMEMBLOCK], SYSMEM_MODULE,
+                                           SYSMEM_USER_LIB_NID, NID_ALLOCMEMBLOCK, hook_AllocMemBlock);
+        g_pacing_uid[PH_ALLOCMEMBLOCK] = u;
+        if (u >= 0) g_hooks_ok |= HOOK_BIT_ALLOCMEMBLOCK;
+        klog("hook: sceKernelAllocMemBlock %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
+        u = taiHookFunctionExportForKernel(KERNEL_PID, &g_pacing_ref[PH_GETFREEMEM], SYSMEM_MODULE,
+                                           SYSMEM_USER_LIB_NID, NID_GETFREEMEMORYSIZE, hook_GetFreeMemorySize);
+        g_pacing_uid[PH_GETFREEMEM] = u;
+        if (u >= 0) g_hooks_ok |= HOOK_BIT_GETFREEMEM;
+        klog("hook: sceKernelGetFreeMemorySize %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
+    }
 }
 
 static void release_hooks(void)
