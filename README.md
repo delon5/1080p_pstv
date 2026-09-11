@@ -44,6 +44,17 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.1 (2026-09-11)** — hardware log showed Tales of Hearts R never
+  produced a `process:` line even with `spoof720`, i.e. it crashed before any
+  hooked call. Three changes: (1) the per-process table now drops an entry
+  the moment its process exits or is killed (process lifecycle callbacks), so
+  a new game that receives a recycled process id can no longer inherit a
+  stale title and override silently; (2) `sceDisplayGetRefreshRate` is hooked
+  too, tracked for every game (it is often a game's very first display call)
+  and forced to 59.94 Hz for `spoof720` titles; (3) the shell id is looked up
+  on demand so SceShell is never tracked as "main" during boot. Fifteen
+  SceDisplay hooks now (`hooks_ok=0xFFFF`). Version banner fixed (1.3.2 had
+  printed itself as "v1.50").
 - **1.4 (2026-09-11)** — new per-game mode `spoof720` for titles that crash
   at start-up under the 1080p30 head but run under 720p (Tales of Hearts R,
   C2-12828-1 before its first frame): for those titles the two display
@@ -271,7 +282,7 @@ PCSB01206    frameskip
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
 | `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
-| `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`) answer as if the output were 720p60. For games that crash with C2-12828-1 before drawing anything under 1080p30 but run under 720p (Tales of Hearts R). |
+| `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`, `sceDisplayGetRefreshRate`) answer as if the output were 720p60. For games that crash with C2-12828-1 before drawing anything under 1080p30 but run under 720p (Tales of Hearts R). |
 
 How to find a title id: launch the game once and read `ux0:data/pstv1080p/kernel.log`;
 the plugin logs `process: pid=0x... title=PCSE01221 override=none` the first
@@ -361,10 +372,12 @@ and that `ux0:data/pstv1080p/kernel.log` exists. Look for the config-load line
 Untested assumptions checked here: the `SceAVConfig` export hook installs
 (same as gameblabla's plugin, so this one is low risk); hooking the
 `SceDisplay` user-library exports (`0x5ED8F994`) with
-`taiHookFunctionExportForKernel` succeeds for the twelve `SceDisplay` hooks
+`taiHookFunctionExportForKernel` succeeds for the fourteen `SceDisplay` hooks
 (six vblank waits plus `_sceDisplaySetFrameBuf`, which is always installed
-and passes straight through unless `fps_mode = 2` with `fps_inject = 1`).
-Expect twelve `hook: ... ok` lines after the `SceAVConfig` one (confirmed on hardware: `hooks_ok=0x1FFF`).
+and passes straight through unless `fps_mode = 2` with `fps_inject = 1`, plus
+the two v1.4 display-information queries used by `spoof720`).
+Expect fifteen `hook: ... ok` lines after the `SceAVConfig` one
+(`hooks_ok=0xFFFF`; 1.2–1.3.2 install twelve, confirmed on hardware as `hooks_ok=0x1FFF`).
 
 **Step 2 — pacing at 60 Hz is a no-op.**
 Still at your usual resolution, play a 60 fps and a 30 fps game for a minute.
@@ -584,8 +597,11 @@ install are logged and skipped; the module still starts and reports which
 hooks are active in `pstv1080p_info_t.hooks_ok`: bit 0 = the `SceAVConfig`
 export hook, bits 1–6 = `WaitVblankStartMulti`, `WaitVblankStartMultiCB`,
 `WaitVblankStart`, `WaitVblankStartCB`, `WaitSetFrameBufMulti`,
-`WaitSetFrameBufMultiCB`, bit 7 = `_sceDisplaySetFrameBuf` (all eight set =
-`0xFF`).
+`WaitSetFrameBufMultiCB`, bit 7 = `_sceDisplaySetFrameBuf`, bits 8–12 =
+`WaitSetFrameBuf`, `WaitSetFrameBufCB`, `GetVcount`, `GetVcountInternal`,
+`RegisterVblankStartCallback`, bits 13–14 =
+`_sceDisplayGetMaximumFrameBufResolution`,
+`_sceDisplayGetResolutionInfoInternal` (all fifteen set = `0x7FFF`).
 
 ### Safe-boot revert rule
 

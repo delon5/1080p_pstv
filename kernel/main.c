@@ -133,6 +133,7 @@
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/sysclib.h>
 #include <psp2kern/kernel/sysroot.h>
+#include <psp2kern/kernel/proc_event.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/stat.h>
@@ -188,6 +189,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define NID_REGISTERVBLANKCB          0x6BDF4C4Du
 #define NID_GETMAXFBRES               0x2EBFC7CBu   /* v1.4: _sceDisplayGetMaximumFrameBufResolution (spoof720) */
 #define NID_GETRESINFOINTERNAL        0xFEFEB240u   /* v1.4: _sceDisplayGetResolutionInfoInternal (spoof720) */
+#define NID_GETREFRESHRATE            0xA08CA60Du   /* v1.4.1: sceDisplayGetRefreshRate (spoof720 + logging) */
 
 /* hooks_ok bitmask reported by pstv1080pGetInfo */
 #define HOOK_BIT_AVCONFIG             (1u << 0)
@@ -205,6 +207,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define HOOK_BIT_REGVBLANKCB          (1u << 12)
 #define HOOK_BIT_GETMAXFBRES          (1u << 13)
 #define HOOK_BIT_GETRESINFO           (1u << 14)
+#define HOOK_BIT_GETREFRESHRATE       (1u << 15)
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
@@ -252,6 +255,7 @@ enum {
     PH_REGVBLANKCB,
     PH_GETMAXFBRES,
     PH_GETRESINFO,
+    PH_GETREFRESHRATE,
     PH_COUNT
 };
 static SceUID g_pacing_uid[PH_COUNT];
@@ -344,6 +348,20 @@ static int g_log_dir_ok = 0;
 static SceInt64 now_us(void)
 {
     return ksceKernelGetSystemTimeWide();
+}
+
+/* SceShell's pid, learned on demand (the worker thread also caches it).
+ * Costs one sysroot call per hook call only while it is still unknown,
+ * i.e. during the first seconds of boot. */
+static inline SceUID shell_pid_now(void)
+{
+    SceUID sp = g_shell_pid;
+    if (sp <= 0) {
+        sp = ksceKernelSysrootGetShellPid();
+        if (sp > 0)
+            g_shell_pid = sp;
+    }
+    return sp;
 }
 
 static void lock(void)
@@ -869,6 +887,56 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
          (pid == g_shell_pid) ? " (shell, never paced)" : "");
 }
 
+/* v1.4.1: process lifecycle events.  A finished process's entry is dropped
+ * at once so a later process that receives the same pid never inherits its
+ * title/override (hardware symptom: a game with no process: line at all). */
+static SceUID g_procevent_uid = -1;
+
+static void proc_forget(SceUID pid)
+{
+    int i;
+    if (pid <= 0)
+        return;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        if (g_procs[i].pid == pid) {
+            g_procs[i].pid = 0;
+            g_procs[i].override = OVR_NONE;
+            g_procs[i].cb_synced = 0;
+            g_procs[i].acc = 0;
+            g_procs[i].last_sync_us = 0;
+            g_procs[i].created_us = 0;
+        }
+    }
+}
+
+static int procevent_create(SceUID pid, SceProcEventInvokeParam2 *a2, int a3)
+{
+    proc_forget(pid);       /* a pid being (re)used: never start from a stale entry */
+    return 0;
+}
+
+static int procevent_exit(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
+{
+    proc_forget(pid);
+    return 0;
+}
+
+static int procevent_kill(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
+{
+    proc_forget(pid);
+    return 0;
+}
+
+static const SceProcEventHandler g_procevent_handler = {
+    .size = sizeof(SceProcEventHandler),
+    .create = procevent_create,
+    .exit = procevent_exit,
+    .kill = procevent_kill,
+    .stop = NULL,
+    .start = NULL,
+    .switch_process = NULL,
+};
+
 /* pid -> entry.  Hits are a lock-free O(PROC_ENTRIES) scan.  A miss (first
  * display syscall of a process) takes g_tbl_mutex, re-checks the table (a
  * sibling thread of the same process may have just published this pid),
@@ -944,7 +1012,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
     out->mode = PSTV1080P_FPS_OFF;
     out->inject = 0;
     *pe = NULL;
-    if (pid <= 0 || pid == KERNEL_PID || pid == g_shell_pid)
+    if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return;
     e = proc_lookup(pid, 1);
     *pe = e;
@@ -1247,7 +1315,7 @@ static int hook_GetVcount(void)
     SceUID pid = ksceKernelGetProcessId();
     proc_entry_t *e = NULL;
     int v;
-    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+    if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
         e = proc_lookup(pid, 1);
         proc_mark_sync(e);
     }
@@ -1260,7 +1328,7 @@ static int hook_GetVcountInternal(int head)
     SceUID pid = ksceKernelGetProcessId();
     proc_entry_t *e = NULL;
     int v;
-    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+    if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
         e = proc_lookup(pid, 1);
         proc_mark_sync(e);
     }
@@ -1271,7 +1339,7 @@ static int hook_GetVcountInternal(int head)
 static int hook_RegisterVblankStartCallback(SceUID uid)
 {
     SceUID pid = ksceKernelGetProcessId();
-    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+    if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
         proc_entry_t *e = proc_lookup(pid, 1);
         e->cb_synced = 1;            /* this process syncs through a vblank callback: never inject */
     }
@@ -1299,7 +1367,7 @@ typedef struct {
 static inline proc_entry_t *spoof_entry_for(SceUID pid)
 {
     proc_entry_t *e;
-    if (pid <= 0 || pid == KERNEL_PID || pid == g_shell_pid)
+    if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return NULL;
     e = proc_lookup(pid, 1);
     return (e && e->override == OVR_SPOOF720) ? e : NULL;
@@ -1343,6 +1411,31 @@ static int hook_GetResolutionInfoInternal(int head, void *pInfo, SceSize infoSiz
                 e->acc |= 0x40000000u;
                 klog("spoof720: %s GetResolutionInfoInternal(head %d) mode=0x%04X %ux%u -> 0x8600 1280x720 p59.94",
                      e->title, head, om, ow, oh);
+            }
+        }
+    }
+    return ret;
+}
+
+/* v1.4.1: sceDisplayGetRefreshRate.  Tracked for every process (it is often
+ * the very first display call a game makes, so the process: line appears as
+ * early as possible); for spoof720 titles the answer is forced to 59.94 Hz. */
+static int hook_GetRefreshRate(float *pFps)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    int ret = HOOK_NEXT(hook_GetRefreshRate, g_pacing_ref[PH_GETREFRESHRATE], pFps);
+    if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
+        proc_entry_t *e = proc_lookup(pid, 1);
+        if (e && ret >= 0 && pFps) {
+            uint32_t ob = 0;
+            ksceKernelCopyFromUser(&ob, pFps, sizeof(ob));
+            if (e->override == OVR_SPOOF720) {
+                uint32_t sb = 0x426FC28Fu;           /* 59.94f */
+                ksceKernelCopyToUser(pFps, &sb, sizeof(sb));
+            }
+            if (!(e->acc & 0x20000000u) && e->override == OVR_SPOOF720) {
+                e->acc |= 0x20000000u;
+                klog("spoof720: %s GetRefreshRate bits=0x%08X -> 0x426FC28F (59.94)", e->title, ob);
             }
         }
     }
@@ -1982,6 +2075,7 @@ static void install_hooks(void)
     install_pacing_hook(PH_REGVBLANKCB,       NID_REGISTERVBLANKCB,       hook_RegisterVblankStartCallback, HOOK_BIT_REGVBLANKCB,  "RegisterVblankStartCallback");
     install_pacing_hook(PH_GETMAXFBRES,       NID_GETMAXFBRES,            hook_GetMaximumFrameBufResolution, HOOK_BIT_GETMAXFBRES, "_sceDisplayGetMaximumFrameBufResolution");
     install_pacing_hook(PH_GETRESINFO,        NID_GETRESINFOINTERNAL,     hook_GetResolutionInfoInternal,    HOOK_BIT_GETRESINFO,  "_sceDisplayGetResolutionInfoInternal");
+    install_pacing_hook(PH_GETREFRESHRATE,    NID_GETREFRESHRATE,         hook_GetRefreshRate,               HOOK_BIT_GETREFRESHRATE, "sceDisplayGetRefreshRate");
 }
 
 static void release_hooks(void)
@@ -2054,8 +2148,7 @@ int module_start(SceSize argc, const void *args)
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
     g_tbl_mutex = ksceKernelCreateMutex("pstv1080p_tbl", 0, 0, NULL);
 
-    klog("pstv1080p kernel module v%u.%u starting",
-         (unsigned)(PSTV1080P_VERSION >> 8), (unsigned)(PSTV1080P_VERSION & 0xFF));
+    klog("pstv1080p kernel module v%s starting", PSTV1080P_VERSION_STR);
     if (g_tbl_mutex < 0)
         klog("table mutex create failed 0x%08X (miss path unserialised)", (unsigned)g_tbl_mutex);
 
@@ -2071,6 +2164,9 @@ int module_start(SceSize argc, const void *args)
     refresh_display_cache(1);
 
     install_hooks();
+
+    g_procevent_uid = ksceKernelRegisterProcEventHandler("pstv1080p", &g_procevent_handler, 0);
+    klog("procevent: register -> 0x%08X", (unsigned)g_procevent_uid);
 
     g_thread_stop = 0;
     g_thread_uid = ksceKernelCreateThread("pstv1080p", pstv1080p_thread, 0x10000100, 0x2000, 0, 0, NULL);
@@ -2102,6 +2198,11 @@ int module_stop(SceSize argc, const void *args)
     }
 
     release_hooks();
+
+    if (g_procevent_uid >= 0) {
+        ksceKernelUnregisterProcEventHandler(g_procevent_uid);
+        g_procevent_uid = -1;
+    }
 
     if (g_mutex >= 0) {
         ksceKernelDeleteMutex(g_mutex);

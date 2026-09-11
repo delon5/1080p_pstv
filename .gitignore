@@ -2,3 +2,4 @@ build/
 *.o
 *.velf
 *.elf
+.DS_Store

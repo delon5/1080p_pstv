@@ -12,7 +12,8 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0104u      /* 1.4 */
+#define PSTV1080P_VERSION            0x0141u      /* 1.4.1 (0xMMmp: major, minor, patch) */
+#define PSTV1080P_VERSION_STR        "1.4.1"
 
 /* Persistent kernel state (ur0 is always mounted when kernel plugins start). */
 #define PSTV1080P_CFG_PATH           "ur0:tai/pstv1080p.cfg"
