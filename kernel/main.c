@@ -892,7 +892,12 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
 
 /* v1.4.1: process lifecycle events.  A finished process's entry is dropped
  * at once so a later process that receives the same pid never inherits its
- * title/override (hardware symptom: a game with no process: line at all). */
+ * title/override (hardware symptom: a game with no process: line at all).
+ * Only the pid is unpublished, with a CAS and no lock: the callbacks run on
+ * the creating/exiting/killing thread without g_tbl_mutex, and the miss path
+ * of proc_lookup re-initialises every other field before it publishes a pid,
+ * so plain stores here could clobber a slot that the miss path has just
+ * evicted and re-assigned (a spoof720 title published with override NONE). */
 static SceUID g_procevent_uid = -1;
 
 /* v1.5 "720p" override: while g_temp_pid runs, the output is held at
@@ -912,14 +917,14 @@ static void proc_forget(SceUID pid)
     if (pid <= 0)
         return;
     for (i = 0; i < PROC_ENTRIES; i++) {
-        if (g_procs[i].pid == pid) {
-            g_procs[i].pid = 0;
-            g_procs[i].override = OVR_NONE;
-            g_procs[i].cb_synced = 0;
-            g_procs[i].acc = 0;
-            g_procs[i].last_sync_us = 0;
-            g_procs[i].created_us = 0;
-        }
+        SceUID expect = pid;
+        /* Unpublish the slot only if it still belongs to this pid.  If the
+         * miss path has already reclaimed it (pid 0, or a new pid after the
+         * resolve) the CAS fails and nothing is touched.  A pid never has
+         * two entries, so stop at the first match. */
+        if (__atomic_compare_exchange_n(&g_procs[i].pid, &expect, 0, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            break;
     }
 }
 
