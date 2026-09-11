@@ -206,7 +206,7 @@ plugin itself to `ux0:data/pstv1080p/`, only in debug mode.
 
 ## O. Configurator app (1.6.1)
 
-`configurator/main.c`, a vita2d LiveArea app (title id `PSTV1080C`, packed by
+`configurator/main.c`, a vita2d LiveArea app (title id `PSTV10801`, packed by
 the Makefile target `configurator` with vita-mksfoex / vita-pack-vpk; assets
 rendered once by `configurator/assets/make_assets.swift` and committed).
 

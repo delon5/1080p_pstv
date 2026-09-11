@@ -379,7 +379,7 @@ with the two `config.txt` lines.
     and `ur0:tai/pstv1080p_verbose.txt` you find there (the 1.5 verbose switch
     is replaced by `pstv1080p_debug.txt` in this folder); the plugin never
     touches `ur0:tai/`.
-  - `ux0:app/PSTV1080C/` — the optional Configurator app, if you installed the VPK
+  - `ux0:app/PSTV10801/` — the optional Configurator app, if you installed the VPK
     (remove it from the LiveArea like any app).
   - `ux0:data/pstv1080p/` — only while the debug file exists: the log
     `pstv1080p.log` and the developer dumps (`settings_page_orig.xml`, `dump_*`).
@@ -682,7 +682,8 @@ same soft-float toolchain, core + PGF members only; see
 snapshot toolchain's soft-float C library. The Makefile also regenerates two
 stale SDK stub archives from the NID database (`build/stubs_appmgr/`). The
 LiveArea images were rendered once with `configurator/assets/make_assets.swift`
-(macOS) and are committed.
+(macOS), converted to 8-bit palette PNGs (the promoter rejects 32-bit PNGs
+with error 0x8010113D) and are committed.
 
 ### Repository layout
 

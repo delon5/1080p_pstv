@@ -32,7 +32,7 @@ ULIBS     := -L$(STUBDIR) -ltaihen_stub -lpstv1080p_stub -lSceLibKernel_stub -lS
 MKSFOEX   := $(TOOLBIN)/vita-mksfoex
 PACKVPK   := $(TOOLBIN)/vita-pack-vpk
 CFGDIR    := configurator
-CFG_TITLE_ID := PSTV1080C
+CFG_TITLE_ID := PSTV10801
 # vita2d is vendored in third_party/vita2d (libvita2d.a built from
 # github.com/xerpi/libvita2d with THIS toolchain, i.e. soft-float like the
 # SDK's libc; the vdpm package is hard-float and cannot be linked against this

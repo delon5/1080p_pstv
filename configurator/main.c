@@ -37,7 +37,7 @@
 #include "pstv1080p.h"
 
 #define APP_VERSION      "1.6.1"
-#define OWN_TITLE_ID     "PSTV1080C"
+#define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
 #define SCREEN_H         544

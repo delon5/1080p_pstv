@@ -1,5 +1,7 @@
 // Renders the LiveArea assets for the pstv1080p Configurator with AppKit.
 // Usage: swift make_assets.swift <output dir>   (macOS only; the PNGs are committed)
+// The promoter rejects 32-bit PNGs (error 0x8010113D): after rendering, convert to
+// 8-bit palette, e.g. with Pillow: Image.open(p).quantize(255).save(p).
 import AppKit
 
 let outDir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
