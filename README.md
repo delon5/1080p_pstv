@@ -48,6 +48,14 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.2 (2026-09-12)** — `trace` override: while the traced game runs, the
+  kernel logs a **display-call profile** every 5 s (flips with next-frame vs
+  immediate sync, `WaitVblankStart*`, `WaitSetFrameBuf*`, `GetVcount`, whether
+  a vblank callback is registered). It shows what a game actually
+  synchronises on, i.e. which override can work for it at all; games that
+  pace themselves through a vblank callback or through the flip's sync flag
+  are not affected by any of the current overrides, and the profile is how
+  that gets found out. Debug logging must be on. No behaviour change.
 - **1.6.1 (2026-09-12)** — **Configurator app.** New `pstv1080p_configurator.vpk`
   (LiveArea, unsafe homebrew): lists installed games with their per-game
   override, change / pick / remove / save (`pstv1080p_games.txt`), plus a
@@ -433,7 +441,7 @@ PCSB01206    frameskip
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
 | `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
-| `trace` | Diagnostic only: logs the title's process lifecycle, every memory block allocation with its result, and free-memory queries to `pstv1080p.log`. Slows that game's start-up slightly. Remove the line when done. |
+| `trace` | Diagnostic only: logs the title's process lifecycle, every memory block allocation with its result, free-memory queries and (1.6.2) a display-call profile every 5 s to `pstv1080p.log` (debug logging must be on). Slows that game's start-up slightly. Remove the line when done. |
 | `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`, `sceDisplayGetRefreshRate`) answer as if the output were 720p60. For games that crash with C2-12828-1 before drawing anything under 1080p30 but run under 720p (Tales of Hearts R). |
 
 How to find a title id: launch the game once and read `ux0:data/pstv1080p/pstv1080p.log`;

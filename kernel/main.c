@@ -336,7 +336,15 @@ typedef struct {
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     char title[TITLE_ID_LEN];
+    volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
+
+/* Profile counters: how a game synchronises to the display.  Cheap increments
+ * in the hooks; read and logged by the plugin thread (never from a hook). */
+enum { PF_WAITVB = 0, PF_WAITVBCB, PF_WAITVBMULTI, PF_WAITSETFB, PF_WAITSETFBMULTI,
+       PF_SETFB_IMM, PF_SETFB_NEXT, PF_GETVCOUNT, PF_MULTI_MAX, PF_COUNT_ };
+#define PF_INC(e, i)        do { if (e) (e)->cnt[i]++; } while (0)
+#define PF_MAX(e, i, v)     do { if ((e) && (uint32_t)(v) > (e)->cnt[i]) (e)->cnt[i] = (uint32_t)(v); } while (0)
 static proc_entry_t g_procs[PROC_ENTRIES];
 /* Serialises the table's miss path (resolve + publish), games_list_load() and
  * title_list_load().  Held for the few ms of a once-per-process resolve only;
@@ -1069,6 +1077,67 @@ static int pid_is_trace_title(SceUID pid, char *title_out)
     return 0;
 }
 
+/* 1.6.2: every 5 s while a "trace" title runs, one line with how many
+ * display calls of each kind it made in that interval.  This shows what the
+ * game actually synchronises on (WaitVblank*, WaitSetFrameBuf*, the flip's
+ * sync flag, GetVcount, a registered vblank callback), i.e. which pacing
+ * override can work for it at all.  Runs on the plugin thread only. */
+static SceUID   g_prof_pid = 0;
+static SceInt64 g_prof_last_us = 0;
+static uint32_t g_prof_snap[PF_COUNT_];
+#define PROFILE_INTERVAL_US (5000u * 1000u)
+
+static proc_entry_t *proc_find(SceUID pid)
+{
+    int i;
+    for (i = 0; i < PROC_ENTRIES; i++)
+        if (g_procs[i].pid == pid)
+            return &g_procs[i];
+    return NULL;
+}
+
+static void trace_profile_tick(void)
+{
+    SceUID pid = g_trace_pid;
+    proc_entry_t *e;
+    uint32_t now[PF_COUNT_], d[PF_COUNT_];
+    SceInt64 t = now_us();
+    unsigned ms;
+    int i;
+
+    if (pid == 0) {
+        g_prof_pid = 0;
+        return;
+    }
+    e = proc_find(pid);
+    if (g_prof_pid != pid) {
+        g_prof_pid = pid;
+        g_prof_last_us = t;
+        for (i = 0; i < PF_COUNT_; i++)
+            g_prof_snap[i] = e ? e->cnt[i] : 0;
+        return;
+    }
+    if (t - g_prof_last_us < (SceInt64)PROFILE_INTERVAL_US)
+        return;
+    ms = (unsigned)((t - g_prof_last_us) / 1000);
+    g_prof_last_us = t;
+    if (!e) {
+        klog("trace: display profile: no display call from the game yet (%u ms)", ms);
+        return;
+    }
+    for (i = 0; i < PF_COUNT_; i++) {
+        now[i] = e->cnt[i];
+        d[i] = now[i] - g_prof_snap[i];
+        g_prof_snap[i] = now[i];
+    }
+    klog("trace: display %u ms: flips next=%u imm=%u (%u/s) | WaitVblank=%u cb=%u multi=%u (max n=%u) | WaitSetFB=%u multi=%u | GetVcount=%u | vblank callback=%s | override=%s hz=%u",
+         ms, d[PF_SETFB_NEXT], d[PF_SETFB_IMM],
+         ms ? (unsigned)(((uint64_t)(d[PF_SETFB_NEXT] + d[PF_SETFB_IMM]) * 1000u) / ms) : 0u,
+         d[PF_WAITVB], d[PF_WAITVBCB], d[PF_WAITVBMULTI], now[PF_MULTI_MAX],
+         d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
+         e->cb_synced ? "yes" : "no", ovr_name(e->override), (unsigned)g_refresh_hz);
+}
+
 static void trace_event(SceUID pid, const char *what)
 {
     char tid[TITLE_ID_LEN];
@@ -1375,6 +1444,8 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITVBMULTI);
+    PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
@@ -1393,6 +1464,8 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITVBMULTI);
+    PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT) {
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
@@ -1413,6 +1486,7 @@ static int hook_WaitVblankStart(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITVB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
@@ -1442,6 +1516,7 @@ static int hook_WaitVblankStartCB(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITVBCB);
     if (pc.mode == PACE_NOWAIT) {
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
@@ -1472,6 +1547,8 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITSETFBMULTI);
+    PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
@@ -1490,6 +1567,8 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITSETFBMULTI);
+    PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT) {
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
@@ -1512,6 +1591,7 @@ static int hook_WaitSetFrameBuf(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITSETFB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
@@ -1525,6 +1605,7 @@ static int hook_WaitSetFrameBufCB(void)
 {
     int ret;
     WAIT_PROLOGUE(pid, e, pc);
+    PF_INC(e, PF_WAITSETFB);
     if (pc.mode == PACE_NOWAIT) {
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
@@ -1560,6 +1641,7 @@ static int hook_GetVcount(void)
     if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
         e = proc_lookup(pid, 1);
         proc_mark_sync(e);
+        PF_INC(e, PF_GETVCOUNT);
     }
     v = HOOK_NEXT(hook_GetVcount, g_pacing_ref[PH_GETVCOUNT]);
     return vcount_for(e, v);
@@ -1573,6 +1655,7 @@ static int hook_GetVcountInternal(int head)
     if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
         e = proc_lookup(pid, 1);
         proc_mark_sync(e);
+        PF_INC(e, PF_GETVCOUNT);
     }
     v = HOOK_NEXT(hook_GetVcountInternal, g_pacing_ref[PH_GETVCOUNTINT], head);
     return vcount_for(e, v);
@@ -1752,6 +1835,7 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
     int ret;
 
     pace_for(pid, &e, &pc);
+    PF_INC(e, sync ? PF_SETFB_NEXT : PF_SETFB_IMM);
     ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
 
     if (pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT && pc.mode != PACE_FRAMESKIP
@@ -2300,6 +2384,7 @@ static int pstv1080p_thread(SceSize args, void *argp)
             break;
 
         marker_tick();
+        trace_profile_tick();
 
         /* v1.4.7: release a held Sony request nobody merged with. */
         if (g_held && (now_us() - g_held_us) >= (SceInt64)HOLD_REQUEST_US) {
