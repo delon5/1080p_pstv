@@ -69,3 +69,7 @@ So: 480p60 = 0x8300, 576p50 = 0x8480?, 1080i60 = 0x8500, 720p60 = 0x8600, 1080p6
 
 ## 10. Sharpscale dependency (2026-09-11)
 - With sharpscale.skprx disabled the console no longer came up in 1080p30 at boot, and selecting 1080p in Settings gave no video at all; re-enabling Sharpscale restores it. The 1080p30 head therefore needs Sharpscale's framebuffer scaling on this setup; the stock display path does not produce a usable picture in 0x8710. Consequence: a "1080p without Sharpscale" bisect is not possible; Sharpscale-related tests must be done through its own settings (scaling mode, framebuffer unlock), not by unloading it.
+
+## 11. Hearts R trace result (2026-09-11, v1.4.4 'trace')
+- `trace: PCSE00429 pid=... created (t0)` then `KILLED by the system (+11563 ms)`: NO start event, NO sceKernelAllocMemBlock, NO GetFreeMemorySize, NO display call. The app's code never ran; the launch (trophy phase) was aborted by the system under a 1080-line head (1080i included, Sharpscale irrelevant). Hypothesis: app memory budget reservation fails because the 1080-line output path holds memory. v1.4.6 logs create/start/exit/kill params for all processes for comparison with a working title.
+- All 1080i->1080p switches in the log were EFFECTIVE (driver readback 0x8710) on attempt 1; the user-perceived "no change" must be TV-side re-lock after two rapid changes on the same pixel clock -> 1.5 s settle when g_last_system_mode == 0x8500.

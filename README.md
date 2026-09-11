@@ -44,6 +44,15 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.6 (2026-09-11)** — the Hearts R trace showed the system killing the
+  launch 11.5 s after creating the process, before the game's code ever ran
+  (no start event, no allocation, no display call): a launcher-level refusal
+  under a 1080-line head, not a game crash. This build logs one `proc:` line
+  per lifecycle event of every process (create/start/exit/kill with the raw
+  event parameters) so a working title's sequence can be compared. Also: when
+  1080p is selected while at 1080i, the plugin now leaves the intermediate
+  720p step in place for 1.5 s so TVs that miss the 1080i to 1080p30 change
+  re-lock.
 - **1.4.5 (2026-09-11)** — a deliberate selection in Settings now resets the
   per-boot apply budget (previously 30 attempts per boot for all paths; after
   enough failed switches in one session the plugin silently stopped trying

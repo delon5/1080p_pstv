@@ -965,15 +965,44 @@ static void trace_event(SceUID pid, const char *what)
     }
 }
 
+/* v1.4.6: one line per lifecycle event of EVERY process (a handful of lines
+ * per app launch), so a working title's sequence can be compared with a
+ * failing one; the raw event parameters are logged in case they carry a reason. */
+static void lifecycle_log(const char *what, SceUID pid, const int *words, int nwords, int extra)
+{
+    char tid[TITLE_ID_LEN];
+    memset(tid, 0, sizeof(tid));
+    if (ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) < 0)
+        tid[0] = 0;
+    tid[sizeof(tid) - 1] = 0;
+    if (nwords >= 4)
+        klog("proc: %s pid=0x%08X title=%s params=[%08X %08X %08X %08X] a=%d", what, (unsigned)pid,
+             tid[0] ? tid : "?", (unsigned)words[0], (unsigned)words[1], (unsigned)words[2], (unsigned)words[3], extra);
+    else
+        klog("proc: %s pid=0x%08X title=%s a=%d", what, (unsigned)pid, tid[0] ? tid : "?", extra);
+}
+
+static void param1_words(SceProcEventInvokeParam1 *p, int *w)
+{
+    w[0] = w[1] = w[2] = w[3] = 0;
+    if (p) { w[0] = (int)p->size; w[1] = p->unk_0x04; w[2] = p->unk_0x08; w[3] = p->unk_0x0C; }
+}
+
 static int procevent_create(SceUID pid, SceProcEventInvokeParam2 *a2, int a3)
 {
+    int w[4] = { 0, 0, 0, 0 };
     proc_forget(pid);       /* a pid being (re)used: never start from a stale entry */
+    if (a2) { w[0] = (int)a2->size; w[1] = (int)a2->pid; w[2] = a2->unk_0x08; w[3] = a2->unk_0x0C; }
+    lifecycle_log("create", pid, w, 4, a3);
     trace_event(pid, "created");
     return 0;
 }
 
 static int procevent_start(SceUID pid, int event_type, SceProcEventInvokeParam1 *a3, int a4)
 {
+    int w[4];
+    param1_words(a3, w);
+    lifecycle_log("start", pid, w, 4, event_type);
     if (g_trace_pid == pid && pid != 0)
         klog("trace: pid=0x%08X started, event_type=%d (+%d ms)", (unsigned)pid, event_type,
              (int)((now_us() - g_trace_t0) / 1000));
@@ -984,6 +1013,9 @@ static int procevent_start(SceUID pid, int event_type, SceProcEventInvokeParam1 
 
 static int procevent_exit(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
+    int w[4];
+    param1_words(a2, w);
+    lifecycle_log("exit", pid, w, 4, a3);
     proc_forget(pid);
     if (g_trace_pid == pid && pid != 0) {
         klog("trace: pid=0x%08X EXITED by itself (+%d ms)", (unsigned)pid, (int)((now_us() - g_trace_t0) / 1000));
@@ -994,6 +1026,9 @@ static int procevent_exit(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 
 static int procevent_kill(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
+    int w[4];
+    param1_words(a2, w);
+    lifecycle_log("kill", pid, w, 4, a3);
     proc_forget(pid);
     if (g_trace_pid == pid && pid != 0) {
         klog("trace: pid=0x%08X KILLED by the system (+%d ms)", (unsigned)pid, (int)((now_us() - g_trace_t0) / 1000));
@@ -1746,8 +1781,12 @@ static int apply_hd_mode(const char *why)
      * user thread inside a syscall: sleeping here is fine). */
     {
         SceInt64 since = now_us() - g_last_sys_setres_us;
-        if (g_last_sys_setres_us != 0 && since >= 0 && since < (SceInt64)SYS_SETRES_SETTLE_US)
-            ksceKernelDelayThread((SceUInt)(SYS_SETRES_SETTLE_US - (uint32_t)since));
+        /* Coming from 1080i the TV sees two changes on the same pixel clock
+         * (1080i60 -> 720p -> 1080p30); give it 1.5 s on the intermediate mode
+         * so it re-locks, otherwise 0.5 s (v1.4.6). */
+        uint32_t settle = (g_last_system_mode == PSTV1080P_MODE_1080I60) ? (1500u * 1000u) : SYS_SETRES_SETTLE_US;
+        if (g_last_sys_setres_us != 0 && since >= 0 && since < (SceInt64)settle)
+            ksceKernelDelayThread((SceUInt)(settle - (uint32_t)since));
     }
 
     g_in_apply = 1;
