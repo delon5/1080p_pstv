@@ -44,6 +44,11 @@ for how they differ.
 
 ## Changelog
 
+- **1.4 (2026-09-11)** — new per-game mode `spoof720` for titles that crash
+  at start-up under the 1080p30 head but run under 720p (Tales of Hearts R,
+  C2-12828-1 before its first frame): for those titles the two display
+  information queries answer as a 720p60 head. Two more pass-through hooks
+  (`hooks_ok` bits 13 and 14). Default and other titles unchanged.
 - **1.3.2 (2026-09-11)** — the override parser now rejects title ids that are
   not exactly 9 characters and logs the ignored line (a real config had
   `PCSG000009` instead of `PCSG00009`, which silently never matched); the
@@ -266,6 +271,7 @@ PCSB01206    frameskip
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
 | `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
+| `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`) answer as if the output were 720p60. For games that crash with C2-12828-1 before drawing anything under 1080p30 but run under 720p (Tales of Hearts R). |
 
 How to find a title id: launch the game once and read `ux0:data/pstv1080p/kernel.log`;
 the plugin logs `process: pid=0x... title=PCSE01221 override=none` the first

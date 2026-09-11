@@ -104,3 +104,7 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - Unified per-process table g_procs[8] {pid, allowed, override, acc, last_sync_us, cb_synced, title}; resolved once per process (sysroot title id + list lookups + one log line).
 - frameskip: credit accumulator acc += n*hz; wait floor(acc/60) vblanks when acc >= 60 else return 0 (n=1 @30 Hz alternates; n=2 @30 Hz waits 1 each; identity @60 Hz). GetVcount/GetVcountInternal return v*60/hz (monotonic, no artificial wrap) for frameskip titles. Never injected.
 - nowait: all wait hooks return 0; no inject. off: nothing. inject: inject=2. force: FORCE rule. scale: SCALE rule.
+
+## I. v1.4 change (spoof720)
+- Hardware: Tales of Hearts R (PCSE00429) crashes (C2-12828-1) before any hooked display call under 1080p30, runs under 720p -> it acts on start-up display queries.
+- Override "spoof720": hooks _sceDisplayGetMaximumFrameBufResolution (0x2EBFC7CB) and _sceDisplayGetResolutionInfoInternal (0xFEFEB240) on the SceDisplay user library; after the original succeeds, for the listed pid the user results are rewritten to 960x544 max framebuffer and {0x8600, 1280x720, progressive, 59.94} via ksceKernelCopyFromUser/CopyToUser. Logged once per process (flag bits in e->acc, unused by spoof720). Pacing follows the global rules.

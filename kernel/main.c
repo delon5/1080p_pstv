@@ -186,6 +186,8 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define NID_GETVCOUNT                 0xB6FDE0BAu
 #define NID_GETVCOUNTINTERNAL         0x9686859Eu
 #define NID_REGISTERVBLANKCB          0x6BDF4C4Du
+#define NID_GETMAXFBRES               0x2EBFC7CBu   /* v1.4: _sceDisplayGetMaximumFrameBufResolution (spoof720) */
+#define NID_GETRESINFOINTERNAL        0xFEFEB240u   /* v1.4: _sceDisplayGetResolutionInfoInternal (spoof720) */
 
 /* hooks_ok bitmask reported by pstv1080pGetInfo */
 #define HOOK_BIT_AVCONFIG             (1u << 0)
@@ -201,6 +203,8 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define HOOK_BIT_GETVCOUNT            (1u << 10)
 #define HOOK_BIT_GETVCOUNTINT         (1u << 11)
 #define HOOK_BIT_REGVBLANKCB          (1u << 12)
+#define HOOK_BIT_GETMAXFBRES          (1u << 13)
+#define HOOK_BIT_GETRESINFO           (1u << 14)
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
@@ -246,6 +250,8 @@ enum {
     PH_GETVCOUNT,
     PH_GETVCOUNTINT,
     PH_REGVBLANKCB,
+    PH_GETMAXFBRES,
+    PH_GETRESINFO,
     PH_COUNT
 };
 static SceUID g_pacing_uid[PH_COUNT];
@@ -280,7 +286,9 @@ enum {
     OVR_FRAMESKIP,  /* "frameskip": fractional vsync for frame-locked 60 fps games (2 logic frames per 30 Hz vblank) */
     OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once (like novsync), no inject */
     OVR_INJECT,     /* "inject":    always wait one period after each flip (Framecapper Inject) */
-    OVR_FORCE       /* "force":     FORCE rule for this title, whatever the global mode */
+    OVR_FORCE,      /* "force":     FORCE rule for this title, whatever the global mode */
+    OVR_SPOOF720    /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head
+                     *              (for games that crash at start-up under a 1080p30 head) */
 };
 typedef struct {
     volatile SceUID pid;
@@ -730,6 +738,7 @@ static const char *ovr_name(uint32_t m)
     case OVR_NOWAIT:    return "nowait";
     case OVR_INJECT:    return "inject";
     case OVR_FORCE:     return "force";
+    case OVR_SPOOF720:  return "spoof720";
     default:            return "none";
     }
 }
@@ -805,6 +814,7 @@ static void games_list_load(int do_log)
             else if (str_ieq(buf + m_start, m_end - m_start, "nowait"))    mode = OVR_NOWAIT;
             else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
             else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
+            else if (str_ieq(buf + m_start, m_end - m_start, "spoof720"))  mode = OVR_SPOOF720;
             else {
                 bad++;
                 if (do_log)
@@ -960,6 +970,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         out->mode = PSTV1080P_FPS_FORCE;
         out->inject = g_cfg.fps_inject;
         return;
+    case OVR_SPOOF720:  /* pacing follows the global rules; only the info queries differ */
     default:
         break;
     }
@@ -1265,6 +1276,77 @@ static int hook_RegisterVblankStartCallback(SceUID uid)
         e->cb_synced = 1;            /* this process syncs through a vblank callback: never inject */
     }
     return HOOK_NEXT(hook_RegisterVblankStartCallback, g_pacing_ref[PH_REGVBLANKCB], uid);
+}
+
+/* v1.4 "spoof720": for the listed titles, the two display-information
+ * queries a game typically makes at start-up answer as if the HDMI head were
+ * 720p60 (screen mode 0x8600, 1280x720, progressive, 59.94 Hz, maximum
+ * framebuffer 960x544).  Hardware finding: Tales of Hearts R (PCSE00429)
+ * crashes (C2-12828-1) before its first frame under a 1080p30 head and runs
+ * under 720p, so it acts on what these queries return.  Pass-through for
+ * every other title.  User pointers are only touched through
+ * ksceKernelCopyFromUser/CopyToUser after the original call succeeded. */
+typedef struct {
+    uint32_t size;
+    uint32_t screenMode;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixelformat;
+    uint32_t scanMode;
+    uint32_t fps_bits;          /* float 59.94f as bits: 0x426FC28F */
+} spoof_resinfo_t;              /* == SceDisplayResolutionInfo, 0x1C bytes on FW 3.60 */
+
+static inline proc_entry_t *spoof_entry_for(SceUID pid)
+{
+    proc_entry_t *e;
+    if (pid <= 0 || pid == KERNEL_PID || pid == g_shell_pid)
+        return NULL;
+    e = proc_lookup(pid, 1);
+    return (e && e->override == OVR_SPOOF720) ? e : NULL;
+}
+
+static int hook_GetMaximumFrameBufResolution(uint32_t *pWidth, uint32_t *pHeight)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    int ret = HOOK_NEXT(hook_GetMaximumFrameBufResolution, g_pacing_ref[PH_GETMAXFBRES], pWidth, pHeight);
+    proc_entry_t *e = spoof_entry_for(pid);
+    if (ret >= 0 && e) {
+        uint32_t ow = 0, oh = 0, sw = 960u, sh = 544u;
+        if (pWidth)  ksceKernelCopyFromUser(&ow, pWidth, sizeof(ow));
+        if (pHeight) ksceKernelCopyFromUser(&oh, pHeight, sizeof(oh));
+        if (pWidth)  ksceKernelCopyToUser(pWidth, &sw, sizeof(sw));
+        if (pHeight) ksceKernelCopyToUser(pHeight, &sh, sizeof(sh));
+        if (!(e->acc & 0x80000000u)) {      /* log once per process (acc is unused by spoof720) */
+            e->acc |= 0x80000000u;
+            klog("spoof720: %s GetMaximumFrameBufResolution %ux%u -> %ux%u", e->title, ow, oh, sw, sh);
+        }
+    }
+    return ret;
+}
+
+static int hook_GetResolutionInfoInternal(int head, void *pInfo, SceSize infoSize)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    int ret = HOOK_NEXT(hook_GetResolutionInfoInternal, g_pacing_ref[PH_GETRESINFO], head, pInfo, infoSize);
+    proc_entry_t *e = spoof_entry_for(pid);
+    if (ret >= 0 && e && pInfo && infoSize >= sizeof(spoof_resinfo_t)) {
+        spoof_resinfo_t t;
+        if (ksceKernelCopyFromUser(&t, pInfo, sizeof(t)) >= 0) {
+            uint32_t om = t.screenMode, ow = t.width, oh = t.height;
+            t.screenMode = PSTV1080P_MODE_720P60;
+            t.width      = 1280u;
+            t.height     = 720u;
+            t.scanMode   = 0u;
+            t.fps_bits   = 0x426FC28Fu;
+            ksceKernelCopyToUser(pInfo, &t, sizeof(t));
+            if (!(e->acc & 0x40000000u)) {
+                e->acc |= 0x40000000u;
+                klog("spoof720: %s GetResolutionInfoInternal(head %d) mode=0x%04X %ux%u -> 0x8600 1280x720 p59.94",
+                     e->title, head, om, ow, oh);
+            }
+        }
+    }
+    return ret;
 }
 
 /* Adaptive inject (fps_inject == 1): after a frame flip, wait one refresh
@@ -1898,6 +1980,8 @@ static void install_hooks(void)
     install_pacing_hook(PH_GETVCOUNT,         NID_GETVCOUNT,              hook_GetVcount,              HOOK_BIT_GETVCOUNT,         "GetVcount");
     install_pacing_hook(PH_GETVCOUNTINT,      NID_GETVCOUNTINTERNAL,      hook_GetVcountInternal,      HOOK_BIT_GETVCOUNTINT,      "GetVcountInternal");
     install_pacing_hook(PH_REGVBLANKCB,       NID_REGISTERVBLANKCB,       hook_RegisterVblankStartCallback, HOOK_BIT_REGVBLANKCB,  "RegisterVblankStartCallback");
+    install_pacing_hook(PH_GETMAXFBRES,       NID_GETMAXFBRES,            hook_GetMaximumFrameBufResolution, HOOK_BIT_GETMAXFBRES, "_sceDisplayGetMaximumFrameBufResolution");
+    install_pacing_hook(PH_GETRESINFO,        NID_GETRESINFOINTERNAL,     hook_GetResolutionInfoInternal,    HOOK_BIT_GETRESINFO,  "_sceDisplayGetResolutionInfoInternal");
 }
 
 static void release_hooks(void)
