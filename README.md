@@ -44,6 +44,25 @@ for how they differ.
 
 ## Changelog
 
+- **1.5.0 (2026-09-11)** — **the Settings entry is mapped natively.** Sony's
+  value→mode code is not in the core module at all: it is a compare ladder in
+  the main `SceSettings` module (1 → 1080i, 2 → 720p, 3 → 480p, anything else →
+  "automatic"), followed by `sceAVConfigHdmiSetResolution(mode, known, 1)` and
+  the registry write (`docs/reversing/settings_value_to_mode.txt`). The Settings
+  plugin now finds that function by its byte signature and replaces its 52-byte
+  dispatch **in memory** (`taiInjectData`, released on unload, nothing on disk)
+  with an equivalent ladder that has a fifth case: our value → 0x8710. Sony's
+  own code therefore asks for 1080p30 when you pick the entry; the kernel hook
+  lets that request through untouched (and skips it when the head is already
+  there) instead of holding an "automatic" request and merging it. The registry
+  is still never written with our value. The kernel passes Sony's second and
+  third SetResolution arguments through and uses the same ones for its own
+  calls. Logging is quiet by default (state changes, user actions, failures);
+  create `ur0:tai/pstv1080p_verbose.txt` for the full inventory (every hook,
+  every process, lifecycle events). The 1.4.8 module dump now runs only when
+  `ux0:data/pstv1080p/dump_request` exists (removed afterwards). On a firmware
+  where the signature is not found the plugin logs that once and everything
+  works as in 1.4.x.
 - **1.4.8 (2026-09-11)** — Settings plugin: one-shot dump of the Settings
   app's two modules (`SceSettings`, `SceSystemSettingsCore`) as mapped in
   memory, to `ux0:data/pstv1080p/dump_*.bin` + `.txt`, the first time the
@@ -393,6 +412,15 @@ UI), only application processes.
   HDMI resolution list, never the pages HENkaku replaces.
 
 ## Diagnostics and reporting issues
+
+**Log volume (1.5.0).** Both logs are quiet by default: one line per boot,
+per mode change, per user action and per game launch, plus failures. To get
+the full inventory (every hook, every process including system apps, process
+lifecycle events, driver cross-checks) create an empty file
+`ur0:tai/pstv1080p_verbose.txt` and reboot. To dump the Settings app's modules
+from memory (for porting the native patch to another firmware) create an empty
+`ux0:data/pstv1080p/dump_request` and open *Sound & Display* once; the file is
+removed and `dump_*.bin/.txt` appear next to the logs.
 
 Both modules write plain-text logs (best effort; failures to write are ignored):
 

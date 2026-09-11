@@ -113,3 +113,37 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - hook_HdmiSetResolution: non-self request while mode_1080p==1, or an "automatic" (0x10000000) request while mode_1080p==0, is HELD (return 0, display untouched) for HOLD_REQUEST_US=400 ms. Explicit Sony modes while 1080p is off pass through unchanged.
 - SetMode1080p(1) within the window: hold cancelled, direct SetResolution(0x8710) (same path as boot). SetMode1080p(0) within the window: the held mode is applied directly (revert). Window expiry (thread tick): if 1080p off -> the held mode is applied from the next user display syscall (run_mode_request); if on -> dropped.
 - Revert without a hold: SETRES_AUTO if Sony's last raw request was automatic, else last plausible Sony mode.
+
+
+## L. Native value→mode mapping (1.5.0)
+
+**Where the mapping lives.** Not in `SceSystemSettingsCore` (no screen-mode
+constant exists in that module) but in the main `SceSettings` module: one
+function (FW 3.60: 0x81125102, `docs/reversing/settings_value_to_mode.txt`)
+reads the list value, runs a compare ladder (1 → 0x8500, 2 → 0x8600,
+3 → 0x8300, else → 0x10000000 with the "known" flag cleared), calls
+`sceAVConfigHdmiSetResolution(mode, known, 1)` through a syscall stub and, on
+success, the core's registry object → `SetKeyInt("/CONFIG/DISPLAY/hdmi_resolution_mode", value)`.
+
+**The patch.** The Settings plugin searches SceSettings' text segment for the
+58-byte signature of that function (push … through the third case). On exactly
+one match it replaces the 52 bytes from `movs r1,#0` to the `blx` with a
+same-size ladder that keeps every register/flag convention (r0 = mode,
+r1 = known, r2 = 1, r3 untouched) and adds `cmp r3,#N; beq ours` →
+`movw r0,#cfg.hd_mode_code`. N and the mode are patched into the template at
+run time (N = the injected list item's value, normally 4). `taiInjectData`
+does the write (taiHEN handles the cache maintenance); `taiInjectRelease` in
+module_stop restores the original bytes. The eboot on disk is never touched.
+
+**Interaction with the kernel hook.** A request equal to `hd_mode_code` that
+is not one of our own is now "Sony's code asking for our mode": the hook lets
+it through unchanged (no hold, no substitution, never recorded as the
+system mode), or returns 0 without calling the driver if the head already
+shows that mode. `SetMode1080p(1)` that follows (from the SetKeyInt hook)
+finds the head already there, or sees that a native request was sent within
+the last 3 s and does not stack a second one; the watchdog re-checks the
+readback as usual.
+
+**Fallback.** Signature not found or ambiguous (another firmware): logged
+once, no patch, and the 1.4.x behaviour (kernel-side substitution of the
+"automatic" request) remains in force.

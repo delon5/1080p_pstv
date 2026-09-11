@@ -245,7 +245,11 @@ static SceUID g_mutex = -1;
 /* SceAVConfig hook */
 static SceUID g_avconfig_uid = -1;
 static tai_hook_ref_t g_avconfig_ref;
-typedef int (*avconfig_setres_fn)(int mode);
+/* Sony's Settings code calls sceAVConfigHdmiSetResolution with THREE
+ * arguments: (mode, known, 1), known = 1 for a concrete mode and 0 for
+ * "automatic" (SceSettings 0x81125102 on FW 3.60, RESEARCH_NOTES section 12).
+ * They are passed through untouched and mimicked for our own calls. */
+typedef int (*avconfig_setres_fn)(int mode, int known, int flag);
 static avconfig_setres_fn g_avconfig_fn = 0;
 
 /* Frame-pacing hooks (index order == HOOK_BIT order minus one) */
@@ -286,6 +290,8 @@ static volatile int32_t  g_last_apply_result = 0;  /* result of the last call WE
 static volatile int32_t  g_last_setres_ret = 0;    /* result of the last call anyone issued */
 static volatile SceInt64 g_last_sys_setres_us = 0; /* when Sony's code last called SetResolution (v1.4.4) */
 static volatile uint32_t g_last_system_raw = 0;    /* last non-self request, unfiltered (may be SETRES_AUTO) */
+static volatile SceInt64 g_last_native_us = 0;     /* v1.5: when Sony's patched Settings code last requested hd_mode_code itself */
+#define NATIVE_RECENT_US              (3000u * 1000u) /* within this window SetMode1080p(1) does not re-send that request */
 /* v1.4.7 held request: Sony's Settings code calls SetResolution BEFORE it
  * writes the registry, i.e. before the plugin learns what the user chose.
  * Holding that call for a moment lets the plugin merge it with its own
@@ -423,6 +429,12 @@ static void ensure_log_dir(void)
         g_log_dir_ok = 1;
 }
 
+/* v1.5: quiet by default (state changes, user actions, failures).  The
+ * per-boot inventory lines (every hook, every process, lifecycle events)
+ * only appear when ur0:tai/pstv1080p_verbose.txt exists at boot. */
+static int g_verbose = 0;
+#define kvlog(...) do { if (g_verbose) klog(__VA_ARGS__); } while (0)
+
 /* Append one line to the kernel log.  Never called from the frame-pacing hooks. */
 static void klog(const char *fmt, ...)
 {
@@ -520,16 +532,20 @@ static int refresh_display_cache(int do_log)
     }
 
     if (do_log && (old_hz != g_refresh_hz || old_mode != g_current_output_mode || ret < 0)) {
-        /* Cross-check with the driver's own idea of the refresh rate.  The
-         * float is converted to an integer immediately (softfp, pointer only). */
-        float fps = 0.0f;
-        int scan = 0;
-        int fps_x100 = -1;
-        int rr = ksceDisplayGetRefreshRateInternal(HDMI_HEAD, &fps, &scan);
-        if (rr >= 0)
-            fps_x100 = (int)(fps * 100.0f);
-        klog("display: GetOutputMode ret=0x%08X mode=0x%04X pf=0x%X -> refresh_hz=%u (driver fps*100=%d scan=%d rr=0x%08X)",
-             (unsigned)ret, (unsigned)mode, (unsigned)pf, (unsigned)g_refresh_hz, fps_x100, scan, (unsigned)rr);
+        if (g_verbose) {
+            /* Cross-check with the driver's own idea of the refresh rate.  The
+             * float is converted to an integer immediately (softfp, pointer only). */
+            float fps = 0.0f;
+            int scan = 0;
+            int fps_x100 = -1;
+            int rr = ksceDisplayGetRefreshRateInternal(HDMI_HEAD, &fps, &scan);
+            if (rr >= 0)
+                fps_x100 = (int)(fps * 100.0f);
+            klog("display: GetOutputMode ret=0x%08X mode=0x%04X pf=0x%X -> refresh_hz=%u (driver fps*100=%d scan=%d rr=0x%08X)",
+                 (unsigned)ret, (unsigned)mode, (unsigned)pf, (unsigned)g_refresh_hz, fps_x100, scan, (unsigned)rr);
+        } else {
+            klog("display: mode=0x%04X refresh=%u Hz (get=0x%08X)", (unsigned)mode, (unsigned)g_refresh_hz, (unsigned)ret);
+        }
     }
     return ret;
 }
@@ -877,11 +893,38 @@ static void games_list_load(int do_log)
     }
     g_games_count = count;
     if (do_log) {
+        /* One line: "games: N override(s): PCSE00429=trace PCSE01262=frameskip ..." */
+        char line[220];
+        int pos = 0;
         uint32_t k;
-        klog("games: %u override(s) loaded, %u line(s) ignored", (unsigned)count, (unsigned)bad);
-        for (k = 0; k < count; k++)
-            klog("games:   %s %s", g_games[k].title, ovr_name(g_games[k].mode));
+        pos = snprintf(line, sizeof(line), "games: %u override(s), %u line(s) ignored:", (unsigned)count, (unsigned)bad);
+        if (pos < 0 || pos >= (int)sizeof(line))
+            pos = 0;
+        for (k = 0; k < count; k++) {
+            int n;
+            if (pos > (int)sizeof(line) - 24) {          /* flush, continue on a new line */
+                klog("%s", line);
+                pos = snprintf(line, sizeof(line), "games:  ");
+                if (pos < 0) pos = 0;
+            }
+            n = snprintf(line + pos, sizeof(line) - (unsigned)pos, " %s=%s", g_games[k].title, ovr_name(g_games[k].mode));
+            if (n < 0 || pos + n >= (int)sizeof(line))
+                break;
+            pos += n;
+        }
+        klog("%s", line);
     }
+}
+
+/* 1 if any per-title override asks for "trace": then the lifecycle of every
+ * process is logged so the traced title can be compared with a working one. */
+static int trace_configured(void)
+{
+    uint32_t i;
+    for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++)
+        if (g_games[i].mode == OVR_TRACE)
+            return 1;
+    return 0;
 }
 
 /* Fill a fresh per-process entry: title id, FORCE-filter verdict, override. */
@@ -910,9 +953,12 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
             break;
         }
     }
-    klog("process: pid=0x%08X title=%s override=%s%s", (unsigned)pid,
-         e->title[0] ? e->title : "?", ovr_name(e->override),
-         (pid == g_shell_pid) ? " (shell, never paced)" : "");
+    /* Quiet mode: games and homebrew only (system apps NPXS* and the shell
+     * are noise for the user; they still show up in verbose mode). */
+    if (g_verbose || (pid != g_shell_pid && strncmp(e->title, "NPXS", 4) != 0))
+        klog("process: pid=0x%08X title=%s override=%s%s", (unsigned)pid,
+             e->title[0] ? e->title : "?", ovr_name(e->override),
+             (pid == g_shell_pid) ? " (shell, never paced)" : "");
 }
 
 /* v1.4.1: process lifecycle events.  A finished process's entry is dropped
@@ -984,6 +1030,8 @@ static void trace_event(SceUID pid, const char *what)
 static void lifecycle_log(const char *what, SceUID pid, const int *words, int nwords, int extra)
 {
     char tid[TITLE_ID_LEN];
+    if (!g_verbose && !trace_configured())
+        return;                     /* v1.5: only while someone is tracing a title */
     memset(tid, 0, sizeof(tid));
     if (ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) < 0)
         tid[0] = 0;
@@ -1673,7 +1721,9 @@ static uint32_t record_applied(uint32_t mode, int do_log)
 
     if (gr >= 0) {
         refresh_display_cache(do_log);
-        if (do_log && (uint32_t)rb != mode)
+        /* Expected for "automatic" (the driver reports the concrete mode it
+         * picked); worth a line for anything else. */
+        if (do_log && (uint32_t)rb != mode && (mode != SETRES_AUTO || g_verbose))
             klog("avconfig: driver reports 0x%04X after applying 0x%04X (assumption A3); pacing uses the applied code",
                  (unsigned)rb, (unsigned)mode);
     } else {
@@ -1725,10 +1775,38 @@ static void apply_schedule_retry(void)
     klog("apply: retry %u scheduled in %u s", (unsigned)(n + 1), (unsigned)k_apply_backoff_s[idx]);
 }
 
-static int hook_HdmiSetResolution(int mode)
+static int hook_HdmiSetResolution(int mode, int known, int flag)
 {
     int requested = mode;
     int ret;
+
+    /* v1.5.0: the Settings plugin patches Sony's value->mode ladder in memory,
+     * so when the user picks the 1080p entry Sony's OWN code asks for our
+     * mode.  That request is the user's choice: apply it as-is (no hold, no
+     * substitution).  If the head already shows it (the same entry selected
+     * again) nothing is sent: re-selecting must not renegotiate the link. */
+    if (!g_self_apply && (uint32_t)mode == g_cfg.hd_mode_code) {
+        unsigned int cur = 0, pf = 0;
+        g_last_system_raw = (uint32_t)mode;
+        if (g_held) {
+            g_held = 0;
+            klog("avconfig: held request 0x%08X cancelled by a native 0x%04X request", (unsigned)g_held_mode, (unsigned)mode);
+        }
+        if (ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf) >= 0 && hd_in_effect(cur)) {
+            g_last_native_us = now_us();
+            g_last_setres_ret = 0;
+            klog("avconfig: native request 0x%04X already in effect (driver 0x%04X), not re-sent", (unsigned)mode, cur);
+            return 0;
+        }
+        ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode, known, flag);
+        g_last_setres_ret = ret;
+        g_last_sys_setres_us = now_us();
+        g_last_native_us = g_last_sys_setres_us;
+        klog("avconfig: native request 0x%04X from Settings (known=%d) ret=0x%08X", (unsigned)mode, known, (unsigned)ret);
+        if (ret >= 0)
+            record_applied((uint32_t)mode, 1);
+        return ret;
+    }
 
     /* Remember what Sony's code wanted, but never our own code (the Settings
      * plugin or an HDMI re-plug may re-send it) and never garbage: this value
@@ -1756,10 +1834,12 @@ static int hook_HdmiSetResolution(int mode)
         }
     }
 
-    if (g_cfg.mode_1080p && !g_self_apply)
+    if (g_cfg.mode_1080p && !g_self_apply) {
         mode = (int)g_cfg.hd_mode_code;
+        known = 1;
+    }
 
-    ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode);
+    ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode, known, flag);
     g_last_setres_ret = ret;
     if (!g_self_apply)
         g_last_sys_setres_us = now_us();
@@ -1779,7 +1859,7 @@ static int call_set_resolution(uint32_t mode)
     if (!g_avconfig_fn)
         return PSTV1080P_ERR_NOT_READY;
     g_self_apply = 1;
-    ret = g_avconfig_fn((int)mode);
+    ret = g_avconfig_fn((int)mode, (mode == SETRES_AUTO) ? 0 : 1, 1);   /* same arguments as Sony's code */
     g_self_apply = 0;
     g_last_apply_result = ret;
     g_last_apply_time = now_us();
@@ -1804,6 +1884,19 @@ static int apply_hd_mode(const char *why)
     gb = ksceDisplayGetOutputMode(HDMI_HEAD, &before, &pf);
     if (gb >= 0 && hd_in_effect(before)) {
         /* Already there: nothing to do, no extra HDMI renegotiation. */
+        refresh_display_cache(0);
+        g_apply_attempts = 0;
+        apply_clear_schedule();
+        return 0;
+    }
+
+    /* v1.5.0: Sony's own (patched) Settings code has just requested our mode
+     * and the driver may simply not report it yet.  Never stack a second
+     * request on it; the watchdog re-checks the readback in a moment. */
+    if (g_last_native_us != 0 && g_last_setres_ret >= 0
+        && (now_us() - g_last_native_us) < (SceInt64)NATIVE_RECENT_US) {
+        klog("apply(%s): native request 0x%04X sent %d ms ago, not re-sent",
+             why, (unsigned)g_cfg.hd_mode_code, (int)((now_us() - g_last_native_us) / 1000));
         refresh_display_cache(0);
         g_apply_attempts = 0;
         apply_clear_schedule();
@@ -2096,8 +2189,8 @@ static int pstv1080p_thread(SceSize args, void *argp)
     }
     if (g_thread_stop)
         return 0;
-    klog("thread: shell pid=0x%08X, waiting %u ms before first apply",
-         (unsigned)g_shell_pid, (unsigned)g_cfg.boot_apply_delay_ms);
+    kvlog("thread: shell pid=0x%08X, waiting %u ms before first apply",
+          (unsigned)g_shell_pid, (unsigned)g_cfg.boot_apply_delay_ms);
 
     /* 2. Boot apply. */
     if (sleep_checking_stop(g_cfg.boot_apply_delay_ms * 1000u))
@@ -2284,6 +2377,7 @@ int pstv1080pGetInfo(pstv1080p_info_t *out)
     info.reserved[2]         = g_hd_alias;
     info.reserved[3]         = (uint32_t)g_apply_pending;
     info.reserved[4]         = g_games_count;
+    info.reserved[5]         = (uint32_t)g_verbose;
     unlock();
 
     ret = ksceKernelCopyToUser(out, &info, sizeof(info));
@@ -2301,7 +2395,7 @@ static void install_pacing_hook(int idx, uint32_t nid, const void *fn, uint32_t 
     g_pacing_uid[idx] = uid;
     if (uid >= 0) {
         g_hooks_ok |= bit;
-        klog("hook: %s ok (uid=0x%08X)", name, (unsigned)uid);
+        kvlog("hook: %s ok (uid=0x%08X)", name, (unsigned)uid);
     } else {
         klog("hook: %s FAILED 0x%08X (skipped)", name, (unsigned)uid);
     }
@@ -2316,14 +2410,14 @@ static void install_hooks(void)
                                                     hook_HdmiSetResolution);
     if (g_avconfig_uid >= 0) {
         g_hooks_ok |= HOOK_BIT_AVCONFIG;
-        klog("hook: sceAVConfigHdmiSetResolution ok (uid=0x%08X)", (unsigned)g_avconfig_uid);
+        kvlog("hook: sceAVConfigHdmiSetResolution ok (uid=0x%08X)", (unsigned)g_avconfig_uid);
     } else {
         klog("hook: sceAVConfigHdmiSetResolution FAILED 0x%08X", (unsigned)g_avconfig_uid);
     }
 
     if (module_get_export_func(KERNEL_PID, AVCONFIG_MODULE, AVCONFIG_LIB_NID, AVCONFIG_SETRES_NID, &fn) >= 0 && fn) {
         g_avconfig_fn = (avconfig_setres_fn)fn;
-        klog("export: sceAVConfigHdmiSetResolution resolved");
+        kvlog("export: sceAVConfigHdmiSetResolution resolved");
     } else {
         g_avconfig_fn = 0;
         klog("export: sceAVConfigHdmiSetResolution NOT found, apply/revert unavailable");
@@ -2350,12 +2444,14 @@ static void install_hooks(void)
                                            SYSMEM_USER_LIB_NID, NID_ALLOCMEMBLOCK, hook_AllocMemBlock);
         g_pacing_uid[PH_ALLOCMEMBLOCK] = u;
         if (u >= 0) g_hooks_ok |= HOOK_BIT_ALLOCMEMBLOCK;
-        klog("hook: sceKernelAllocMemBlock %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
+        if (u < 0 || g_verbose)
+            klog("hook: sceKernelAllocMemBlock %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
         u = taiHookFunctionExportForKernel(KERNEL_PID, &g_pacing_ref[PH_GETFREEMEM], SYSMEM_MODULE,
                                            SYSMEM_USER_LIB_NID, NID_GETFREEMEMORYSIZE, hook_GetFreeMemorySize);
         g_pacing_uid[PH_GETFREEMEM] = u;
         if (u >= 0) g_hooks_ok |= HOOK_BIT_GETFREEMEM;
-        klog("hook: sceKernelGetFreeMemorySize %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
+        if (u < 0 || g_verbose)
+            klog("hook: sceKernelGetFreeMemorySize %s (0x%08X)", u >= 0 ? "ok" : "FAILED", (unsigned)u);
     }
 }
 
@@ -2400,7 +2496,8 @@ static void safe_boot_check(void)
         } else {
             int r = file_touch(PSTV1080P_BOOT_MARKER_PATH);
             g_marker_pending = (r == 0);
-            klog("safeboot: marker created (0x%08X), window %us", (unsigned)r, (unsigned)g_cfg.safe_boot_seconds);
+            if (r != 0 || g_verbose)
+                klog("safeboot: marker created (0x%08X), window %us", (unsigned)r, (unsigned)g_cfg.safe_boot_seconds);
         }
     } else {
         if (marker)
@@ -2429,7 +2526,8 @@ int module_start(SceSize argc, const void *args)
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
     g_tbl_mutex = ksceKernelCreateMutex("pstv1080p_tbl", 0, 0, NULL);
 
-    klog("pstv1080p kernel module v%s starting", PSTV1080P_VERSION_STR);
+    g_verbose = file_exists(PSTV1080P_VERBOSE_PATH);
+    klog("pstv1080p kernel module v%s starting%s", PSTV1080P_VERSION_STR, g_verbose ? " (verbose logging)" : "");
     if (g_tbl_mutex < 0)
         klog("table mutex create failed 0x%08X (miss path unserialised)", (unsigned)g_tbl_mutex);
 
@@ -2447,7 +2545,8 @@ int module_start(SceSize argc, const void *args)
     install_hooks();
 
     g_procevent_uid = ksceKernelRegisterProcEventHandler("pstv1080p", &g_procevent_handler, 0);
-    klog("procevent: register -> 0x%08X", (unsigned)g_procevent_uid);
+    if (g_procevent_uid < 0 || g_verbose)
+        klog("procevent: register -> 0x%08X", (unsigned)g_procevent_uid);
 
     g_thread_stop = 0;
     g_thread_uid = ksceKernelCreateThread("pstv1080p", pstv1080p_thread, 0x10000100, 0x2000, 0, 0, NULL);

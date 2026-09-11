@@ -1,0 +1,84 @@
+SceSettings (vs0:app/NPXS10015/eboot.bin) FW 3.60, module NID 0xC2A86F54, seg0 vaddr 0x81063540
+Dumped from memory by pstv1080p 1.4.8 on 2026-09-11 (ux0:data/pstv1080p/dump_settings_seg0.bin).
+
+== value->mode ladder + SetResolution + registry write (called when a resolution list item is chosen) ==
+   r4 = list object, [r4+8] = list value (0 automatic, 1 1080i, 2 720p, 3 480p; 4 = pstv1080p's item)
+81125102:	b570      	push	{r4, r5, r6, lr}
+81125104:	1c04      	adds	r4, r0, #0
+81125106:	68a3      	ldr	r3, [r4, #8]
+81125108:	2100      	movs	r1, #0
+8112510a:	2b01      	cmp	r3, #1
+8112510c:	f04f 5080 	mov.w	r0, #268435456	@ 0x10000000
+81125110:	f04f 0201 	mov.w	r2, #1
+81125114:	dc02      	bgt.n	0x8112511c
+81125116:	2b00      	cmp	r3, #0
+81125118:	dd10      	ble.n	0x8112513c
+8112511a:	e004      	b.n	0x81125126
+8112511c:	2b02      	cmp	r3, #2
+8112511e:	dd06      	ble.n	0x8112512e
+81125120:	2b03      	cmp	r3, #3
+81125122:	dd08      	ble.n	0x81125136
+81125124:	e00a      	b.n	0x8112513c
+81125126:	f45f 4005 	movs.w	r0, #34048	@ 0x8500
+8112512a:	1c11      	adds	r1, r2, #0
+8112512c:	e006      	b.n	0x8112513c
+8112512e:	f45f 4006 	movs.w	r0, #34304	@ 0x8600
+81125132:	1c11      	adds	r1, r2, #0
+81125134:	e002      	b.n	0x8112513c
+81125136:	f45f 4003 	movs.w	r0, #33536	@ 0x8300
+8112513a:	1c11      	adds	r1, r2, #0
+8112513c:	f0fa eaee 	blx	0x8121f71c
+81125140:	1c05      	adds	r5, r0, #0
+81125142:	d10a      	bne.n	0x8112515a
+81125144:	f0f9 eeb2 	blx	0x8121eeac
+81125148:	6802      	ldr	r2, [r0, #0]
+8112514a:	f643 01d0 	movw	r1, #14544	@ 0x38d0
+8112514e:	68a3      	ldr	r3, [r4, #8]
+81125150:	f2c8 112d 	movt	r1, #33069	@ 0x812d
+81125154:	6a54      	ldr	r4, [r2, #36]	@ 0x24
+81125156:	1c1a      	adds	r2, r3, #0
+81125158:	47a0      	blx	r4
+8112515a:	1c28      	adds	r0, r5, #0
+8112515c:	bd70      	pop	{r4, r5, r6, pc}
+
+== 0x8121f71c: import stub of sceAVConfigHdmiSetResolution (NID 0x4D37F036), ARM mode: movw r12,#syscall; svc 0; bx lr ==
+8121f71c:	e300c3fb 	movw	ip, #1019	@ 0x3fb
+8121f720:	ef000000 	svc	0x00000000
+8121f724:	e12fff1e 	bx	lr
+   -> called with r0 = mode, r1 = known (1 for a concrete mode, 0 for automatic), r2 = 1
+
+== 0x8121eeac: stub into SceSystemSettingsCore (0x814AF466): registry wrapper object; vtable+0x24 = SetKeyInt(key, value) ==
+8121eeac:	e30fc467 	movw	ip, #62567	@ 0xf467
+8121eeb0:	e348c14a 	movt	ip, #33098	@ 0x814a
+8121eeb4:	e12fff1c 	bx	ip
+   key string at 0x812D38D0 = "/CONFIG/DISPLAY/hdmi_resolution_mode"
+
+== the same function after pstv1080p 1.5.0's in-memory patch (52 bytes at 0x81125108), value 4 -> 0x8710 ==
+81125102:	b570      	push	{r4, r5, r6, lr}
+81125104:	1c04      	adds	r4, r0, #0
+81125106:	68a3      	ldr	r3, [r4, #8]
+81125108:	2101      	movs	r1, #1
+8112510a:	2201      	movs	r2, #1
+8112510c:	f04f 5080 	mov.w	r0, #268435456	@ 0x10000000
+81125110:	2b01      	cmp	r3, #1
+81125112:	d007      	beq.n	0x81125124
+81125114:	2b02      	cmp	r3, #2
+81125116:	d008      	beq.n	0x8112512a
+81125118:	2b03      	cmp	r3, #3
+8112511a:	d009      	beq.n	0x81125130
+8112511c:	2b04      	cmp	r3, #4
+8112511e:	d00a      	beq.n	0x81125136
+81125120:	2100      	movs	r1, #0
+81125122:	e00b      	b.n	0x8112513c
+81125124:	f45f 4005 	movs.w	r0, #34048	@ 0x8500
+81125128:	e008      	b.n	0x8112513c
+8112512a:	f45f 4006 	movs.w	r0, #34304	@ 0x8600
+8112512e:	e005      	b.n	0x8112513c
+81125130:	f45f 4003 	movs.w	r0, #33536	@ 0x8300
+81125134:	e002      	b.n	0x8112513c
+81125136:	f248 7010 	movw	r0, #34576	@ 0x8710
+8112513a:	bf00      	nop
+8112513c:	f0fa  	blx	0x8121f71c
+
+SceSystemSettingsCore (system_settings_core.suprx, NID 0x7E9D545C) contains NO screen-mode constant at all:
+the core only hosts the page/registry framework; the mapping lives in the main module.

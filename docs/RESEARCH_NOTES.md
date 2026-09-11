@@ -73,3 +73,29 @@ So: 480p60 = 0x8300, 576p50 = 0x8480?, 1080i60 = 0x8500, 720p60 = 0x8600, 1080p6
 ## 11. Hearts R trace result (2026-09-11, v1.4.4 'trace')
 - `trace: PCSE00429 pid=... created (t0)` then `KILLED by the system (+11563 ms)`: NO start event, NO sceKernelAllocMemBlock, NO GetFreeMemorySize, NO display call. The app's code never ran; the launch (trophy phase) was aborted by the system under a 1080-line head (1080i included, Sharpscale irrelevant). Hypothesis: app memory budget reservation fails because the 1080-line output path holds memory. v1.4.6 logs create/start/exit/kill params for all processes for comparison with a working title.
 - All 1080i->1080p switches in the log were EFFECTIVE (driver readback 0x8710) on attempt 1; the user-perceived "no change" must be TV-side re-lock after two rapid changes on the same pixel clock -> 1.5 s settle when g_last_system_mode == 0x8500.
+
+
+## 12. Where Sony maps the resolution value to a screen mode (2026-09-11 dumps)
+
+Dumped from memory with 1.4.8 (SceSystemSettingsCore seg0 0x814A0A00, 0x36724
+bytes; SceSettings seg0 0x81063540, 0x2938DC bytes; FW 3.60).
+
+* The core contains **no** 0x8300/0x8500/0x8600/0x8710 constant, neither as a
+  literal word nor as a Thumb immediate. The core hosts the page framework and
+  the registry wrapper object only.
+* SceSettings 0x81125102 (see `reversing/settings_value_to_mode.txt`):
+  `ldr r3,[r4,#8]` (list value) → ladder → `blx 0x8121F71C` →
+  `movw r12,#0x3FB; svc 0; bx lr` = import stub of **sceAVConfigHdmiSetResolution**
+  (NID 0x4D37F036, SceAVConfig import table at 0x81224190, entry 4).
+  Arguments: **r0 = mode, r1 = known (1 concrete / 0 automatic), r2 = 1.**
+  The function therefore takes three arguments, not one; the kernel module
+  passes them through and mimics them (1.5.0).
+* After a successful call: `blx 0x8121EEAC` → stub into the core (0x814AF466)
+  returning the registry wrapper object; `[vtable+0x24](key, value)` writes
+  `/CONFIG/DISPLAY/hdmi_resolution_mode` (string at 0x812D38D0). That is the
+  call our `sceRegMgrSetKeyInt` import hook in the core intercepts.
+* Any value ≥ 4 or ≤ 0 → 0x10000000 with known = 0, which is exactly the
+  "automatic" request the kernel log showed for our item before 1.5.0.
+* Other hits in SceSettings (0x8700 = 1080p60 in two places, `and.w #0x8600`
+  at 0x81224E68, a 0x8600 literal at 0x812520E8) belong to unrelated code
+  (display-area / device-info pages) and were not touched.

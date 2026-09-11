@@ -28,22 +28,31 @@
  *     NOT written, return 0. Any other value -> if 1080p is on, turn it off via
  *     pstv1080pSetMode1080p(0) first, then let Sony's code write the registry
  *     and apply its own mode (the kernel hook passes it through once 1080p is off).
- *  5. sceAVConfigHdmiSetResolution (SceSystemSettingsCore <- SceAVConfig):
- *     logs the screen-mode code Sony's code selected for each registry value
- *     (mapping evidence). DEVIATION from DESIGN B.5: it does NOT substitute
- *     cfg.hd_mode_code while the kernel reports its own export hook installed
- *     (pstv1080pGetInfo hooks_ok bit 0) - substituting here would feed the
- *     kernel hook our code as "Sony's request", corrupting last_system_mode
- *     (so revert would re-apply 1080p) and the mapping evidence. Only when
- *     the kernel hook is missing does this hook substitute (belt and braces).
- *     The module may not import this function directly, so a failed install
- *     is only logged.
+ *  5. NATIVE value->mode (1.5.0, docs/RESEARCH_NOTES.md section 12): the
+ *     function in SceSettings (the main module, NOT the core) that turns the
+ *     list value into a screen-mode code is a compare ladder
+ *       1 -> 0x8500 (1080i), 2 -> 0x8600 (720p), 3 -> 0x8300 (480p),
+ *       anything else -> 0x10000000 (automatic, "known" flag 0)
+ *     followed by sceAVConfigHdmiSetResolution(mode, known, 1) and the
+ *     registry write. At module_start the 58-byte signature of that function
+ *     is searched in SceSettings' text segment; on exactly one match its
+ *     52-byte dispatch is replaced IN MEMORY (taiInjectData, released on
+ *     unload, nothing on disk) by an equivalent ladder with a fifth case
+ *       N -> cfg.hd_mode_code (0x8710, "known" 1).
+ *     From then on Sony's own code maps our entry itself; the kernel hook
+ *     sees a plain request for 0x8710 and just lets it through. If the
+ *     signature is missing or ambiguous (other firmware) nothing is patched
+ *     and the kernel hook keeps doing the substitution as in 1.4.x.
  *  6. scePafToplevelGetText (SceSystemSettingsCore <- ScePafToplevel): returns
  *     the UTF-16 string "1080p (30 Hz)" for msg id "msg_pstv1080p_1080p".
  *  7. Kernel config is fetched with pstv1080pGetConfig at module_start, again
  *     when the page is loaded, on every access to our key and after every Set.
- *  8. Everything is logged to ux0:data/pstv1080p/settings.log (append, best
- *     effort, failures ignored).
+ *  8. Logged to ux0:data/pstv1080p/settings.log (append, best effort): quiet
+ *     by default (user actions, state changes, failures); everything when the
+ *     kernel reports verbose mode (ur0:tai/pstv1080p_verbose.txt exists).
+ *  9. Creating ux0:data/pstv1080p/dump_request makes the plugin write the
+ *     Settings modules (as mapped in memory) to dump_*.bin once, for analysis
+ *     on another firmware; the request file is removed afterwards.
  *
  * Safety rules followed by every hook: NULL/length checks on every pointer,
  * all string compares/searches are bounded, no heap, no libc, no floats, and
@@ -79,9 +88,6 @@
 
 #include "pstv1080p.h"
 
-/* Not declared in psp2/avconfig.h (see docs/RESEARCH_NOTES.md). */
-int sceAVConfigHdmiSetResolution(int screenMode);
-
 /*
  * taihen.h's TAI_CONTINUE casts the continuation to `type(*)()`, which under
  * GCC 15's default C23 mode means "no arguments" and fails to compile. This
@@ -96,7 +102,6 @@ int sceAVConfigHdmiSetResolution(int screenMode);
 typedef int (*fn_loadxml_t)(int, void *, int, int);
 typedef int (*fn_reggetint_t)(const char *, const char *, int *);
 typedef int (*fn_regsetint_t)(const char *, const char *, int);
-typedef int (*fn_setres_t)(int);
 typedef wchar_t *(*fn_gettext_t)(void *, char **);
 typedef SceUID (*fn_loadstart_t)(const char *, SceSize, void *, int, SceKernelLMOption *, int *);
 typedef int (*fn_stopunload_t)(SceUID, SceSize, void *, int, SceKernelULMOption *, int *);
@@ -117,8 +122,6 @@ typedef int (*fn_stopunload_t)(SceUID, SceSize, void *, int, SceKernelULMOption 
 #define NID_LIB_SCEREGMGR        0xC436F916u
 #define NID_SCEREGMGRGETKEYINT   0x16DDF3DCu
 #define NID_SCEREGMGRSETKEYINT   0xD72EA399u
-#define NID_LIB_SCEAVCONFIG      0x79E0F03Fu
-#define NID_SCEAVCONFIGHDMISETRESOLUTION 0x4D37F036u
 #define NID_LIB_SCEPAFTOPLEVEL   0x4D9A9DD0u
 #define NID_SCEPAFTOPLEVELGETTEXT 0x19CEFDA7u
 
@@ -129,7 +132,6 @@ enum {
     HOOK_LOADXML,
     HOOK_REG_GETINT,
     HOOK_REG_SETINT,
-    HOOK_AVCONFIG_SETRES,
     HOOK_GETTEXT,
     HOOK_COUNT
 };
@@ -147,7 +149,16 @@ static uint32_t g_mode_1080p;     /* kernel says the virtual item is selected */
 /* Diagnostics. */
 static int g_log_dir_done;
 static int g_xml_dumped;
+static int g_verbose;             /* mirrors the kernel's verbose flag (GetInfo reserved[5]) */
 static char g_xml_out[XML_OUT_SIZE];
+
+/* v1.5.0 native value->mode patch state. */
+static SceUID g_native_inject = -1;
+static uint32_t g_native_value;   /* N the patched ladder maps */
+static uint32_t g_native_mode;    /* to this screen-mode code */
+static int g_native_failed;       /* signature not found/ambiguous: logged once, not retried */
+static void native_patch_apply(const char *why);
+static void native_patch_release(void);
 
 /* UTF-16 (-fshort-wchar) title for the injected list item. */
 static wchar_t g_text_1080p[] = L"1080p (30 Hz)";
@@ -193,6 +204,7 @@ static void pstv_log(const char *fmt, ...)
 }
 
 #define LOG(fmt, ...) pstv_log("[pstv1080p] " fmt, ##__VA_ARGS__)
+#define VLOG(fmt, ...) do { if (g_verbose) pstv_log("[pstv1080p] " fmt, ##__VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------------------------- */
 /* Kernel config cache                                                       */
@@ -200,6 +212,8 @@ static void pstv_log(const char *fmt, ...)
 
 static void refresh_config(const char *why)
 {
+    static int logged;
+    static uint32_t last_mode, last_item, last_hd;
     pstv1080p_config_t tmp;
     int ret;
 
@@ -217,9 +231,16 @@ static void refresh_config(const char *why)
     g_mode_1080p = g_cfg.mode_1080p ? 1u : 0u;
     if (g_cfg.settings_item_value >= 1 && g_cfg.settings_item_value <= 255)
         g_item_value = g_cfg.settings_item_value;
-    LOG("GetConfig(%s): mode_1080p=%u hd_mode=0x%04X N=%u fps_mode=%u",
-        why ? why : "?", (unsigned)g_cfg.mode_1080p, (unsigned)g_cfg.hd_mode_code,
-        (unsigned)g_item_value, (unsigned)g_cfg.fps_mode);
+    /* Quiet: one line per actual change of state (verbose: every fetch). */
+    if (g_verbose || !logged || last_mode != g_mode_1080p || last_item != g_item_value || last_hd != g_cfg.hd_mode_code) {
+        LOG("config(%s): mode_1080p=%u hd_mode=0x%04X N=%u fps_mode=%u",
+            why ? why : "?", (unsigned)g_cfg.mode_1080p, (unsigned)g_cfg.hd_mode_code,
+            (unsigned)g_item_value, (unsigned)g_cfg.fps_mode);
+        logged = 1;
+        last_mode = g_mode_1080p;
+        last_item = g_item_value;
+        last_hd = g_cfg.hd_mode_code;
+    }
 }
 
 /* One-shot diagnostics line from the kernel (output mode, refresh rate, hooks). */
@@ -234,6 +255,7 @@ static void log_kernel_info(void)
         LOG("GetInfo failed: 0x%08X", (unsigned)ret);
         return;
     }
+    g_verbose = info.reserved[5] ? 1 : 0;
     LOG("GetInfo: version=0x%04X mode_1080p=%u N=%u output_mode=0x%04X refresh=%u Hz "
         "last_system_mode=0x%04X last_apply=0x%08X hooks_ok=0x%08X",
         (unsigned)info.version, (unsigned)info.mode_1080p, (unsigned)info.settings_item_value,
@@ -450,6 +472,8 @@ static int patch_hdmi_page(const char *buf, int len)
     int item_len, total;
     uint32_t chosen;
     char id[64], title[64], val[16];
+    char seen[160];
+    int seen_len = 0;
 
     key_pos = find_bytes(buf, len, 0, key, (int)sizeof(key) - 1);
     if (key_pos < 0)
@@ -513,7 +537,12 @@ static int patch_hdmi_page(const char *buf, int len)
             v = parse_uint(val, bstrlen(val, sizeof(val)));
         else
             v = -1;
-        LOG("xml: existing list_item id=\"%s\" title=\"%s\" value=%d", id, title, v);
+        VLOG("xml: existing list_item id=\"%s\" title=\"%s\" value=%d", id, title, v);
+        if (seen_len < (int)sizeof(seen) - 24) {
+            int n = sceClibSnprintf(seen + seen_len, sizeof(seen) - (unsigned)seen_len, " %s=%d", title, v);
+            if (n > 0)
+                seen_len += n;
+        }
         if (v >= 0 && nvalues < MAX_LIST_VALUES)
             values[nvalues++] = v;
         p = iend + 1;
@@ -522,6 +551,8 @@ static int patch_hdmi_page(const char *buf, int len)
         LOG("xml: list has no <list_item children, passing through");
         return 0;
     }
+    seen[seen_len] = '\0';
+    LOG("xml: Sony's items:%s", seen);
 
     /* Choose our value. */
     chosen = g_item_value;
@@ -534,6 +565,7 @@ static int patch_hdmi_page(const char *buf, int len)
     }
     if (chosen != g_item_value || (g_cfg_valid && g_cfg.settings_item_value != chosen))
         push_item_value(chosen);
+    native_patch_apply("page load");   /* (re)patch Sony's ladder for the final N */
 
     /* Indentation of the last existing item (only if it starts its own line). */
     q = last_item - 1;
@@ -634,12 +666,12 @@ static int sceRegMgrGetKeyInt_patched(const char *category, const char *name, in
     if (g_mode_1080p) {
         if (value)
             *value = (int)g_item_value;
-        LOG("GetKeyInt(%s, %s): 1080p on -> %u", category, name, (unsigned)g_item_value);
+        VLOG("GetKeyInt(%s, %s): 1080p on -> %u", category, name, (unsigned)g_item_value);
         return 0;
     }
     ret = PSTV_CONTINUE(fn_reggetint_t, g_refs[HOOK_REG_GETINT], category, name, value);
-    LOG("GetKeyInt(%s, %s): passthrough ret=0x%08X value=%d",
-        category, name, (unsigned)ret, value ? *value : -1);
+    VLOG("GetKeyInt(%s, %s): passthrough ret=0x%08X value=%d",
+         category, name, (unsigned)ret, value ? *value : -1);
     return ret;
 }
 
@@ -671,46 +703,179 @@ static int sceRegMgrSetKeyInt_patched(const char *category, const char *name, in
 }
 
 /* ------------------------------------------------------------------------- */
-/* sceAVConfigHdmiSetResolution (mapping evidence + belt and braces)          */
+/* Native value->mode: patch Sony's ladder in SceSettings, in memory (1.5.0)   */
 /* ------------------------------------------------------------------------- */
 
-/* 1 if the kernel module reports its own sceAVConfigHdmiSetResolution export
- * hook installed (hooks_ok bit 0), 0 if not or if GetInfo fails. */
-static int kernel_avconfig_hook_ok(void)
+/*
+ * SceSettings (vs0:app/NPXS10015/eboot.bin, FW 3.60, module NID 0xC2A86F54)
+ * at 0x81125102 in the dump of 2026-09-11 (docs/reversing/settings_value_to_mode.txt):
+ *
+ *   push {r4,r5,r6,lr}; mov r4,r0; ldr r3,[r4,#8]   ; r3 = list value
+ *   movs r1,#0                                       ; "known" flag
+ *   cmp r3,#1; mov.w r0,#0x10000000; mov.w r2,#1
+ *   bgt .Lhi; cmp r3,#0; ble .Lcall; b .L1080i
+ *   .Lhi: cmp r3,#2; ble .L720p; cmp r3,#3; ble .L480p; b .Lcall
+ *   .L1080i: movs.w r0,#0x8500; mov r1,r2; b .Lcall
+ *   .L720p:  movs.w r0,#0x8600; mov r1,r2; b .Lcall
+ *   .L480p:  movs.w r0,#0x8300; mov r1,r2
+ *   .Lcall:  blx sceAVConfigHdmiSetResolution(r0=mode, r1=known, r2=1)
+ *            ... then core registry object ->SetKeyInt(key, value)
+ *
+ * The 52 bytes from "movs r1,#0" to ".Lcall" are replaced by (same size,
+ * same registers, same flag semantics, one more case):
+ *
+ *   movs r1,#1; movs r2,#1; mov.w r0,#0x10000000
+ *   cmp r3,#1; beq .L1080i; cmp r3,#2; beq .L720p
+ *   cmp r3,#3; beq .L480p;  cmp r3,#N; beq .Lours
+ *   movs r1,#0; b .Lcall                         ; anything else: automatic
+ *   .L1080i: movs.w r0,#0x8500; b .Lcall
+ *   .L720p:  movs.w r0,#0x8600; b .Lcall
+ *   .L480p:  movs.w r0,#0x8300; b .Lcall
+ *   .Lours:  movw r0,#hd_mode_code; nop          ; falls into .Lcall
+ *
+ * Both listings were assembled with the vitasdk toolchain and diffed against
+ * the dump before release (scratch test in the repo history).
+ */
+#define LADDER_SIG_LEN    58
+#define LADDER_PATCH_OFF  6       /* patch starts after push/mov/ldr */
+#define LADDER_PATCH_LEN  52
+#define LADDER_VALUE_OFF  20      /* imm8 of "cmp r3,#N" inside the patch */
+#define LADDER_MOVW_OFF   46      /* "movw r0,#mode" inside the patch */
+
+static const unsigned char k_ladder_sig[LADDER_SIG_LEN] = {
+    0x70,0xb5, 0x04,0x1c, 0xa3,0x68, 0x00,0x21, 0x01,0x2b, 0x4f,0xf0,0x80,0x50,
+    0x4f,0xf0,0x01,0x02, 0x02,0xdc, 0x00,0x2b, 0x10,0xdd, 0x04,0xe0, 0x02,0x2b,
+    0x06,0xdd, 0x03,0x2b, 0x08,0xdd, 0x0a,0xe0, 0x5f,0xf4,0x05,0x40, 0x11,0x1c,
+    0x06,0xe0, 0x5f,0xf4,0x06,0x40, 0x11,0x1c, 0x02,0xe0, 0x5f,0xf4,0x03,0x40,
+    0x11,0x1c
+};
+
+static const unsigned char k_ladder_patch[LADDER_PATCH_LEN] = {
+    0x01,0x21,              /* movs r1,#1            */
+    0x01,0x22,              /* movs r2,#1            */
+    0x4f,0xf0,0x80,0x50,    /* mov.w r0,#0x10000000  */
+    0x01,0x2b, 0x07,0xd0,   /* cmp r3,#1; beq +0x1c  */
+    0x02,0x2b, 0x08,0xd0,   /* cmp r3,#2; beq +0x22  */
+    0x03,0x2b, 0x09,0xd0,   /* cmp r3,#3; beq +0x28  */
+    0x04,0x2b, 0x0a,0xd0,   /* cmp r3,#N; beq +0x2e  (N patched in)  */
+    0x00,0x21,              /* movs r1,#0            */
+    0x0b,0xe0,              /* b .Lcall              */
+    0x5f,0xf4,0x05,0x40,    /* movs.w r0,#0x8500     */
+    0x08,0xe0,              /* b .Lcall              */
+    0x5f,0xf4,0x06,0x40,    /* movs.w r0,#0x8600     */
+    0x05,0xe0,              /* b .Lcall              */
+    0x5f,0xf4,0x03,0x40,    /* movs.w r0,#0x8300     */
+    0x02,0xe0,              /* b .Lcall              */
+    0x48,0xf2,0x10,0x70,    /* movw r0,#0x8710       (mode patched in) */
+    0x00,0xbf               /* nop                   */
+};
+
+/* Thumb-2 MOVW r0,#imm16 (T3 encoding), little-endian halfwords. */
+static void enc_movw_r0(unsigned char *p, uint32_t imm16)
 {
-    pstv1080p_info_t info;
-    sceClibMemset(&info, 0, sizeof(info));
-    if (pstv1080pGetInfo(&info) < 0)
-        return 0;
-    return (info.hooks_ok & 1u) ? 1 : 0;
+    uint32_t imm4 = (imm16 >> 12) & 0xFu, i = (imm16 >> 11) & 1u;
+    uint32_t imm3 = (imm16 >> 8) & 7u, imm8 = imm16 & 0xFFu;
+    uint32_t hw1 = 0xF240u | (i << 10) | imm4;
+    uint32_t hw2 = (imm3 << 12) | imm8;          /* Rd = r0 */
+    p[0] = (unsigned char)(hw1 & 0xFF); p[1] = (unsigned char)(hw1 >> 8);
+    p[2] = (unsigned char)(hw2 & 0xFF); p[3] = (unsigned char)(hw2 >> 8);
 }
 
-/*
- * Deviation from DESIGN B.5: this hook is LOG-ONLY while the kernel's export
- * hook is installed. Substituting here would hand the kernel hook our own
- * code as "what Sony requested" (it records g_last_system_mode from the value
- * it receives), which destroys the value->mode mapping evidence and makes the
- * kernel's revert path re-apply 1080p. The kernel hook performs the
- * substitution for every caller anyway. Only when the kernel reports its hook
- * missing (hooks_ok bit 0 clear) do we substitute as belt and braces.
- */
-static int sceAVConfigHdmiSetResolution_patched(int mode)
+/* Count occurrences of sig in [base, base+size); stop counting at 2. */
+static int count_sig(const unsigned char *base, SceSize size, const unsigned char *sig, int siglen, SceSize *first)
 {
-    int requested = mode;
-    int ret;
-    int substituted = 0;
-
-    refresh_config("HdmiSetResolution");
-    if (g_mode_1080p && g_cfg_valid && g_cfg.hd_mode_code != 0 && !kernel_avconfig_hook_ok()) {
-        mode = (int)g_cfg.hd_mode_code;
-        substituted = 1;
+    SceSize i, j;
+    int n = 0;
+    if (!base || size < (SceSize)siglen)
+        return 0;
+    for (i = 0; i + (SceSize)siglen <= size; i += 2) {   /* Thumb code: halfword aligned */
+        if (base[i] != sig[0])
+            continue;
+        for (j = 1; j < (SceSize)siglen; j++)
+            if (base[i + j] != sig[j])
+                break;
+        if (j == (SceSize)siglen) {
+            if (n == 0)
+                *first = i;
+            if (++n >= 2)
+                break;
+        }
     }
-    ret = PSTV_CONTINUE(fn_setres_t, g_refs[HOOK_AVCONFIG_SETRES], mode);
-    LOG("HdmiSetResolution: Sony requested 0x%04X, passed 0x%04X (%s) -> 0x%08X",
-        (unsigned)requested, (unsigned)mode,
-        substituted ? "substituted here: kernel hook missing" : "unchanged; kernel hook substitutes",
-        (unsigned)ret);
-    return ret;
+    return n;
+}
+
+static void native_patch_release(void)
+{
+    if (g_native_inject >= 0) {
+        int r = taiInjectRelease(g_native_inject);
+        VLOG("native: inject 0x%08X released (0x%08X)", (unsigned)g_native_inject, (unsigned)r);
+        g_native_inject = -1;
+    }
+}
+
+static void native_patch_apply(const char *why)
+{
+    tai_module_info_t tinfo;
+    SceKernelModuleInfo minfo;
+    unsigned char patch[LADDER_PATCH_LEN];
+    const unsigned char *text;
+    SceSize text_size, off = 0;
+    uint32_t value = g_item_value;
+    uint32_t mode = (g_cfg_valid && g_cfg.hd_mode_code != 0) ? g_cfg.hd_mode_code : PSTV1080P_MODE_1080P30;
+    int n, r;
+
+    if (g_native_failed)
+        return;
+    if (value < 1 || value > 255 || mode > 0xFFFFu) {
+        LOG("native: value %u / mode 0x%X not encodable, ladder left alone", (unsigned)value, (unsigned)mode);
+        return;
+    }
+    if (g_native_inject >= 0 && g_native_value == value && g_native_mode == mode)
+        return;                                   /* already patched for these */
+
+    sceClibMemset(&tinfo, 0, sizeof(tinfo));
+    tinfo.size = sizeof(tinfo);
+    r = taiGetModuleInfo("SceSettings", &tinfo);
+    if (r < 0) {
+        LOG("native: taiGetModuleInfo(SceSettings) failed 0x%08X", (unsigned)r);
+        return;
+    }
+    sceClibMemset(&minfo, 0, sizeof(minfo));
+    minfo.size = sizeof(minfo);
+    r = sceKernelGetModuleInfo(tinfo.modid, &minfo);
+    if (r < 0) {
+        LOG("native: sceKernelGetModuleInfo(0x%08X) failed 0x%08X", (unsigned)tinfo.modid, (unsigned)r);
+        return;
+    }
+    text = (const unsigned char *)minfo.segments[0].vaddr;
+    text_size = minfo.segments[0].memsz;
+
+    n = count_sig(text, text_size, k_ladder_sig, LADDER_SIG_LEN, &off);
+    if (n != 1) {
+        g_native_failed = 1;
+        LOG("native: value->mode ladder %s in SceSettings (module nid 0x%08X, text 0x%08X+0x%X): "
+            "Sony's code keeps mapping value %u to automatic, the kernel hook substitutes as before",
+            n == 0 ? "NOT FOUND" : "AMBIGUOUS", (unsigned)tinfo.module_nid,
+            (unsigned)(uintptr_t)text, (unsigned)text_size, (unsigned)value);
+        return;
+    }
+
+    native_patch_release();
+
+    sceClibMemcpy(patch, k_ladder_patch, sizeof(patch));
+    patch[LADDER_VALUE_OFF] = (unsigned char)value;
+    enc_movw_r0(patch + LADDER_MOVW_OFF, mode);
+
+    g_native_inject = taiInjectData(tinfo.modid, 0, (uint32_t)(off + LADDER_PATCH_OFF), patch, sizeof(patch));
+    if (g_native_inject < 0) {
+        LOG("native(%s): taiInjectData at SceSettings+0x%X failed 0x%08X; kernel hook substitutes as before",
+            why, (unsigned)(off + LADDER_PATCH_OFF), (unsigned)g_native_inject);
+        return;
+    }
+    g_native_value = value;
+    g_native_mode = mode;
+    LOG("native(%s): Sony's ladder at 0x%08X patched in memory: value %u -> 0x%04X (inject 0x%08X)",
+        why, (unsigned)(uintptr_t)(text + off), (unsigned)value, (unsigned)mode, (unsigned)g_native_inject);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -738,14 +903,16 @@ static void install_hook(int slot, const char *module, uint32_t lib, uint32_t fu
         return;
     }
     g_hooks[slot] = taiHookFunctionImport(&g_refs[slot], module, lib, func, hook);
-    LOG("hook %s in %s: 0x%08X", what, module, (unsigned)g_hooks[slot]);
+    if (g_hooks[slot] < 0 || g_verbose)
+        LOG("hook %s in %s: 0x%08X", what, module, (unsigned)g_hooks[slot]);
 }
 
 static void release_hook(int slot, const char *what)
 {
     if (g_hooks[slot] >= 0) {
         int ret = taiHookRelease(g_hooks[slot], g_refs[slot]);
-        LOG("release %s: 0x%08X", what, (unsigned)ret);
+        if (ret < 0 || g_verbose)
+            LOG("release %s: 0x%08X", what, (unsigned)ret);
         g_hooks[slot] = -1;
         g_refs[slot] = 0;
     }
@@ -759,12 +926,15 @@ static void install_page_hooks(void)
                  sceRegMgrGetKeyInt_patched, "sceRegMgrGetKeyInt");
     install_hook(HOOK_REG_SETINT, "SceSystemSettingsCore", NID_LIB_SCEREGMGR, NID_SCEREGMGRSETKEYINT,
                  sceRegMgrSetKeyInt_patched, "sceRegMgrSetKeyInt");
-    /* May legitimately fail: the module might not import it directly. */
-    install_hook(HOOK_AVCONFIG_SETRES, "SceSystemSettingsCore", NID_LIB_SCEAVCONFIG,
-                 NID_SCEAVCONFIGHDMISETRESOLUTION, sceAVConfigHdmiSetResolution_patched,
-                 "sceAVConfigHdmiSetResolution (optional)");
     install_hook(HOOK_GETTEXT, "SceSystemSettingsCore", NID_LIB_SCEPAFTOPLEVEL, NID_SCEPAFTOPLEVELGETTEXT,
                  scePafToplevelGetText_patched, "scePafToplevelGetText");
+    {
+        int ok = 0, i;
+        for (i = HOOK_LOADXML; i <= HOOK_GETTEXT; i++)
+            if (g_hooks[i] >= 0)
+                ok++;
+        LOG("page hooks: %d/4 installed (core modid 0x%08X)", ok, (unsigned)g_settings_core_modid);
+    }
 }
 
 static void release_page_hooks(void)
@@ -772,16 +942,13 @@ static void release_page_hooks(void)
     release_hook(HOOK_LOADXML, "scePafMiscLoadXmlLayout");
     release_hook(HOOK_REG_GETINT, "sceRegMgrGetKeyInt");
     release_hook(HOOK_REG_SETINT, "sceRegMgrSetKeyInt");
-    release_hook(HOOK_AVCONFIG_SETRES, "sceAVConfigHdmiSetResolution");
     release_hook(HOOK_GETTEXT, "scePafToplevelGetText");
 }
 
-/* v1.4.8 one-shot module dump (for locating Sony's value->mode table so the
- * core can be patched in memory to know our value natively).  Writes the
- * segments of the given module, as mapped in this process, to
- * ux0:data/pstv1080p/dump_<tag>_seg<i>.bin plus a .txt with the layout. */
-#define DUMP_DONE_MARKER PSTV1080P_LOG_DIR "/dump_done"
-
+/* Module dump (1.4.8, on request since 1.5.0): writes the segments of the
+ * given module, as mapped in this process, to
+ * ux0:data/pstv1080p/dump_<tag>_seg<i>.bin plus a .txt with the layout, so
+ * the value->mode ladder can be located on another firmware. */
 static void dump_module(SceUID modid, const char *tag)
 {
     SceKernelModuleInfo info;
@@ -843,25 +1010,22 @@ static void dump_module(SceUID modid, const char *tag)
     }
 }
 
-static void dump_settings_modules_once(void)
+static void dump_settings_modules_on_request(void)
 {
     SceIoStat st;
     tai_module_info_t tinfo;
-    SceUID fd;
 
-    if (sceIoGetstat(DUMP_DONE_MARKER, &st) >= 0)
-        return;                                   /* already dumped on this console */
+    if (sceIoGetstat(PSTV1080P_DUMP_REQUEST, &st) < 0)
+        return;                                   /* nobody asked */
+    sceIoRemove(PSTV1080P_DUMP_REQUEST);
     ensure_log_dir();
-    LOG("dump: writing Settings modules once (delete " DUMP_DONE_MARKER " to repeat)");
+    LOG("dump: " PSTV1080P_DUMP_REQUEST " found, writing the Settings modules (request file removed)");
     if (g_settings_core_modid >= 0)
         dump_module(g_settings_core_modid, "core");
     sceClibMemset(&tinfo, 0, sizeof(tinfo));
     tinfo.size = sizeof(tinfo);
     if (taiGetModuleInfo("SceSettings", &tinfo) >= 0)
         dump_module(tinfo.modid, "settings");
-    fd = sceIoOpen(DUMP_DONE_MARKER, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
-    if (fd >= 0)
-        sceIoClose(fd);
 }
 
 static SceUID sceKernelLoadStartModule_patched(const char *path, SceSize args, void *argp,
@@ -871,10 +1035,11 @@ static SceUID sceKernelLoadStartModule_patched(const char *path, SceSize args, v
     SceUID ret = PSTV_CONTINUE(fn_loadstart_t, g_refs[HOOK_LOADSTART], path, args, argp, flags, option, status);
 
     if (ret >= 0 && path && sceClibStrncmp(path, core, sizeof(core)) == 0) {
-        LOG("system_settings_core.suprx loaded (modid 0x%08X), installing page hooks", (unsigned)ret);
+        VLOG("system_settings_core.suprx loaded (modid 0x%08X), installing page hooks", (unsigned)ret);
         g_settings_core_modid = ret;
         install_page_hooks();
-        dump_settings_modules_once();
+        native_patch_apply("core load");          /* no-op if module_start already did it */
+        dump_settings_modules_on_request();
     }
     return ret;
 }
@@ -883,7 +1048,7 @@ static int sceKernelStopUnloadModule_patched(SceUID modid, SceSize args, void *a
                                              SceKernelULMOption *option, int *status)
 {
     if (modid >= 0 && modid == g_settings_core_modid) {
-        LOG("system_settings_core.suprx unloading, releasing page hooks");
+        VLOG("system_settings_core.suprx unloading, releasing page hooks");
         g_settings_core_modid = -1;
         release_page_hooks();
     }
@@ -909,14 +1074,17 @@ int module_start(SceSize argc, const void *args)
         g_hooks[i] = -1;
         g_refs[i] = 0;
     }
-    LOG("module_start (version 0x%04X)", (unsigned)PSTV1080P_VERSION);
+    LOG("module_start (version " PSTV1080P_VERSION_STR ")");
+    log_kernel_info();                 /* also learns the verbose flag */
     refresh_config("module_start");
-    log_kernel_info();
 
     install_hook(HOOK_LOADSTART, "SceSettings", NID_LIB_SCELIBKERNEL, NID_SCEKERNELLOADSTARTMODULE,
                  sceKernelLoadStartModule_patched, "sceKernelLoadStartModule");
     install_hook(HOOK_STOPUNLOAD, "SceSettings", NID_LIB_SCELIBKERNEL, NID_SCEKERNELSTOPUNLOADMODULE,
                  sceKernelStopUnloadModule_patched, "sceKernelStopUnloadModule");
+
+    /* SceSettings is already mapped when taiHEN starts us: patch its ladder now. */
+    native_patch_apply("module_start");
     return SCE_KERNEL_START_SUCCESS;
 }
 
@@ -925,6 +1093,7 @@ int module_stop(SceSize argc, const void *args)
     (void)argc;
     (void)args;
     LOG("module_stop");
+    native_patch_release();
     release_page_hooks();
     release_hook(HOOK_STOPUNLOAD, "sceKernelStopUnloadModule");
     release_hook(HOOK_LOADSTART, "sceKernelLoadStartModule");
