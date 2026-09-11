@@ -146,6 +146,8 @@ static int g_load_failed;               /* file unreadable or larger than the ke
 static pstv1080p_config_t g_cfg, g_cfg_edit;
 static pstv1080p_info_t g_info;
 static int g_kernel_ok;
+static int g_kernel_old;          /* module loaded but older than 1.6.1: it lacks ReadGames/WriteGames */
+#define KERNEL_MIN_VERSION 0x0161u
 
 static char g_status[160];
 static unsigned g_status_color = C_DIM;
@@ -535,6 +537,12 @@ static void refresh_kernel(void)
     memset(&g_cfg, 0, sizeof(g_cfg));
     g_kernel_ok = (pstv1080pGetInfo(&g_info) >= 0 && pstv1080pGetConfig(&g_cfg) >= 0 &&
                    g_cfg.magic == PSTV1080P_CFG_MAGIC);
+    /* An older module resolves the newer syscalls to nothing: calling them
+     * jumps to address 0 (that was the first crash report).  Never call
+     * ReadGames/WriteGames unless the module says it has them. */
+    g_kernel_old = g_kernel_ok && g_info.version < KERNEL_MIN_VERSION;
+    if (g_kernel_old)
+        g_kernel_ok = 0;
     g_cfg_edit = g_cfg;
 }
 
@@ -839,8 +847,15 @@ static void apply_settings(void)
 static void draw_nokernel(void)
 {
     draw_header("pstv1080p Configurator " APP_VERSION);
-    text_center(SCREEN_W / 2, 230, C_ERR, "The pstv1080p kernel module is not loaded.");
-    text_center(SCREEN_W / 2, 262, C_DIM, "Add  ur0:tai/pstv1080p.skprx  under *KERNEL in ur0:tai/config.txt and reboot.");
+    if (g_kernel_old) {
+        unsigned v = g_info.version;
+        textf(SCREEN_W / 2 - 300, 230, C_ERR, "The pstv1080p kernel module is version %u.%u.%u; this app needs 1.6.1 or newer.",
+              (v >> 8) & 0xFF, (v >> 4) & 0xF, v & 0xF);
+        text_center(SCREEN_W / 2, 262, C_DIM, "Replace ur0:tai/pstv1080p.skprx with the one from the same release as this app and reboot.");
+    } else {
+        text_center(SCREEN_W / 2, 230, C_ERR, "The pstv1080p kernel module is not loaded.");
+        text_center(SCREEN_W / 2, 262, C_DIM, "Add  ur0:tai/pstv1080p.skprx  under *KERNEL in ur0:tai/config.txt and reboot.");
+    }
     text_center(SCREEN_W / 2, 294, C_DIM, "This app reads and writes the plugin's files through that module.");
     draw_footer("O exit");
 }
