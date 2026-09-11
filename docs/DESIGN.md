@@ -147,3 +147,18 @@ readback as usual.
 **Fallback.** Signature not found or ambiguous (another firmware): logged
 once, no patch, and the 1.4.x behaviour (kernel-side substitution of the
 "automatic" request) remains in force.
+
+
+## M. Launch tracer (1.5.1)
+
+Opt-in, log-only. When a `trace` override exists (or verbose logging is on)
+the kernel module hooks the seven launch-chain exports listed in
+RESEARCH_NOTES section 13 and logs, per call: arguments (bounded strings,
+raw integers), the calling process (SceShell / a title / kernel), the result,
+milliseconds since the last CreateProcess, and the process status words
+(`ksceKernelGetProcessStatus`, `SceKernelProcessInfo` status / modid /
+entrypoint / type / budget) before StartProcess and before/at kill. Every hook
+continues the original call unchanged. The error-history hook copies 0x140
+bytes of the posted record from the caller and dumps the words after the
+0x100-byte message (layout unverified, hence raw). Without a trace override
+none of these hooks is installed.

@@ -134,6 +134,7 @@
 #include <psp2kern/kernel/sysclib.h>
 #include <psp2kern/kernel/sysroot.h>
 #include <psp2kern/kernel/proc_event.h>
+#include <psp2kern/kernel/processmgr.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/stat.h>
@@ -1043,6 +1044,10 @@ static void lifecycle_log(const char *what, SceUID pid, const int *words, int nw
         klog("proc: %s pid=0x%08X title=%s a=%d", what, (unsigned)pid, tid[0] ? tid : "?", extra);
 }
 
+/* Launch tracer (defined below the syscall exports). */
+static int g_launch_trace;
+static void lt_proc_state(SceUID pid, const char *when);
+
 static void param1_words(SceProcEventInvokeParam1 *p, int *w)
 {
     w[0] = w[1] = w[2] = w[3] = 0;
@@ -1055,6 +1060,8 @@ static int procevent_create(SceUID pid, SceProcEventInvokeParam2 *a2, int a3)
     proc_forget(pid);       /* a pid being (re)used: never start from a stale entry */
     if (a2) { w[0] = (int)a2->size; w[1] = (int)a2->pid; w[2] = a2->unk_0x08; w[3] = a2->unk_0x0C; }
     lifecycle_log("create", pid, w, 4, a3);
+    if (g_launch_trace)
+        lt_proc_state(pid, "procevent create");
     trace_event(pid, "created");
     return 0;
 }
@@ -1063,7 +1070,10 @@ static int procevent_start(SceUID pid, int event_type, SceProcEventInvokeParam1 
 {
     int w[4];
     param1_words(a3, w);
-    lifecycle_log("start", pid, w, 4, event_type);
+    /* "start" fires once per event_type (0x10000.., dozens per app): only the
+     * traced process or verbose mode gets these lines (1.5.1). */
+    if (g_verbose || (g_trace_pid == pid && pid != 0))
+        lifecycle_log("start", pid, w, 4, event_type);
     if (g_trace_pid == pid && pid != 0)
         klog("trace: pid=0x%08X started, event_type=%d (+%d ms)", (unsigned)pid, event_type,
              (int)((now_us() - g_trace_t0) / 1000));
@@ -1091,6 +1101,8 @@ static int procevent_kill(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
     param1_words(a2, w);
     lifecycle_log("kill", pid, w, 4, a3);
     proc_forget(pid);
+    if (g_launch_trace)
+        lt_proc_state(pid, "procevent kill");     /* compare with the event's third word */
     if (g_trace_pid == pid && pid != 0) {
         klog("trace: pid=0x%08X KILLED by the system (+%d ms)", (unsigned)pid, (int)((now_us() - g_trace_t0) / 1000));
         g_trace_pid = 0;
@@ -2385,6 +2397,237 @@ int pstv1080pGetInfo(pstv1080p_info_t *out)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Launch tracer (1.5.1)                                                      */
+/* ------------------------------------------------------------------------- */
+/* Log-only hooks on the app-launch chain, installed only when a "trace"
+ * override exists (or verbose logging is on).  Sony's C2-12828-1 dialog is
+ * SceShell's generic "application terminated" code and carries no reason
+ * (docs/RESEARCH_NOTES.md section 13), so the reason has to be read where a
+ * launch actually fails: SceShell -> SceAppMgr -> ksceKernelCreateProcess
+ * (budget, address space, then ksceKernelLoadProcessImage) ->
+ * ksceKernelStartProcess(Ext) -> user code.  An abort ends in
+ * ksceKernelKillProcess / ksceAppMgrKillProcess, and SceShell posts the
+ * dialog's code to the error history (_sceErrorHistoryPostError).  Every hook
+ * passes the call through unchanged and logs arguments, result, caller and
+ * timing.  Prototypes: psp2kern headers where declared, otherwise
+ * wiki.henkaku.xyz/vita/SceProcessmgr; NIDs verified in vita-headers db/360. */
+
+#define LT_PROCESSMGR_MODULE     "SceProcessmgr"
+#define LT_PROCESSMGR_KLIB       0x7A69DE86u   /* SceProcessmgrForKernel */
+#define LT_NID_CREATEPROCESS     0x71CF71FDu
+#define LT_NID_STARTPROCESS      0x38FB7BCAu
+#define LT_NID_STARTPROCESSEXT   0x36728B16u
+#define LT_NID_KILLPROCESS       0xA1071106u
+#define LT_MODULEMGR_MODULE      "SceKernelModulemgr"
+#define LT_MODULEMGR_KLIB        0xC445FA63u   /* SceModulemgrForKernel */
+#define LT_NID_LOADPROCESSIMAGE  0xAC4EABDBu
+#define LT_APPMGR_MODULE         "SceAppMgr"
+#define LT_APPMGR_DLIB           0xDCE180F8u   /* SceAppMgrForDriver */
+#define LT_NID_APPMGRKILL        0xD80566DBu
+#define LT_ERROR_MODULE          "SceError"
+#define LT_ERROR_ULIB            0x5CD2CAD1u   /* SceError user library: SceShell posts every error dialog here */
+#define LT_NID_ERRHISTPOST       0x70F9D872u
+
+enum { LT_CREATE = 0, LT_LOADIMAGE, LT_START, LT_STARTEXT, LT_KILL, LT_APPKILL, LT_ERRPOST, LT_COUNT };
+static SceUID g_lt_uid[LT_COUNT];
+static tai_hook_ref_t g_lt_ref[LT_COUNT];
+static SceInt64 g_lt_t0 = 0;              /* time of the last CreateProcess call */
+
+static int lt_ms(void)
+{
+    return g_lt_t0 ? (int)((now_us() - g_lt_t0) / 1000) : -1;
+}
+
+/* "SceShell(0x..)", "PCSE00429(0x..)" or "kernel(0x..)" for the calling context. */
+static void lt_caller(char *out, int outsz)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    char tid[TITLE_ID_LEN];
+    memset(tid, 0, sizeof(tid));
+    if (pid > 0 && pid == g_shell_pid)
+        snprintf(out, outsz, "SceShell(0x%08X)", (unsigned)pid);
+    else if (pid > 0 && ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) >= 0 && tid[0])
+        snprintf(out, outsz, "%s(0x%08X)", tid, (unsigned)pid);
+    else
+        snprintf(out, outsz, "kernel(0x%08X)", (unsigned)pid);
+}
+
+/* Process status + info words.  3.60 layout of SceKernelProcessInfo (wiki):
+ * status +0x10, budgetId +0x18, modid +0x24, entrypoint +0x28, type +0x2C;
+ * vitasdk's struct exposes them as unk3 and unk[0], unk[3], unk[4], unk[5]. */
+static void lt_proc_state(SceUID pid, const char *when)
+{
+    SceKernelProcessInfo info;
+    int st = -1, r1, r2;
+
+    r1 = ksceKernelGetProcessStatus(pid, &st);
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    r2 = ksceKernelGetProcessInfo(pid, &info);
+    klog("launch: %s pid=0x%08X status=0x%X/%08X info: status=0x%X modid=%08X entry=%08X type=%08X budget=%08X /%08X (+%d ms)",
+         when, (unsigned)pid, (unsigned)st, (unsigned)r1, (unsigned)info.unk3, (unsigned)info.unk[3],
+         (unsigned)info.unk[4], (unsigned)info.unk[5], (unsigned)info.unk[0], (unsigned)r2, lt_ms());
+}
+
+static SceUID lt_hook_CreateProcess(const char *titleid, uint32_t type, const char *path, void *opt)
+{
+    SceInt64 t = now_us();
+    SceUID ret = HOOK_NEXT(lt_hook_CreateProcess, g_lt_ref[LT_CREATE], titleid, type, path, opt);
+    if (g_launch_trace) {
+        char caller[40];
+        lt_caller(caller, sizeof(caller));
+        g_lt_t0 = t;
+        klog("launch: CreateProcess(title=%.16s type=0x%X path=%.48s) from %s -> 0x%08X in %d ms",
+             titleid ? titleid : "?", (unsigned)type, path ? path : "?", caller, (unsigned)ret,
+             (int)((now_us() - t) / 1000));
+        if (ret > 0)
+            lt_proc_state(ret, "after create");
+    }
+    return ret;
+}
+
+static SceUID lt_hook_LoadProcessImage(SceUID pid, const char *path, int flags, void *auth_info,
+                                       void *param, void *shim_info)
+{
+    SceInt64 t = now_us();
+    SceUID ret = HOOK_NEXT(lt_hook_LoadProcessImage, g_lt_ref[LT_LOADIMAGE], pid, path, flags, auth_info, param, shim_info);
+    if (g_launch_trace)
+        klog("launch: LoadProcessImage(pid=0x%08X path=%.48s flags=0x%X) -> 0x%08X in %d ms (+%d ms)",
+             (unsigned)pid, path ? path : "?", (unsigned)flags, (unsigned)ret,
+             (int)((now_us() - t) / 1000), lt_ms());
+    return ret;
+}
+
+static int lt_hook_StartProcess(SceUID pid, uint32_t type, SceSize argSize, const void *argBlock)
+{
+    int ret;
+    if (g_launch_trace)
+        lt_proc_state(pid, "before StartProcess");
+    ret = HOOK_NEXT(lt_hook_StartProcess, g_lt_ref[LT_START], pid, type, argSize, argBlock);
+    if (g_launch_trace)
+        klog("launch: StartProcess(pid=0x%08X type=0x%X argSize=%u) -> 0x%08X (+%d ms)",
+             (unsigned)pid, (unsigned)type, (unsigned)argSize, (unsigned)ret, lt_ms());
+    return ret;
+}
+
+static int lt_hook_StartProcessExt(SceUID pid, uint32_t type, SceSize argSize, const void *argBlock, uint32_t flags)
+{
+    int ret;
+    if (g_launch_trace)
+        lt_proc_state(pid, "before StartProcessExt");
+    ret = HOOK_NEXT(lt_hook_StartProcessExt, g_lt_ref[LT_STARTEXT], pid, type, argSize, argBlock, flags);
+    if (g_launch_trace)
+        klog("launch: StartProcessExt(pid=0x%08X type=0x%X argSize=%u flags=0x%X) -> 0x%08X (+%d ms)",
+             (unsigned)pid, (unsigned)type, (unsigned)argSize, (unsigned)flags, (unsigned)ret, lt_ms());
+    return ret;
+}
+
+static int lt_hook_KillProcess(SceUID pid, int option)
+{
+    int ret;
+    if (g_launch_trace) {
+        char caller[40];
+        lt_caller(caller, sizeof(caller));
+        klog("launch: KillProcess(pid=0x%08X option=%d) from %s (+%d ms)", (unsigned)pid, option, caller, lt_ms());
+        lt_proc_state(pid, "before kill");
+    }
+    ret = HOOK_NEXT(lt_hook_KillProcess, g_lt_ref[LT_KILL], pid, option);
+    if (g_launch_trace)
+        klog("launch: KillProcess(pid=0x%08X) -> 0x%08X", (unsigned)pid, (unsigned)ret);
+    return ret;
+}
+
+static int lt_hook_AppMgrKillProcess(SceUID pid)
+{
+    int ret;
+    if (g_launch_trace) {
+        char caller[40];
+        lt_caller(caller, sizeof(caller));
+        klog("launch: AppMgrKillProcess(pid=0x%08X) from %s (+%d ms)", (unsigned)pid, caller, lt_ms());
+    }
+    ret = HOOK_NEXT(lt_hook_AppMgrKillProcess, g_lt_ref[LT_APPKILL], pid);
+    if (g_launch_trace)
+        klog("launch: AppMgrKillProcess(pid=0x%08X) -> 0x%08X", (unsigned)pid, (unsigned)ret);
+    return ret;
+}
+
+/* SceShell posts every error dialog to the error history.  The record starts
+ * with a 0x100-byte message and carries the raw 32-bit code and the title id
+ * after it (wiki SceError: error_code_hex, titleid[0xC]; exact offsets
+ * unverified), so the 64 bytes after the message are dumped raw. */
+static int lt_hook_ErrorHistoryPostError(const void *uinfo)
+{
+    int ret = HOOK_NEXT(lt_hook_ErrorHistoryPostError, g_lt_ref[LT_ERRPOST], uinfo);
+    if (g_launch_trace && uinfo) {
+        unsigned char rec[0x140];
+        int c;
+        memset(rec, 0, sizeof(rec));
+        c = ksceKernelCopyFromUser(rec, uinfo, sizeof(rec));
+        if (c < 0) {
+            klog("launch: ErrorHistoryPostError -> 0x%08X (record copy failed 0x%08X)", (unsigned)ret, (unsigned)c);
+        } else {
+            const uint32_t *w = (const uint32_t *)(rec + 0x100);
+            char asc[65];
+            int i;
+            rec[0xFF] = 0;
+            for (i = 0; i < 64; i++) {
+                unsigned char ch = rec[0x100 + i];
+                asc[i] = (ch >= 0x20 && ch < 0x7F) ? (char)ch : '.';
+            }
+            asc[64] = 0;
+            klog("launch: ErrorHistoryPostError -> 0x%08X msg=\"%.72s\"", (unsigned)ret, (const char *)rec);
+            klog("launch:   +0x100: %08X %08X %08X %08X %08X %08X %08X %08X",
+                 (unsigned)w[0], (unsigned)w[1], (unsigned)w[2], (unsigned)w[3],
+                 (unsigned)w[4], (unsigned)w[5], (unsigned)w[6], (unsigned)w[7]);
+            klog("launch:   +0x120: %08X %08X %08X %08X %08X %08X %08X %08X",
+                 (unsigned)w[8], (unsigned)w[9], (unsigned)w[10], (unsigned)w[11],
+                 (unsigned)w[12], (unsigned)w[13], (unsigned)w[14], (unsigned)w[15]);
+            klog("launch:   +0x100 ascii: %s", asc);
+        }
+    }
+    return ret;
+}
+
+static void lt_install(int idx, const char *mod, uint32_t lib, uint32_t nid, const void *fn, const char *name)
+{
+    SceUID u = taiHookFunctionExportForKernel(KERNEL_PID, &g_lt_ref[idx], mod, lib, nid, fn);
+    g_lt_uid[idx] = u;
+    klog("launch: hook %s %s (0x%08X)", name, u >= 0 ? "ok" : "FAILED", (unsigned)u);
+}
+
+static void launch_trace_install(void)
+{
+    int i;
+    for (i = 0; i < LT_COUNT; i++) {
+        g_lt_uid[i] = -1;
+        g_lt_ref[i] = 0;
+    }
+    g_launch_trace = (g_verbose || trace_configured()) ? 1 : 0;
+    if (!g_launch_trace)
+        return;
+    klog("launch: tracer on (a trace override exists): the app-launch chain is logged");
+    lt_install(LT_CREATE,    LT_PROCESSMGR_MODULE, LT_PROCESSMGR_KLIB, LT_NID_CREATEPROCESS,    lt_hook_CreateProcess,         "ksceKernelCreateProcess");
+    lt_install(LT_LOADIMAGE, LT_MODULEMGR_MODULE,  LT_MODULEMGR_KLIB,  LT_NID_LOADPROCESSIMAGE, lt_hook_LoadProcessImage,      "ksceKernelLoadProcessImage");
+    lt_install(LT_START,     LT_PROCESSMGR_MODULE, LT_PROCESSMGR_KLIB, LT_NID_STARTPROCESS,     lt_hook_StartProcess,          "ksceKernelStartProcess");
+    lt_install(LT_STARTEXT,  LT_PROCESSMGR_MODULE, LT_PROCESSMGR_KLIB, LT_NID_STARTPROCESSEXT,  lt_hook_StartProcessExt,       "ksceKernelStartProcessExt");
+    lt_install(LT_KILL,      LT_PROCESSMGR_MODULE, LT_PROCESSMGR_KLIB, LT_NID_KILLPROCESS,      lt_hook_KillProcess,           "ksceKernelKillProcess");
+    lt_install(LT_APPKILL,   LT_APPMGR_MODULE,     LT_APPMGR_DLIB,     LT_NID_APPMGRKILL,       lt_hook_AppMgrKillProcess,     "ksceAppMgrKillProcess");
+    lt_install(LT_ERRPOST,   LT_ERROR_MODULE,      LT_ERROR_ULIB,      LT_NID_ERRHISTPOST,      lt_hook_ErrorHistoryPostError, "_sceErrorHistoryPostError");
+}
+
+static void launch_trace_release(void)
+{
+    int i;
+    for (i = LT_COUNT - 1; i >= 0; i--) {
+        if (g_lt_uid[i] >= 0) {
+            taiHookReleaseForKernel(g_lt_uid[i], g_lt_ref[i]);
+            g_lt_uid[i] = -1;
+        }
+    }
+    g_launch_trace = 0;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Hook installation                                                          */
 /* ------------------------------------------------------------------------- */
 
@@ -2543,6 +2786,7 @@ int module_start(SceSize argc, const void *args)
     refresh_display_cache(1);
 
     install_hooks();
+    launch_trace_install();     /* no-op unless a trace override exists (1.5.1) */
 
     g_procevent_uid = ksceKernelRegisterProcEventHandler("pstv1080p", &g_procevent_handler, 0);
     if (g_procevent_uid < 0 || g_verbose)
@@ -2577,6 +2821,7 @@ int module_stop(SceSize argc, const void *args)
         g_thread_uid = -1;
     }
 
+    launch_trace_release();
     release_hooks();
 
     if (g_procevent_uid >= 0) {

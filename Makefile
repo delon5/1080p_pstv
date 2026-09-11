@@ -20,6 +20,7 @@ STUBDIR   := $(BUILD)/stubs
 
 KCFLAGS   := -Wl,-q -Wall -Wextra -Wno-unused-parameter -Wno-attribute-alias -O2 -nostdlib -fno-builtin -D__VITA_KERNEL__ -Iinclude
 KLIBS     := -ltaihenForKernel_stub -ltaihenModuleUtils_stub -lSceSysclibForDriver_stub -lSceSysmemForDriver_stub \
+             -lSceProcessmgrForDriver_stub \
              -lSceIofilemgrForDriver_stub -lSceThreadmgrForDriver_stub -lSceDisplayForDriver_stub \
              -lSceRegMgrForDriver_stub -lSceSysrootForDriver_stub -lSceSysrootForKernel_stub -lSceProcEventForDriver_stub -lgcc
 

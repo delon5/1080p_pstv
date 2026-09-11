@@ -99,3 +99,63 @@ bytes; SceSettings seg0 0x81063540, 0x2938DC bytes; FW 3.60).
 * Other hits in SceSettings (0x8700 = 1080p60 in two places, `and.w #0x8600`
   at 0x81224E68, a 0x8600 literal at 0x812520E8) belong to unrelated code
   (display-area / device-info pages) and were not touched.
+
+
+## 13. Tales of Hearts R launch failure: what the 2026-09-11 research established
+
+Sources: wiki.henkaku.xyz (SceSysmem, SceProcessmgr, SceAppMgr, SceError,
+Memory_budget), psdevwiki (PARAM.SFO, Error_Codes via Wayback), vitasdk
+headers and the 3.60 NID database in the toolchain, vita-mksfoex.c, Sharpscale
+and LowMemMode sources, PS TV manual, community threads. Verified locally
+where marked.
+
+* **Kill-event words.** `SceProcEventInvokeParam1` = {size 0x10, w1, w2, w3}.
+  w1 is the event id (2 EXIT, 3 KILL; resume events also carry 3), w3 is the
+  process type (0x01000000 GAME, 0x02000000 MINI_APPLICATION). w2 is
+  undocumented anywhere (headers, wiki, 22 public repos using the struct);
+  it is 0 on every normal LiveArea close and 0x10 only on the Hearts R kill.
+  The only documented 0x10 in SceProcessmgr's vocabulary is a *suspended*
+  status bit (`SceKernelProcessInfo.status`: suspended = 0x11/0x10011,
+  started = |2), which fits "killed before it was ever started". 1.5.1 logs
+  `ksceKernelGetProcessStatus` / `GetProcessInfo` at create and kill time to
+  test that reading. The handler's last argument (`a=0`) is our own pCommon.
+* **C2-12828-1.** Display codes are not an arithmetic transform of the hex
+  code: SceError looks the code up in os0:kd/error_table.bin; the prefix is
+  the facility group, the number is the table index (+2000), the last digit
+  the digit sum mod 10 (wiki SceError, rule verified on ~2700 known pairs).
+  C2 = facility 0x010 (SceShell-side utility codes). A kernel error would
+  display as C1-xxxx (e.g. SCE_KERNEL_ERROR_NO_MEMORY = C1-2631-2,
+  NO_PHYMEMPART_CDRAM = C1-8827-5), a SceAppMgr error as C0-xxxx, a display
+  error as C4-xxxx. C2-12828-1 is therefore SceShell's generic "An error
+  occurred in the following applications" and carries no reason; the raw
+  code is stored in the error history (`_sceErrorHistoryPostError`, hooked
+  in 1.5.1).
+* **Hearts R param.sfo** (copy in the session scratchpad): ATTRIBUTE
+  0x00200001 (0x200000 = health warning in the manual, 0x1 unnamed but
+  ubiquitous), ATTRIBUTE2 0 (**no memory expansion**: standard 256 MiB main /
+  112 MiB CDRAM / 26 MiB phycont budget), ATTRIBUTE_MINOR 0x10 (baseline
+  bit on every FW 3.x title), sdk 1.80, sysver 3.15, officially PS TV
+  compatible at launch. No PARAM.SFO key encodes an HDMI/1080 mode; the PS TV
+  launch gate in SceShell is a title-ID blacklist that ignores the AV mode.
+* **Memory.** Budgets are fixed physical partitions carved at boot; system
+  allocations cannot touch the game partitions, the only shared pool is the
+  125 MiB "+109 MiB / system" region, Sharpscale allocates nothing, and a
+  budget failure would abort inside `ksceKernelCreateProcess` immediately,
+  not 8-11 s later. Two other commercial titles and two homebrews launched
+  fine in the same session under 0x8710. Memory is an unlikely cause.
+* **Sony's own 1080i refusal** exists only for PlayStation-format (PS1)
+  software (PS TV manual: "If the resolution is set to 1080i, PlayStation
+  format software cannot start"); during the failed Hearts R launch nothing
+  called sceAVConfigHdmiSetResolution at all.
+* **Launch chain (3.60).** SceShell -> SceAppMgr user export
+  `_sceAppMgrLaunchAppByName2ForShell` (0xC6BA9596, then `..2ndStage`
+  0xDEDD2AED) -> `ksceKernelCreateProcess` (SceProcessmgrForKernel
+  0x7A69DE86/0x71CF71FD: ProcCB, budget, address space, then
+  `ksceKernelLoadProcessImage` SceModulemgrForKernel 0xC445FA63/0xAC4EABDB)
+  -> `ksceKernelStartProcessExt` (0x36728B16, "used by SceAppMgr") -> user
+  code. Aborts end in `ksceKernelKillProcess(pid, option)` (0xA1071106,
+  option 0/1/2 -> flags 0x2/0x20/0x40) or `ksceAppMgrKillProcess`
+  (SceAppMgrForDriver 0xDCE180F8/0xD80566DB). All are exports of kernel
+  modules and hookable with taiHookFunctionExportForKernel. The two ForShell
+  launch exports have unknown argument counts and are NOT hooked (a
+  pass-through hook with a wrong prototype corrupts stack arguments).

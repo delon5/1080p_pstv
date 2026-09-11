@@ -44,6 +44,22 @@ for how they differ.
 
 ## Changelog
 
+- **1.5.1 (2026-09-11)** — diagnostics only, no behaviour change. The
+  `proc: start` lines (one per resume phase, dozens per app) now appear only
+  for the traced title or in verbose mode. New **launch tracer**, installed
+  only while a `trace` override exists: log-only hooks on the kernel's
+  app-launch chain (`ksceKernelCreateProcess`, `ksceKernelLoadProcessImage`,
+  `ksceKernelStartProcess[Ext]`, `ksceKernelKillProcess`,
+  `ksceAppMgrKillProcess`, and `_sceErrorHistoryPostError`, the call SceShell
+  makes to file an error dialog) with arguments, results, calling process,
+  process status words and timing, so a launch the system aborts before any
+  user code runs (Tales of Hearts R under 1080-line output) shows *which* step
+  fails and with *which* SCE error. Background in `docs/RESEARCH_NOTES.md`
+  section 13: the kill event's words are event type / an undocumented status
+  word (0x10 only for the failing launch) / process type; C2-12828-1 is
+  SceShell's generic "application terminated" code and encodes no reason;
+  Hearts R's param.sfo is an ordinary retail profile (no memory expansion, no
+  PS TV or resolution flags).
 - **1.5.0 (2026-09-11)** — **the Settings entry is mapped natively.** Sony's
   value→mode code is not in the core module at all: it is a compare ladder in
   the main `SceSettings` module (1 → 1080i, 2 → 720p, 3 → 480p, anything else →
