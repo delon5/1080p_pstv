@@ -159,3 +159,30 @@ where marked.
   modules and hookable with taiHookFunctionExportForKernel. The two ForShell
   launch exports have unknown argument counts and are NOT hooked (a
   pass-through hook with a wrong prototype corrupts stack arguments).
+
+
+## 14. What the 1.5.1 tracer recorded before it was removed (2026-09-11)
+
+One Hearts R launch under 1080p30 (kernel.log, v1.5.1 boot 1):
+
+```
+LoadProcessImage(pid path=ux0:/app/PCSE00429/eboot.bin) -> OK in 244 ms
+CreateProcess(title=PCSE00429 type=0x1000000) from SceShell -> OK in 473 ms
+StartProcessExt(pid type=0 argSize=0 flags=0x2) -> 0x00000000        (+1126 ms)
+ErrorHistoryPostError msg="An error has occurred in the following application."  (+6.7 s)
+KillProcess(pid option=1) from kernel(0x00010005)                    (+8793 ms)
+before kill: status=0x3 / info.status=0x4000003
+```
+
+Every normal close of a working title: `KillProcess(option=0)` from SceShell or
+Settings, `info.status=0x3`. So Hearts R is **not refused**: image load, process
+creation and start all succeed; the process then dies before its first display
+call and before any `sceKernelAllocMemBlock`, killed from kernel context with
+option 1 and the 0x04000000 status bit set (exception path). No psp2core is
+written. Conclusion: an early-startup crash (game `module_start` or a
+preloaded system module's init) that only happens under 1080-line output. The
+memory-budget and launcher-gate hypotheses are dead. The decisive next test
+needs no build: launch the title at stock 1080i with both pstv1080p files
+removed from the tai config (Sharpscale off). Fails -> Sony-level for this
+title on this console; works -> one of the plugin's passive user-library hooks
+is the trigger and can be bisected.

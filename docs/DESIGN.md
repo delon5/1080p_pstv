@@ -149,7 +149,17 @@ once, no patch, and the 1.4.x behaviour (kernel-side substitution of the
 "automatic" request) remains in force.
 
 
-## M. Launch tracer (1.5.1)
+## M. Launch tracer (1.5.1) — REMOVED in 1.5.2
+
+> **Removed.** The tracer hooked `ksceKernelCreateProcess`, `ksceKernelStartProcess(Ext)`
+> and `ksceKernelKillProcess` and called `klog()` (ux0: file open/write/close) from
+> inside them, with a 232-byte `SceKernelProcessInfo` on the caller's kernel stack.
+> On hardware this rebooted the console and corrupted the state file
+> (`hd_mode_code` became 0x8700). Rule for this project from now on: never do
+> file I/O or large stack allocations inside hooks on process/module-manager
+> internals; buffer to a static ring and flush from the plugin's own thread, or
+> trace from user-library export hooks (syscall context) only. The section below
+> is kept as a record of what was tried.
 
 Opt-in, log-only. When a `trace` override exists (or verbose logging is on)
 the kernel module hooks the seven launch-chain exports listed in
