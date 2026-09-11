@@ -219,7 +219,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
 #define APPLY_MAX_ATTEMPTS_EPISODE    10             /* attempts per drift episode */
-#define APPLY_MAX_TOTAL_SESSION       30             /* hard cap per boot session */
+#define APPLY_MAX_TOTAL_SESSION       60             /* cap for AUTOMATIC attempts per boot; a user selection resets it */
 #define APPLY_MIN_INTERVAL_US         (5u * 1000u * 1000u)
 #define APPLY_SHELL_FALLBACK_US       (10u * 1000u * 1000u) /* no SceShell frame took the job -> thread does it */
 #define SHELL_WAIT_POLL_US            (500u * 1000u)
@@ -1863,6 +1863,7 @@ static int state_changed(int old_enabled, const char *why)
     int ret = 0;
 
     g_apply_attempts = 0;
+    g_apply_total = 0;          /* a deliberate selection always gets a fresh budget (v1.4.5) */
     apply_clear_schedule();
 
     if (!g_cfg.mode_1080p) {
@@ -2101,6 +2102,7 @@ int pstv1080pSetMode1080p(int enable)
         /* Already on: persist and make sure the output really is in HD mode. */
         ret = config_save();
         g_apply_attempts = 0;
+        g_apply_total = 0;
         apply_clear_schedule();
         {
             int a = apply_hd_mode("SetMode1080p(re-apply)");

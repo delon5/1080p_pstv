@@ -44,6 +44,11 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.5 (2026-09-11)** — a deliberate selection in Settings now resets the
+  per-boot apply budget (previously 30 attempts per boot for all paths; after
+  enough failed switches in one session the plugin silently stopped trying
+  until a reboot, which looked like "it won't let me back into 1080p"). The
+  automatic budget is 60 per boot.
 - **1.4.4 (2026-09-11)** — fixes "switching from 1080i to 1080p sometimes
   does not change the output". Sony's Settings code switches the head to
   "automatic" just before the plugin asks for 1080p30; if the driver is still
