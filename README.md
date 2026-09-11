@@ -146,6 +146,15 @@ only offers 480p, 720p and 1080i. This project:
 
 ## Requirements
 
+> **Sharpscale is required.** On the tested console the 1080p30 head shows no
+> picture at all unless `sharpscale.skprx` is loaded: the plugin switches the
+> HDMI mode, Sharpscale scales the 960x544 framebuffer into it. Never disable
+> Sharpscale while 1080p is selected. If you did and the screen is black:
+> power off, boot, power off again within 2 minutes, and the safe-boot rule
+> restores your Sony mode on the next start.
+
+
+
 - A PlayStation TV (VTE-1000 series). This does nothing useful on a handheld Vita.
 - HENkaku / taiHEN (Enso recommended) on firmware **3.60 – 3.74**.
 - A display that accepts **1080p at 30 Hz** over HDMI (most TVs do; see below).
