@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<system_settings version="1.0" plugin="sound_settings_plugin">
+
+  <!-- サウンド＆ディスプレイ -->
+  <setting_list id="sound_settings" title="msg_sound_display">
+
+    <!-- 明るさ (1G/2G) -->
+    <setting_list id="display_brightness" title="msg_brightness" icon="tex_spanner">
+      <user_custom id="display_brightness_setting"/>
+      <!-- DEBUG AC状態Fake 
+      <toggle_switch id="debug_ac_status2" title="DEBUG AC Status ON" icon="tex_spanner"/>
+      -->
+    </setting_list>
+    <!-- DEBUG AC状態Fake 
+    <toggle_switch id="debug_ac_status1" title="DEBUG AC Status ON" icon="tex_spanner"/>
+    -->
+    
+    <!-- 解像度 (Dolce) -->
+    <list id="resolution" title="msg_resolution" icon="tex_spanner"
+          key="/CONFIG/DISPLAY/hdmi_resolution_mode">
+      <list_item id="resolution_0" title="msg_automatic" value="0"/>
+      <list_item id="resolution_2" title="msg_720p" value="2"/>
+      <list_item id="resolution_1" title="msg_1080i" value="1"/>
+      <list_item id="resolution_3" title="msg_480p" value="3"/>
+    </list>
+
+    <!-- RGBレンジ (Dolce) -->
+    <list id="rgb_range" title="msg_rgb_range" icon="tex_spanner" hint="msg_rgb_range_info"
+          key="/CONFIG/DISPLAY/rgb_range_mode">
+      <list_item id="rgb_range_0" title="msg_automatic_recommended" value="0"/>
+      <list_item id="rgb_range_1" title="msg_limited" value="1"/>
+      <list_item id="rgb_range_2" title="msg_full_rgb" value="2"/>
+    </list>
+
+    <!-- 表示エリア設定 (Dolce) -->
+    <button id="display_area" title="msg_display_area_settings" icon="tex_spanner"/>
+    
+    <!-- スクリーンセーバー (Dolce) -->
+    <list id="screensaver" title="msg_start_screensaver" icon="tex_spanner"
+          key="/CONFIG/DISPLAY/dimming_interval">
+      <list_item id="screensaver_1" title="" value="300"/>
+      <list_item id="screensaver_2" title="" value="900"/>
+      <list_item id="screensaver_3" title="" value="1800"/>
+      <list_item id="screensaver_0" title="msg_off" value="0"/>
+    </list>
+
+    <!-- システムのミュージック -->
+    <toggle_switch id="bgm" key="/CONFIG/SHELL/bgm"
+                   title="msg_system_music" icon="tex_spanner"/>
+    
+    <!-- AVLS (1G/2G) -->
+    <toggle_switch id="avls" key="/CONFIG/SOUND/avls"
+                   title="msg_avls" hint="msg_avls_info" icon="tex_spanner"/>
+
+    <!-- 自動で消音する (1G/2G) -->
+    <toggle_switch id="mute_automatically" key="/CONFIG/SOUND/speaker_mute"
+                   title="msg_mute_automatically" hint="msg_mute_automatically_info" icon="tex_spanner"/>
+
+   
+  </setting_list>
+</system_settings>

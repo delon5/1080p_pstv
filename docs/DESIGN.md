@@ -93,3 +93,8 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - Settings-path apply works on hardware; the kernel-thread boot apply did not take effect (driver kept reporting 0x8300) and the v1.0 "expected readback" latch then suppressed retries.
 - New rule: an apply is EFFECTIVE only if ksceDisplayGetOutputMode changes (to hd_mode_code, or to a new plausible value which becomes the alias). Unchanged readback = not applied.
 - Boot-time attempt is scheduled by the thread and executed from SceShell's display syscalls (_sceDisplaySetFrameBuf, sceDisplayWaitVblankStart*, sceDisplayWaitSetFrameBufMulti*) via the existing kernel export hooks, i.e. in a user-process syscall context; thread fallback after 10 s. Retries with backoff, 10/episode, 30/session. Re-entrancy guard + try-lock so a frame flip never blocks behind the watchdog.
+
+## G. v1.2 change (adaptive inject)
+- Per-process tracker: every SceDisplay vsync-related syscall (WaitVblankStart*, WaitSetFrameBuf*, GetVcount*) stamps last_sync_us for the calling pid on entry and exit; RegisterVblankStartCallback marks the pid as callback-synced.
+- _sceDisplaySetFrameBuf hook: if fps_mode != OFF and fps_inject == 1 and the pid had no sync activity for > 4.5 refresh periods (and is not callback-synced) -> ksceDisplayWaitVblankStartMulti(1) (FORCE: force_interval()). fps_inject == 2 = always (old Framecapper Inject). Default fps_inject = 1.
+- Rationale: games that never vsync were unpaced at 30 Hz (user-reported flicker / wrong rate); Framecapper60Inject paced them but double-waited every syncing game.

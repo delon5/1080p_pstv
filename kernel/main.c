@@ -68,8 +68,24 @@
  *     frame-pacing hot path; every failure is ignored).
  *
  * ---------------------------------------------------------------------------
- * UNTESTED ASSUMPTIONS (no PS TV was available while writing this)
+ * HARDWARE RESULTS (PS TV, 2026-09-11) and remaining assumptions
  * ---------------------------------------------------------------------------
+ *  Confirmed: A1 (0x8710 works), A3 (GetOutputMode reports 0x8710 after the
+ *  apply, 0x8300/0x8600 for 480p/720p), A4 (all SceDisplay export hooks
+ *  install), A7, A9.  sceAVConfigHdmiSetResolution returns 0x80010058
+ *  (ENOSYS) when called from a kernel thread and works from any user-process
+ *  syscall context; the thread fallback below is therefore expected to fail
+ *  and only exists as a last resort.  Sony's Settings core calls
+ *  SetResolution(<code>) BEFORE it writes hdmi_resolution_mode; for a value
+ *  it does not know (ours) it sends 0x10000000, which the driver treats as
+ *  "automatic" (720p on the test TV); our SetMode1080p(1) then switches to
+ *  0x8710 right after, so selecting the item shows a brief 720p flash.
+ *  Registry values on FW 3.60: 0 automatic, 1 1080i, 2 720p, 3 480p.
+ *  v1.2 adds the adaptive inject (fps_inject = 1): games without any vsync
+ *  wait were unpaced at 30 Hz (flicker / wrong rate reported by the user),
+ *  which Framecapper's Inject build used to hide at the price of double-
+ *  waiting games that do sync.
+ *
  *  A1. sceAVConfigHdmiSetResolution(0x8710) really switches the HDMI path to
  *      1080p30 (gameblabla's plugin relies on exactly this; the user's own
  *      480p->1080p remap binary confirms the NID/library).
@@ -165,6 +181,11 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define NID_WAITSETFRAMEBUFMULTI      0x7D9864A8u
 #define NID_WAITSETFRAMEBUFMULTICB    0x3E796EF5u
 #define NID_SETFRAMEBUF               0xF51523CBu
+#define NID_WAITSETFRAMEBUF           0x9423560Cu   /* v1.2: sync-activity tracking only */
+#define NID_WAITSETFRAMEBUFCB         0x814C90AFu
+#define NID_GETVCOUNT                 0xB6FDE0BAu
+#define NID_GETVCOUNTINTERNAL         0x9686859Eu
+#define NID_REGISTERVBLANKCB          0x6BDF4C4Du
 
 /* hooks_ok bitmask reported by pstv1080pGetInfo */
 #define HOOK_BIT_AVCONFIG             (1u << 0)
@@ -175,6 +196,11 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define HOOK_BIT_WAITSETFBMULTI       (1u << 5)
 #define HOOK_BIT_WAITSETFBMULTICB     (1u << 6)
 #define HOOK_BIT_SETFRAMEBUF          (1u << 7)
+#define HOOK_BIT_WAITSETFB            (1u << 8)
+#define HOOK_BIT_WAITSETFBCB          (1u << 9)
+#define HOOK_BIT_GETVCOUNT            (1u << 10)
+#define HOOK_BIT_GETVCOUNTINT         (1u << 11)
+#define HOOK_BIT_REGVBLANKCB          (1u << 12)
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
@@ -215,6 +241,11 @@ enum {
     PH_WAITSETFBMULTI,
     PH_WAITSETFBMULTICB,
     PH_SETFRAMEBUF,
+    PH_WAITSETFB,
+    PH_WAITSETFBCB,
+    PH_GETVCOUNT,
+    PH_GETVCOUNTINT,
+    PH_REGVBLANKCB,
     PH_COUNT
 };
 static SceUID g_pacing_uid[PH_COUNT];
@@ -244,6 +275,19 @@ typedef struct {
 } pid_cache_entry_t;
 static pid_cache_entry_t g_pid_cache[PID_CACHE_ENTRIES];
 static volatile uint32_t g_pid_cache_next = 0;
+
+/* v1.2 adaptive inject: per-process record of the last vsync activity
+ * (any SceDisplay wait entry/exit or vcount read) and whether the process
+ * registered a vblank callback (then it syncs by itself and is never injected). */
+#define VS_TRACK_ENTRIES              8
+#define VS_IDLE_PERIODS_X2            9              /* inject if no sync activity for > 4.5 refresh periods */
+typedef struct {
+    volatile SceUID pid;
+    volatile SceInt64 last_sync_us;
+    volatile uint32_t cb_synced;
+} vs_entry_t;
+static vs_entry_t g_vs[VS_TRACK_ENTRIES];
+static volatile uint32_t g_vs_next = 0;
 
 /* Title list (ur0:tai/pstv1080p_titles.txt) */
 static volatile uint32_t g_title_filter_active = 0;  /* 1 = only listed titles are paced in FORCE mode */
@@ -421,7 +465,7 @@ static void config_defaults(pstv1080p_config_t *c)
     c->settings_item_value = 3;
     c->fps_mode            = PSTV1080P_FPS_SCALE;
     c->fps_target          = 30;
-    c->fps_inject          = 0;
+    c->fps_inject          = 1;     /* AUTO: inject only for games that do not vsync themselves */
     c->safe_boot_seconds   = 120;
     c->boot_apply_delay_ms = 3000;
     c->watchdog_period_ms  = 2000;
@@ -459,7 +503,7 @@ static int config_valid(const pstv1080p_config_t *c)
         return 0;
     if (c->fps_target != 20 && c->fps_target != 30 && c->fps_target != 60)
         return 0;
-    if (c->fps_inject > 1)
+    if (c->fps_inject > 2)
         return 0;
     return 1;
 }
@@ -648,23 +692,70 @@ static uint32_t pid_allowed_cached(SceUID pid)
 /* ------------------------------------------------------------------------- */
 
 /* Returns PSTV1080P_FPS_OFF (pass through), _SCALE or _FORCE for this caller. */
-static inline uint32_t pacing_mode_for_caller(void)
+static vs_entry_t *vs_lookup(SceUID pid, int create)
+{
+    uint32_t i, slot;
+    for (i = 0; i < VS_TRACK_ENTRIES; i++) {
+        if (g_vs[i].pid == pid)
+            return &g_vs[i];
+    }
+    if (!create)
+        return NULL;
+    slot = g_vs_next % VS_TRACK_ENTRIES;
+    g_vs_next = slot + 1;
+    g_vs[slot].pid = 0;
+    g_vs[slot].last_sync_us = 0;
+    g_vs[slot].cb_synced = 0;
+    g_vs[slot].pid = pid;
+    return &g_vs[slot];
+}
+
+static void vs_clear(void)
+{
+    uint32_t i;
+    for (i = 0; i < VS_TRACK_ENTRIES; i++) {
+        g_vs[i].pid = 0;
+        g_vs[i].last_sync_us = 0;
+        g_vs[i].cb_synced = 0;
+    }
+    g_vs_next = 0;
+}
+
+/* Called on entry and exit of every vsync-related syscall of a user process.
+ * O(1), no I/O.  Only needed while fps_inject == AUTO. */
+static inline void vs_mark_sync(void)
+{
+    SceUID pid;
+    vs_entry_t *e;
+    if (g_cfg.fps_inject != 1u)
+        return;
+    pid = ksceKernelGetProcessId();
+    if (pid <= 0 || pid == KERNEL_PID)
+        return;
+    e = vs_lookup(pid, 1);
+    e->last_sync_us = now_us();
+}
+
+static inline uint32_t pacing_mode_for_pid(SceUID pid)
 {
     uint32_t mode = g_cfg.fps_mode;
-    SceUID pid;
 
     if (mode == PSTV1080P_FPS_OFF)
         return PSTV1080P_FPS_OFF;
-
-    pid = ksceKernelGetProcessId();
     if (pid == KERNEL_PID || pid == g_shell_pid || pid <= 0)
         return PSTV1080P_FPS_OFF;
-
     if (mode == PSTV1080P_FPS_FORCE && g_title_filter_active) {
         if (!pid_allowed_cached(pid))
             return PSTV1080P_FPS_OFF;
     }
     return mode;
+}
+
+static inline uint32_t pacing_mode_for_caller(void)
+{
+    if (g_cfg.fps_mode == PSTV1080P_FPS_OFF)
+        return PSTV1080P_FPS_OFF;
+    return pacing_mode_for_pid(ksceKernelGetProcessId());
 }
 
 static inline unsigned int scale_vcount(unsigned int vcount)
@@ -714,69 +805,171 @@ static inline void shell_apply_check(void)
 static int hook_WaitVblankStartMulti(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
-    return HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
+    ret = HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
+    vs_mark_sync();
+    return ret;
 }
 
 static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
-    return HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
+    ret = HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
+    vs_mark_sync();
+    return ret;
 }
 
 static int hook_WaitVblankStart(void)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
-        if (interval > 1)
-            return ksceDisplayWaitVblankStartMulti(interval);
+        if (interval > 1) {
+            ret = ksceDisplayWaitVblankStartMulti(interval);
+            vs_mark_sync();
+            return ret;
+        }
     }
     /* SCALE: interval 1 scales to 1 -> always pass through. */
-    return HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
+    ret = HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
+    vs_mark_sync();
+    return ret;
 }
 
 static int hook_WaitVblankStartCB(void)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
-        if (interval > 1)
-            return ksceDisplayWaitVblankStartMultiCB(interval);
+        if (interval > 1) {
+            ret = ksceDisplayWaitVblankStartMultiCB(interval);
+            vs_mark_sync();
+            return ret;
+        }
     }
-    return HOOK_NEXT(hook_WaitVblankStartCB, g_pacing_ref[PH_WAITVBLANKCB]);
+    ret = HOOK_NEXT(hook_WaitVblankStartCB, g_pacing_ref[PH_WAITVBLANKCB]);
+    vs_mark_sync();
+    return ret;
 }
 
 static int hook_WaitSetFrameBufMulti(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
-    return HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
+    ret = HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
+    vs_mark_sync();
+    return ret;
 }
 
 static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
 {
     uint32_t mode = pacing_mode_for_caller();
+    int ret;
     shell_apply_check();
+    vs_mark_sync();
     if (mode != PSTV1080P_FPS_OFF)
         vcount = pace_vcount(mode, vcount);
-    return HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
+    ret = HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
+    vs_mark_sync();
+    return ret;
+}
+
+/* v1.2 pass-through hooks: they only feed the sync-activity tracker. */
+static int hook_WaitSetFrameBuf(void)
+{
+    int ret;
+    vs_mark_sync();
+    ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
+    vs_mark_sync();
+    return ret;
+}
+
+static int hook_WaitSetFrameBufCB(void)
+{
+    int ret;
+    vs_mark_sync();
+    ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
+    vs_mark_sync();
+    return ret;
+}
+
+static int hook_GetVcount(void)
+{
+    vs_mark_sync();
+    return HOOK_NEXT(hook_GetVcount, g_pacing_ref[PH_GETVCOUNT]);
+}
+
+static int hook_GetVcountInternal(int head)
+{
+    vs_mark_sync();
+    return HOOK_NEXT(hook_GetVcountInternal, g_pacing_ref[PH_GETVCOUNTINT], head);
+}
+
+static int hook_RegisterVblankStartCallback(SceUID uid)
+{
+    SceUID pid = ksceKernelGetProcessId();
+    if (pid > 0 && pid != KERNEL_PID) {
+        vs_entry_t *e = vs_lookup(pid, 1);
+        e->cb_synced = 1;            /* this process syncs through a vblank callback: never inject */
+    }
+    return HOOK_NEXT(hook_RegisterVblankStartCallback, g_pacing_ref[PH_REGVBLANKCB], uid);
+}
+
+/* Adaptive inject (v1.2, fps_inject == 1): after a frame flip, wait one
+ * refresh period (FORCE: the forced interval) ONLY if this process showed no
+ * vsync activity for more than 4.5 refresh periods, i.e. it does not sync by
+ * itself.  Games that already wait for vblank are never double-waited (the
+ * defect of Framecapper's Inject build).  fps_inject == 2 injects always. */
+static inline int inject_wanted(SceUID pid)
+{
+    vs_entry_t *e;
+    SceInt64 idle, limit;
+    uint32_t hz;
+
+    if (g_cfg.fps_inject == 2u)
+        return 1;
+    if (g_cfg.fps_inject != 1u)
+        return 0;
+    e = vs_lookup(pid, 1);
+    if (e->cb_synced)
+        return 0;
+    hz = g_refresh_hz;
+    if (hz == 0)
+        hz = 60;
+    limit = (SceInt64)(1000000u / hz) * VS_IDLE_PERIODS_X2 / 2;
+    idle = now_us() - e->last_sync_us;
+    return idle > limit;
 }
 
 static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
 {
+    SceUID pid = ksceKernelGetProcessId();
+    uint32_t mode = pacing_mode_for_pid(pid);
     int ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
-    if (g_cfg.fps_inject && pacing_mode_for_caller() == PSTV1080P_FPS_FORCE)
-        ksceDisplayWaitVblankStartMulti(force_interval());
+
+    if (mode != PSTV1080P_FPS_OFF && g_cfg.fps_inject != 0u && inject_wanted(pid)) {
+        unsigned int n = (mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
+        ksceDisplayWaitVblankStartMulti(n);
+    }
     /* After the flip: run a scheduled HD apply from SceShell's context (A9). */
     shell_apply_check();
     return ret;
@@ -1363,6 +1556,11 @@ static void install_hooks(void)
     install_pacing_hook(PH_WAITSETFBMULTI,    NID_WAITSETFRAMEBUFMULTI,   hook_WaitSetFrameBufMulti,   HOOK_BIT_WAITSETFBMULTI,    "WaitSetFrameBufMulti");
     install_pacing_hook(PH_WAITSETFBMULTICB,  NID_WAITSETFRAMEBUFMULTICB, hook_WaitSetFrameBufMultiCB, HOOK_BIT_WAITSETFBMULTICB,  "WaitSetFrameBufMultiCB");
     install_pacing_hook(PH_SETFRAMEBUF,       NID_SETFRAMEBUF,            hook_SetFrameBuf,            HOOK_BIT_SETFRAMEBUF,       "_sceDisplaySetFrameBuf");
+    install_pacing_hook(PH_WAITSETFB,         NID_WAITSETFRAMEBUF,        hook_WaitSetFrameBuf,        HOOK_BIT_WAITSETFB,         "WaitSetFrameBuf");
+    install_pacing_hook(PH_WAITSETFBCB,       NID_WAITSETFRAMEBUFCB,      hook_WaitSetFrameBufCB,      HOOK_BIT_WAITSETFBCB,       "WaitSetFrameBufCB");
+    install_pacing_hook(PH_GETVCOUNT,         NID_GETVCOUNT,              hook_GetVcount,              HOOK_BIT_GETVCOUNT,         "GetVcount");
+    install_pacing_hook(PH_GETVCOUNTINT,      NID_GETVCOUNTINTERNAL,      hook_GetVcountInternal,      HOOK_BIT_GETVCOUNTINT,      "GetVcountInternal");
+    install_pacing_hook(PH_REGVBLANKCB,       NID_REGISTERVBLANKCB,       hook_RegisterVblankStartCallback, HOOK_BIT_REGVBLANKCB,  "RegisterVblankStartCallback");
 }
 
 static void release_hooks(void)
@@ -1431,6 +1629,7 @@ int module_start(SceSize argc, const void *args)
     }
     g_avconfig_ref = 0;
     pid_cache_clear();
+    vs_clear();
 
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
 
@@ -1460,8 +1659,9 @@ int module_start(SceSize argc, const void *args)
         klog("thread: create failed 0x%08X", (unsigned)g_thread_uid);
     }
 
-    klog("started: hooks_ok=0x%02X mode_1080p=%u refresh_hz=%u",
-         (unsigned)g_hooks_ok, (unsigned)g_cfg.mode_1080p, (unsigned)g_refresh_hz);
+    klog("started: hooks_ok=0x%04X mode_1080p=%u refresh_hz=%u fps_mode=%u inject=%u",
+         (unsigned)g_hooks_ok, (unsigned)g_cfg.mode_1080p, (unsigned)g_refresh_hz,
+         (unsigned)g_cfg.fps_mode, (unsigned)g_cfg.fps_inject);
     return SCE_KERNEL_START_SUCCESS;
 }
 

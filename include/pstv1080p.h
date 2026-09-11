@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0101u      /* 1.1 */
+#define PSTV1080P_VERSION            0x0102u      /* 1.2 */
 
 /* Persistent kernel state (ur0 is always mounted when kernel plugins start). */
 #define PSTV1080P_CFG_PATH           "ur0:tai/pstv1080p.cfg"
@@ -69,7 +69,8 @@ typedef struct pstv1080p_config {
     uint32_t settings_item_value; /* registry-style value of the injected list_item, default 3 */
     uint32_t fps_mode;            /* PSTV1080P_FPS_* , default SCALE */
     uint32_t fps_target;          /* FORCE mode target fps: 20/30/60, default 30 */
-    uint32_t fps_inject;          /* FORCE mode: wait after every SetFrameBuf (Framecapper "Inject"), default 0 */
+    uint32_t fps_inject;          /* 0 off, 1 AUTO (default): after a flip wait one period only for processes that
+                                   * made no vsync call of their own, 2 always (Framecapper "Inject" semantics) */
     uint32_t safe_boot_seconds;   /* revert-on-quick-reboot window, default 120, 0 disables */
     uint32_t boot_apply_delay_ms; /* delay after SceShell appears before first apply, default 3000 */
     uint32_t watchdog_period_ms;  /* 0 disables, default 2000 */

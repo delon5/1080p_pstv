@@ -1,6 +1,6 @@
 # pstv1080p — a native "1080p (30 Hz)" option for the PlayStation TV
 
-> **Status: built, NOT yet tested on real hardware.**
+> **Status: tested on a PS TV (FW 3.60, 2026-09-11).** The Settings entry, the switch, the automatic apply at boot (1.1) and the safe-boot marker all behaved as designed. Frame pacing for games without their own vsync was fixed in 1.2; a wider game test is still open.
 > The author does not currently own a PS TV. Everything below describes what the
 > code is designed to do, verified only by compiling it and by reverse engineering
 > the original plugin and Sony's modules. Please read
@@ -44,6 +44,20 @@ for how they differ.
 
 ## Changelog
 
+- **1.2 (2026-09-11)** — adaptive inject. The first game tests showed that
+  titles which never wait for vblank themselves ran unpaced at 30 Hz
+  (flicker, wrong frame rate); Framecapper's Inject build used to hide that
+  at the price of double-waiting every game that *does* sync (30 fps at
+  60 Hz, 15 fps at 30 Hz). `fps_inject` now has three values: 0 off, 1 AUTO
+  (new default): after a frame flip the plugin waits one refresh period only
+  if that process made no vsync call for more than 4.5 periods, 2 always
+  (old Framecapper semantics). Five pass-through hooks feed the tracker
+  (`WaitSetFrameBuf`, `WaitSetFrameBufCB`, `GetVcount`, `GetVcountInternal`,
+  `RegisterVblankStartCallback`; a process that registers a vblank callback
+  is never injected). Also documents the hardware findings: Sony's list is
+  0 automatic / 1 1080i / 2 720p / 3 480p (our item takes 4), and the boot
+  apply from a kernel thread fails with `0x80010058` (ENOSYS), which is why
+  1.1 issues it from SceShell's context.
 - **1.1 (2026-09-11)** — first hardware test found that the entry and the
   switch from Settings work, but after a reboot the console stayed at the
   Sony-selected mode (480p) while Settings still showed 1080p. Cause: the
@@ -184,6 +198,25 @@ with the two `config.txt` lines.
   `ur0:tai/pstv1080p_titles.txt` and the `ux0:data/pstv1080p/` folder.
   Reboot; the HDMI resolution is whatever Sony's registry says.
 
+## Hardware findings (PS TV, FW 3.60)
+
+- The HDMI list in Settings > Sound & Display is defined in Sony's
+  `sound_settings_plugin` page (dumped to `docs/reversing/sound_settings_page_fw360.xml`):
+  `0` Automatic, `2` 720p, `1` 1080i, `3` 480p, bound to
+  `/CONFIG/DISPLAY/hdmi_resolution_mode`. The plugin's item therefore uses
+  value `4`; Sony's registry never sees it.
+- When you pick an entry, Sony's Settings code calls
+  `sceAVConfigHdmiSetResolution(<code>)` first and writes the registry key
+  afterwards. For a value it does not know it sends `0x10000000`
+  ("automatic", 720p on the test TV), and the plugin switches to 0x8710 right
+  after, so selecting "1080p (30 Hz)" shows a short 720p flash. Cosmetic.
+- `sceAVConfigHdmiSetResolution` returns `0x80010058` (ENOSYS) when called
+  from a kernel thread; from any user-process system call it works. The boot
+  apply is therefore issued from SceShell's first display call after the
+  configured delay (about 9 s after power-on in the log).
+- `ksceDisplayGetOutputMode(1)` reports the plain screen-mode codes
+  (`0x8300`, `0x8600`, `0x8710`), so no alias handling was needed.
+
 ## Frame pacing
 
 In the default SCALE mode nothing changes at 60 Hz: the rescaling is
@@ -197,7 +230,7 @@ is no config app yet, see [Config file](#config-file-ur0taipstv1080pcfg)):
 |-----------:|-------|-----------|
 | 0 | OFF   | Pacing hooks pass everything through untouched. At 30 Hz, games that wait 2 vblanks run at 15 fps (the problem the original remap had). |
 | 1 | SCALE (default) | Each game's own vblank-wait count is rescaled to the current refresh rate, so the game keeps its intended frame rate where the refresh rate allows it. A "wait 2 vblanks" (30 fps at 60 Hz) becomes "wait 1 vblank" at 30 Hz. 60 fps titles become 30 fps (unavoidable at 30 Hz). |
-| 2 | FORCE | Framecapper-style fixed target: every wait becomes "one frame at `fps_target` fps", computed from the *current* refresh rate. With `fps_target = 30`: 2 vblanks at 60 Hz, 1 vblank at 30 Hz. `fps_inject = 1` additionally waits after every `SetFrameBuf`, like Framecapper's "Inject" builds. An optional title list `ur0:tai/pstv1080p_titles.txt` (one title id per line, or a single line `*ALL`) limits FORCE mode to the listed games (see the config section for the no-file case). |
+| 2 | FORCE | Framecapper-style fixed target: every wait becomes "one frame at `fps_target` fps", computed from the *current* refresh rate. With `fps_target = 30`: 2 vblanks at 60 Hz, 1 vblank at 30 Hz. `fps_inject = 2` additionally waits after every `SetFrameBuf`, like Framecapper's "Inject" builds (`fps_inject = 1`, the default, injects only for games that do not sync themselves, in both modes). An optional title list `ur0:tai/pstv1080p_titles.txt` (one title id per line, or a single line `*ALL`) limits FORCE mode to the listed games (see the config section for the no-file case). |
 
 The pacing never touches the kernel itself or SceShell (the LiveArea / system
 UI), only application processes.
@@ -260,10 +293,10 @@ and that `ux0:data/pstv1080p/kernel.log` exists. Look for the config-load line
 Untested assumptions checked here: the `SceAVConfig` export hook installs
 (same as gameblabla's plugin, so this one is low risk); hooking the
 `SceDisplay` user-library exports (`0x5ED8F994`) with
-`taiHookFunctionExportForKernel` succeeds for the seven `SceDisplay` hooks
+`taiHookFunctionExportForKernel` succeeds for the twelve `SceDisplay` hooks
 (six vblank waits plus `_sceDisplaySetFrameBuf`, which is always installed
 and passes straight through unless `fps_mode = 2` with `fps_inject = 1`).
-Expect seven `hook: ... ok` lines after the `SceAVConfig` one.
+Expect twelve `hook: ... ok` lines after the `SceAVConfig` one (confirmed on hardware: `hooks_ok=0x1FFF`).
 
 **Step 2 — pacing at 60 Hz is a no-op.**
 Still at your usual resolution, play a 60 fps and a 30 fps game for a minute.
@@ -387,7 +420,7 @@ validation, defaults are used and `mode_1080p` is 0.
 | 0x10 | `settings_item_value` | u32 | 3 | the `value="N"` number of the injected `list_item`. The Settings plugin bumps it to the smallest free number ≥ 3 if Sony's list already uses it (allowed range 1..255). |
 | 0x14 | `fps_mode` | u32 | 1 | 0 = OFF, 1 = SCALE, 2 = FORCE (see [frame-pacing model](#frame-pacing-model)) |
 | 0x18 | `fps_target` | u32 | 30 | FORCE mode target fps: 20, 30 or 60 |
-| 0x1C | `fps_inject` | u32 | 0 | FORCE mode: 1 = also wait one interval after every `sceDisplaySetFrameBuf` (Framecapper "Inject") |
+| 0x1C | `fps_inject` | u32 | 1 | 0 = off. 1 = AUTO (default): after a frame flip, wait one refresh period (FORCE: the forced interval) only if the process made no vsync call of its own for more than 4.5 refresh periods, so games that already sync are never double-waited. 2 = always (Framecapper "Inject" semantics). |
 | 0x20 | `safe_boot_seconds` | u32 | 120 | how long a 1080p boot must survive before it is considered good; 0 disables the safe-boot revert. Clamp: values above 3600 are lowered to 3600. |
 | 0x24 | `boot_apply_delay_ms` | u32 | 3000 | delay after SceShell appears before the first apply at boot. Clamp: values above 60000 are lowered to 60000. |
 | 0x28 | `watchdog_period_ms` | u32 | 2000 | how often the watchdog re-checks the output mode; 0 disables the watchdog (boot apply still happens). Clamp: a non-zero value below 500 is raised to 500. |
@@ -411,7 +444,7 @@ change. The checks are: `magic` = `0x50383150`, `version` = 1,
 `mode_1080p` ≤ 1, `hd_mode_code` with bit `0x8000` set, a resolution field
 (`& 0x0700`) between `0x0300` and `0x0700` and no bits above `0xFFFF`,
 `settings_item_value` in 1..255, `fps_mode` ≤ 2, `fps_target` in
-{20, 30, 60}, `fps_inject` ≤ 1. A typo such as `fps_target = 25` therefore
+{20, 30, 60}, `fps_inject` ≤ 2. A typo such as `fps_target = 25` therefore
 silently turns 1080p off. The three timing fields are never rejected, only
 clamped as noted in the table, and `reserved[]` is zeroed.
 
