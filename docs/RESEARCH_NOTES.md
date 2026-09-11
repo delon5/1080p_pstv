@@ -186,3 +186,15 @@ needs no build: launch the title at stock 1080i with both pstv1080p files
 removed from the tai config (Sharpscale off). Fails -> Sony-level for this
 title on this console; works -> one of the plugin's passive user-library hooks
 is the trigger and can be bisected.
+
+
+## 15. Tales of Hearts R: solved (2026-09-12)
+
+With the 1.6.3 `novsync` switch (hook_SetFrameBuf forces
+`SCE_DISPLAY_SETBUF_IMMEDIATE`) the title starts and plays under 1080p30.
+Every other override, including `spoof720`, had no effect. Therefore the
+startup crash sits in the game's first `sceDisplaySetFrameBuf(...,
+SCE_DISPLAY_SETBUF_NEXTFRAME)` under a 1080-line head (the kernel kill with
+the 0x10 status word and no core dump is consistent with the process aborting
+inside that call). Not investigated further: it is fixed for the user, and
+the wait-based hypotheses in sections 11-14 are closed.
