@@ -108,3 +108,8 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 ## I. v1.4 change (spoof720)
 - Hardware: Tales of Hearts R (PCSE00429) crashes (C2-12828-1) before any hooked display call under 1080p30, runs under 720p -> it acts on start-up display queries.
 - Override "spoof720": hooks _sceDisplayGetMaximumFrameBufResolution (0x2EBFC7CB) and _sceDisplayGetResolutionInfoInternal (0xFEFEB240) on the SceDisplay user library; after the original succeeds, for the listed pid the user results are rewritten to 960x544 max framebuffer and {0x8600, 1280x720, progressive, 59.94} via ksceKernelCopyFromUser/CopyToUser. Logged once per process (flag bits in e->acc, unused by spoof720). Pacing follows the global rules.
+
+## K. v1.4.7 held requests (single-transition switching)
+- hook_HdmiSetResolution: non-self request while mode_1080p==1, or an "automatic" (0x10000000) request while mode_1080p==0, is HELD (return 0, display untouched) for HOLD_REQUEST_US=400 ms. Explicit Sony modes while 1080p is off pass through unchanged.
+- SetMode1080p(1) within the window: hold cancelled, direct SetResolution(0x8710) (same path as boot). SetMode1080p(0) within the window: the held mode is applied directly (revert). Window expiry (thread tick): if 1080p off -> the held mode is applied from the next user display syscall (run_mode_request); if on -> dropped.
+- Revert without a hold: SETRES_AUTO if Sony's last raw request was automatic, else last plausible Sony mode.

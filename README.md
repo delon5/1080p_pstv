@@ -44,6 +44,16 @@ for how they differ.
 
 ## Changelog
 
+- **1.4.7 (2026-09-11)** — mode switches from Settings are now a single
+  transition. Sony's Settings code commands the driver before it writes the
+  registry, so selecting "1080p (30 Hz)" used to produce 1080i -> 720p ->
+  1080p30 within half a second, which some TVs do not follow (the driver
+  reported 1080p30 while the picture stayed on 1080i). The plugin now holds
+  Sony's request for 0.4 s: if your 1080p selection follows, it is cancelled
+  and the display goes straight to 1080p30, exactly like the boot-time switch
+  that has always worked; if you picked a Sony mode while in 1080p, that mode
+  is applied directly; if nothing follows ("Automatic"), the held request is
+  applied after the window. No more 720p flash when selecting 1080p.
 - **1.4.6 (2026-09-11)** — the Hearts R trace showed the system killing the
   launch 11.5 s after creating the process, before the game's code ever ran
   (no start event, no allocation, no display call): a launcher-level refusal

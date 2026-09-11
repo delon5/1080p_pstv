@@ -172,6 +172,8 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define AVCONFIG_MODULE               "SceAVConfig"
 #define AVCONFIG_LIB_NID              0x79E0F03Fu
 #define AVCONFIG_SETRES_NID           0x4D37F036u
+#define SETRES_AUTO                   0x10000000u   /* Sony's "automatic" (the core also sends it for values it does not know) */
+#define HOLD_REQUEST_US               (400u * 1000u) /* v1.4.7: how long a Sony request is held to merge it with ours */
 
 #define DISPLAY_MODULE                "SceDisplay"
 #define DISPLAY_USER_LIB_NID          0x5ED8F994u
@@ -283,6 +285,17 @@ static volatile uint32_t g_hd_alias = 0;           /* driver's own readback for 
 static volatile int32_t  g_last_apply_result = 0;  /* result of the last call WE issued */
 static volatile int32_t  g_last_setres_ret = 0;    /* result of the last call anyone issued */
 static volatile SceInt64 g_last_sys_setres_us = 0; /* when Sony's code last called SetResolution (v1.4.4) */
+static volatile uint32_t g_last_system_raw = 0;    /* last non-self request, unfiltered (may be SETRES_AUTO) */
+/* v1.4.7 held request: Sony's Settings code calls SetResolution BEFORE it
+ * writes the registry, i.e. before the plugin learns what the user chose.
+ * Holding that call for a moment lets the plugin merge it with its own
+ * decision into ONE display transition (the boot path, which always worked,
+ * is a single direct transition). */
+static volatile int g_held = 0;
+static volatile uint32_t g_held_mode = 0;
+static volatile SceInt64 g_held_us = 0;
+static volatile uint32_t g_mode_request = 0;       /* a mode to apply from the next user display syscall */
+static volatile int g_mode_request_pending = 0;
 #define SYS_SETRES_SETTLE_US          (500u * 1000u)
 static volatile int      g_self_apply = 0;         /* set while we call the export ourselves */
 
@@ -1229,10 +1242,14 @@ static void run_pending_apply(const char *ctx);
  * (the export only refuses kernel-thread callers).  Inside the Settings app
  * SceShell is not drawing, so restricting this to the shell made retries
  * time out there (1080i -> 1080p "does not change"). */
+static void run_mode_request(void);
+
 static inline void shell_apply_check_pid(SceUID pid)
 {
     if (g_apply_pending && pid > 0 && pid != KERNEL_PID)
         run_pending_apply(pid == g_shell_pid ? "shell" : "user process");
+    if (g_mode_request_pending && pid > 0 && pid != KERNEL_PID)
+        run_mode_request();
 }
 
 /* Common prologue of the wait hooks. */
@@ -1716,10 +1733,30 @@ static int hook_HdmiSetResolution(int mode)
     /* Remember what Sony's code wanted, but never our own code (the Settings
      * plugin or an HDMI re-plug may re-send it) and never garbage: this value
      * is handed back to SetResolution by the revert path. */
-    if (!g_self_apply && (uint32_t)mode != g_cfg.hd_mode_code && mode_code_plausible((uint32_t)mode))
-        g_last_system_mode = (uint32_t)mode;
+    if (!g_self_apply) {
+        g_last_system_raw = (uint32_t)mode;
+        if ((uint32_t)mode != g_cfg.hd_mode_code && mode_code_plausible((uint32_t)mode))
+            g_last_system_mode = (uint32_t)mode;
 
-    if (g_cfg.mode_1080p)
+        /* Hold the request (do not touch the display now) when the plugin's
+         * decision may follow within a moment:
+         *  - 1080p is on: any Sony request precedes either a SetMode1080p(0)
+         *    (user picked a Sony mode -> that mode becomes the single
+         *    transition) or nothing (we keep 1080p, request dropped);
+         *  - 1080p is off and the request is "automatic": either the user
+         *    picked our item (-> one direct transition to 1080p30) or
+         *    "Automatic" (-> the held request is applied after the window). */
+        if (g_avconfig_fn && (g_cfg.mode_1080p || (uint32_t)mode == SETRES_AUTO)) {
+            g_held_mode = (uint32_t)mode;
+            g_held_us = now_us();
+            g_held = 1;
+            klog("avconfig: request 0x%08X held (%u ms) to merge it with the user's choice",
+                 (unsigned)mode, (unsigned)(HOLD_REQUEST_US / 1000u));
+            return 0;
+        }
+    }
+
+    if (g_cfg.mode_1080p && !g_self_apply)
         mode = (int)g_cfg.hd_mode_code;
 
     ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode);
@@ -1758,6 +1795,11 @@ static int apply_hd_mode(const char *why)
 
     if (!g_cfg.mode_1080p)
         return 0;
+
+    if (g_held) {
+        g_held = 0;
+        klog("apply: held request 0x%08X cancelled, switching directly to 0x%04X", (unsigned)g_held_mode, (unsigned)g_cfg.hd_mode_code);
+    }
 
     gb = ksceDisplayGetOutputMode(HDMI_HEAD, &before, &pf);
     if (gb >= 0 && hd_in_effect(before)) {
@@ -1832,6 +1874,30 @@ static int apply_hd_mode(const char *why)
     return 0;   /* the syscall itself succeeded; the retry schedule covers the rest */
 }
 
+/* Apply a released held request from a user display syscall (the export
+ * refuses kernel-thread callers). */
+static void run_mode_request(void)
+{
+    int ret;
+    uint32_t mode;
+
+    if (!g_mode_request_pending || g_in_apply)
+        return;
+    if (g_mutex >= 0 && ksceKernelTryLockMutex(g_mutex, 1) < 0)
+        return;
+    if (g_mode_request_pending && !g_in_apply) {
+        mode = g_mode_request;
+        g_mode_request_pending = 0;
+        g_in_apply = 1;
+        ret = call_set_resolution(mode);
+        g_in_apply = 0;
+        klog("avconfig: released request 0x%08X applied ret=0x%08X", (unsigned)mode, (unsigned)ret);
+        refresh_display_cache(1);
+    }
+    if (g_mutex >= 0)
+        ksceKernelUnlockMutex(g_mutex, 1);
+}
+
 /* Execute a scheduled attempt if it is due.  Safe to call from the SetFrameBuf
  * hook (SceShell's syscall context) and from the worker thread.  Uses a
  * try-lock so a frame flip never blocks behind the watchdog, and skips while
@@ -1871,6 +1937,26 @@ static int revert_hd_mode(void)
 {
     uint32_t sys = g_last_system_mode;
     int ret;
+
+    if (g_held) {
+        /* The user just picked a Sony mode: Sony's request for it is on hold,
+         * apply exactly that as the single transition. */
+        sys = g_held_mode;
+        g_held = 0;
+        ret = call_set_resolution(sys);
+        klog("revert: held request 0x%08X applied directly ret=0x%08X", (unsigned)sys, (unsigned)ret);
+        if (ret >= 0 && mode_code_plausible(sys))
+            record_applied(sys, !(g_hooks_ok & HOOK_BIT_AVCONFIG));
+        else
+            refresh_display_cache(1);
+        return ret < 0 ? ret : 0;
+    }
+    if (g_last_system_raw == SETRES_AUTO) {
+        ret = call_set_resolution(SETRES_AUTO);
+        klog("revert: SetResolution(automatic) ret=0x%08X", (unsigned)ret);
+        refresh_display_cache(1);
+        return ret < 0 ? ret : 0;
+    }
 
     if (sys == 0) {
         klog("revert: system mode unknown, leaving the display alone");
@@ -2041,6 +2127,19 @@ static int pstv1080p_thread(SceSize args, void *argp)
             break;
 
         marker_tick();
+
+        /* v1.4.7: release a held Sony request nobody merged with. */
+        if (g_held && (now_us() - g_held_us) >= (SceInt64)HOLD_REQUEST_US) {
+            uint32_t m = g_held_mode;
+            g_held = 0;
+            if (!g_cfg.mode_1080p) {
+                g_mode_request = m;
+                g_mode_request_pending = 1;
+                klog("avconfig: held request 0x%08X released (no 1080p selection followed)", (unsigned)m);
+            } else {
+                klog("avconfig: held request 0x%08X dropped, 1080p stays on", (unsigned)m);
+            }
+        }
 
         /* Fallback: if no SceShell frame flip picked up the scheduled attempt
          * within APPLY_SHELL_FALLBACK_US of it becoming due, do it from here. */
