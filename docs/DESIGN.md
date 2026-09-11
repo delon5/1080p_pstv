@@ -108,7 +108,3 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 ## I. v1.4 change (spoof720)
 - Hardware: Tales of Hearts R (PCSE00429) crashes (C2-12828-1) before any hooked display call under 1080p30, runs under 720p -> it acts on start-up display queries.
 - Override "spoof720": hooks _sceDisplayGetMaximumFrameBufResolution (0x2EBFC7CB) and _sceDisplayGetResolutionInfoInternal (0xFEFEB240) on the SceDisplay user library; after the original succeeds, for the listed pid the user results are rewritten to 960x544 max framebuffer and {0x8600, 1280x720, progressive, 59.94} via ksceKernelCopyFromUser/CopyToUser. Logged once per process (flag bits in e->acc, unused by spoof720). Pacing follows the global rules.
-
-## J. v1.5 change ("720p" override)
-- SceProcEvent create/start: if the new pid's title is listed as 720p and mode_1080p is on -> g_temp_pid/g_temp_mode=0x8600; issue SetResolution(0x8600) immediately (event callbacks run on a user process's thread; the export works there) else leave pending and execute from the next display syscall of any user process (run_mode_request, triggered in shell_apply_check_pid).
-- exit/kill of that pid -> restore hd_mode_code the same way. hd_in_effect() treats g_temp_mode as wanted so the watchdog does not fight it; hook_HdmiSetResolution does not substitute while g_self_apply or g_temp_mode is set.

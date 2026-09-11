@@ -291,9 +291,8 @@ enum {
     OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once (like novsync), no inject */
     OVR_INJECT,     /* "inject":    always wait one period after each flip (Framecapper Inject) */
     OVR_FORCE,      /* "force":     FORCE rule for this title, whatever the global mode */
-    OVR_SPOOF720,   /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head */
-    OVR_720P        /* "720p":      switch the real output to 720p60 while this title runs, back to
-                     *              hd_mode_code when it exits (for games that cannot start under 1080p30) */
+    OVR_SPOOF720    /* "spoof720":  default pacing, but the display-info queries answer as a 720p60 head
+                     *              (for games that crash at start-up under a 1080p30 head) */
 };
 typedef struct {
     volatile SceUID pid;
@@ -758,7 +757,6 @@ static const char *ovr_name(uint32_t m)
     case OVR_INJECT:    return "inject";
     case OVR_FORCE:     return "force";
     case OVR_SPOOF720:  return "spoof720";
-    case OVR_720P:      return "720p";
     default:            return "none";
     }
 }
@@ -835,7 +833,6 @@ static void games_list_load(int do_log)
             else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
             else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
             else if (str_ieq(buf + m_start, m_end - m_start, "spoof720"))  mode = OVR_SPOOF720;
-            else if (str_ieq(buf + m_start, m_end - m_start, "720p"))      mode = OVR_720P;
             else {
                 bad++;
                 if (do_log)
@@ -900,17 +897,6 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
  * evicted and re-assigned (a spoof720 title published with override NONE). */
 static SceUID g_procevent_uid = -1;
 
-/* v1.5 "720p" override: while g_temp_pid runs, the output is held at
- * g_temp_mode (0x8600) instead of hd_mode_code.  A mode request that could
- * not be issued from the event callback context is left pending and is
- * executed from the next display syscall of ANY user process. */
-static volatile SceUID g_temp_pid = 0;
-static volatile uint32_t g_temp_mode = 0;
-static volatile uint32_t g_mode_request = 0;
-static volatile int g_mode_request_pending = 0;
-static int call_set_resolution(uint32_t mode);
-static void mode_request_issue(uint32_t mode, const char *why);
-
 static void proc_forget(SceUID pid)
 {
     int i;
@@ -928,73 +914,21 @@ static void proc_forget(SceUID pid)
     }
 }
 
-/* Look a pid's title up in the override list without touching the table. */
-static uint32_t override_for_pid(SceUID pid, char *title_out)
-{
-    char tid[TITLE_ID_LEN];
-    uint32_t i;
-    memset(tid, 0, sizeof(tid));
-    if (ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) < 0)
-        return OVR_NONE;
-    tid[sizeof(tid) - 1] = 0;
-    if (title_out)
-        memcpy(title_out, tid, TITLE_ID_LEN);
-    for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
-        if (strncmp(tid, g_games[i].title, TITLE_ID_LEN) == 0)
-            return g_games[i].mode;
-    }
-    return OVR_NONE;
-}
-
-static void temp_mode_begin(SceUID pid, const char *why)
-{
-    char tid[TITLE_ID_LEN];
-    memset(tid, 0, sizeof(tid));
-    if (g_temp_pid != 0 || !g_cfg.mode_1080p)
-        return;
-    if (override_for_pid(pid, tid) != OVR_720P)
-        return;
-    g_temp_pid = pid;
-    g_temp_mode = PSTV1080P_MODE_720P60;
-    klog("720p: %s (pid 0x%08X) %s -> output to 720p60 while it runs", tid, (unsigned)pid, why);
-    mode_request_issue(PSTV1080P_MODE_720P60, why);
-}
-
-static void temp_mode_end(SceUID pid, const char *why)
-{
-    if (g_temp_pid == 0 || pid != g_temp_pid)
-        return;
-    g_temp_pid = 0;
-    g_temp_mode = 0;
-    klog("720p: pid 0x%08X %s -> restoring 0x%04X", (unsigned)pid, why, (unsigned)g_cfg.hd_mode_code);
-    if (g_cfg.mode_1080p)
-        mode_request_issue(g_cfg.hd_mode_code, why);
-}
-
 static int procevent_create(SceUID pid, SceProcEventInvokeParam2 *a2, int a3)
 {
     proc_forget(pid);       /* a pid being (re)used: never start from a stale entry */
-    temp_mode_begin(pid, "created");
-    return 0;
-}
-
-static int procevent_start(SceUID pid, int event_type, SceProcEventInvokeParam1 *a3, int a4)
-{
-    temp_mode_begin(pid, "started");   /* no-op if create already handled it */
     return 0;
 }
 
 static int procevent_exit(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
     proc_forget(pid);
-    temp_mode_end(pid, "exited");
     return 0;
 }
 
 static int procevent_kill(SceUID pid, SceProcEventInvokeParam1 *a2, int a3)
 {
     proc_forget(pid);
-    temp_mode_end(pid, "killed");
     return 0;
 }
 
@@ -1004,7 +938,7 @@ static const SceProcEventHandler g_procevent_handler = {
     .exit = procevent_exit,
     .kill = procevent_kill,
     .stop = NULL,
-    .start = procevent_start,
+    .start = NULL,
     .switch_process = NULL,
 };
 
@@ -1110,7 +1044,6 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         out->inject = g_cfg.fps_inject;
         return;
     case OVR_SPOOF720:  /* pacing follows the global rules; only the info queries differ */
-    case OVR_720P:      /* pacing follows the global rules (identity at 60 Hz anyway) */
     default:
         break;
     }
@@ -1186,14 +1119,10 @@ static void run_pending_apply(const char *ctx);
  * from the first SceShell display syscall that comes along (frame flip or
  * vblank wait), i.e. from a user-process syscall context.  One volatile load
  * per call when nothing is pending. */
-static void run_mode_request(const char *ctx);
-
 static inline void shell_apply_check_pid(SceUID pid)
 {
     if (g_apply_pending && g_shell_pid > 0 && pid == g_shell_pid)
         run_pending_apply("shell");
-    if (g_mode_request_pending && pid > 0 && pid != KERNEL_PID)
-        run_mode_request("display call");
 }
 
 /* Common prologue of the wait hooks. */
@@ -1599,8 +1528,6 @@ static uint32_t record_applied(uint32_t mode, int do_log)
  * we learned from an apply that visibly changed the driver state. */
 static int hd_in_effect(uint32_t cur)
 {
-    if (g_temp_mode != 0 && cur == g_temp_mode)
-        return 1;                      /* a "720p" title is running: 720p60 is the wanted state */
     if (cur == g_cfg.hd_mode_code)
         return 1;
     if (g_hd_alias != 0 && cur == g_hd_alias)
@@ -1646,7 +1573,7 @@ static int hook_HdmiSetResolution(int mode)
     if (!g_self_apply && (uint32_t)mode != g_cfg.hd_mode_code && mode_code_plausible((uint32_t)mode))
         g_last_system_mode = (uint32_t)mode;
 
-    if (g_cfg.mode_1080p && !g_self_apply && g_temp_mode == 0)
+    if (g_cfg.mode_1080p)
         mode = (int)g_cfg.hd_mode_code;
 
     ret = HOOK_NEXT(hook_HdmiSetResolution, g_avconfig_ref, mode);
@@ -1741,64 +1668,6 @@ static int apply_hd_mode(const char *why)
     if (ret < 0)
         return ret;
     return 0;   /* the syscall itself succeeded; the retry schedule covers the rest */
-}
-
-/* Issue a temporary-mode request: try right now (the process-event callbacks
- * run on a user process's thread, where the export works), otherwise leave
- * it pending for the next display syscall of any user process. */
-static void mode_request_issue(uint32_t mode, const char *why)
-{
-    int ret;
-    unsigned int cur = 0, pf = 0;
-
-    g_mode_request = mode;
-    g_mode_request_pending = 1;
-
-    if (g_in_apply)
-        return;
-    if (g_mutex >= 0 && ksceKernelTryLockMutex(g_mutex, 1) < 0)
-        return;
-    g_in_apply = 1;
-    ret = call_set_resolution(mode);
-    g_in_apply = 0;
-    if (ret >= 0) {
-        g_mode_request_pending = 0;
-        ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf);
-        refresh_display_cache(0);
-        klog("720p: SetResolution(0x%04X) from event (%s) ret=0x%08X now=0x%04X", (unsigned)mode, why, (unsigned)ret, cur);
-    } else {
-        klog("720p: SetResolution(0x%04X) from event (%s) ret=0x%08X, left pending for the next user display call",
-             (unsigned)mode, why, (unsigned)ret);
-    }
-    if (g_mutex >= 0)
-        ksceKernelUnlockMutex(g_mutex, 1);
-}
-
-/* Executed from any user process's display syscall while a request is pending. */
-static void run_mode_request(const char *ctx)
-{
-    int ret;
-    uint32_t mode;
-    unsigned int cur = 0, pf = 0;
-
-    if (!g_mode_request_pending || g_in_apply)
-        return;
-    if (g_mutex >= 0 && ksceKernelTryLockMutex(g_mutex, 1) < 0)
-        return;
-    if (g_mode_request_pending && !g_in_apply) {
-        mode = g_mode_request;
-        g_mode_request_pending = 0;
-        g_in_apply = 1;
-        ret = call_set_resolution(mode);
-        g_in_apply = 0;
-        ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf);
-        refresh_display_cache(0);
-        klog("720p: SetResolution(0x%04X) from %s ret=0x%08X now=0x%04X", (unsigned)mode, ctx, (unsigned)ret, cur);
-        if (ret < 0)
-            g_mode_request_pending = 1;    /* try again from the next call */
-    }
-    if (g_mutex >= 0)
-        ksceKernelUnlockMutex(g_mutex, 1);
 }
 
 /* Execute a scheduled attempt if it is due.  Safe to call from the SetFrameBuf
@@ -2152,7 +2021,6 @@ int pstv1080pGetInfo(pstv1080p_info_t *out)
     info.reserved[2]         = g_hd_alias;
     info.reserved[3]         = (uint32_t)g_apply_pending;
     info.reserved[4]         = g_games_count;
-    info.reserved[5]         = (uint32_t)g_temp_pid;
     unlock();
 
     ret = ksceKernelCopyToUser(out, &info, sizeof(info));
