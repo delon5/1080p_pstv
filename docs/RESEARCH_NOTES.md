@@ -56,3 +56,9 @@ So: 480p60 = 0x8300, 576p50 = 0x8480?, 1080i60 = 0x8500, 720p60 = 0x8600, 1080p6
 - sceAVConfigHdmiSetResolution(0x8710) from the kernel worker thread: returns 0x80010058 (SCE_ERROR_ERRNO_ENOSYS) every time. The same call issued inside a user-process syscall (Settings app via our SetMode1080p, or SceShell via the v1.1 SetFrameBuf/vblank-wait hook trigger) returns 0 and ksceDisplayGetOutputMode(1) then reports 0x8710. Boot timeline (v1.1): module start 3.0 s, shell pid 5.8 s, apply scheduled 8.8 s, EFFECTIVE at 8.95 s.
 - All 7 (v1.1) / 12 (v1.2) SceDisplay user-export hooks install (hooks_ok = 0xFF / 0x1FFF). ksceDisplayGetRefreshRateInternal reports 59.94 for 480p/720p and also for 0x8710 (so it is NOT a reliable 30 Hz indicator; mode flag 0x10 is).
 - User report after v1.1: with the plugin replacing Framecapper60Inject, some games flicker or do not hold 30 fps at 1080p30 -> games without any vsync wait of their own; v1.2 adaptive inject addresses that.
+
+## 8. Game reports after v1.2 (2026-09-11)
+- Most games fine at 1080p30 with SCALE + adaptive inject.
+- Bloodstained: Curse of the Moon: half speed with vsync (30 waits/s -> 30 logic frames/s), double speed with novsync (unthrottled, no own limiter) -> logic advanced once per vblank wait. Needs 2 logic frames per 30 Hz vblank = frameskip (alternate immediate return / real wait).
+- Ys VIII: half speed -> same family; may measure elapsed frames via sceDisplayGetVcount deltas (SCALE cannot fix that), so frameskip also scales the reported vcount x2 with 16-bit wrap.
+- ksceDisplayGetRefreshRateInternal reports 59.94 at 0x8710, so games asking the refresh rate believe 60 Hz (which is why frame-locked games do not adapt by themselves).

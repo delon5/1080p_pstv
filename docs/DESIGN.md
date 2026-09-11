@@ -98,3 +98,9 @@ No libc: use sceClib* (user) / SceSysclibForDriver (kernel: memcpy/memset/strncm
 - Per-process tracker: every SceDisplay vsync-related syscall (WaitVblankStart*, WaitSetFrameBuf*, GetVcount*) stamps last_sync_us for the calling pid on entry and exit; RegisterVblankStartCallback marks the pid as callback-synced.
 - _sceDisplaySetFrameBuf hook: if fps_mode != OFF and fps_inject == 1 and the pid had no sync activity for > 4.5 refresh periods (and is not callback-synced) -> ksceDisplayWaitVblankStartMulti(1) (FORCE: force_interval()). fps_inject == 2 = always (old Framecapper Inject). Default fps_inject = 1.
 - Rationale: games that never vsync were unpaced at 30 Hz (user-reported flicker / wrong rate); Framecapper60Inject paced them but double-waited every syncing game.
+
+## H. v1.3 change (per-title overrides)
+- ur0:tai/pstv1080p_games.txt: "TITLEID mode" lines, modes off/scale/frameskip/nowait/inject/force. Loaded at module_start and re-read on every new process (proc_resolve), so no reboot is needed.
+- Unified per-process table g_procs[8] {pid, allowed, override, acc, last_sync_us, cb_synced, title}; resolved once per process (sysroot title id + list lookups + one log line).
+- frameskip: credit accumulator acc += n*hz; wait floor(acc/60) vblanks when acc >= 60 else return 0 (n=1 @30 Hz alternates; n=2 @30 Hz waits 1 each; identity @60 Hz). GetVcount/GetVcountInternal return v*60/hz masked to 16 bits for frameskip titles. Never injected.
+- nowait: all wait hooks return 0; no inject. off: nothing. inject: inject=2. force: FORCE rule. scale: SCALE rule.

@@ -268,26 +268,40 @@ static volatile int      g_self_apply = 0;         /* set while we call the expo
 /* Process filter */
 static volatile SceUID g_shell_pid = 0;
 
-/* pid -> allowed cache for FORCE mode title filtering */
-typedef struct {
-    volatile SceUID pid;
-    volatile uint32_t allowed;
-} pid_cache_entry_t;
-static pid_cache_entry_t g_pid_cache[PID_CACHE_ENTRIES];
-static volatile uint32_t g_pid_cache_next = 0;
-
-/* v1.2 adaptive inject: per-process record of the last vsync activity
- * (any SceDisplay wait entry/exit or vcount read) and whether the process
- * registered a vblank callback (then it syncs by itself and is never injected). */
-#define VS_TRACK_ENTRIES              8
+/* Per-process table (v1.3): FORCE-filter verdict, per-title override,
+ * frameskip accumulator and vsync-activity tracking, keyed by pid.  Filled on
+ * the first display syscall of a process (one sysroot call + list lookups). */
+#define PROC_ENTRIES                  8
 #define VS_IDLE_PERIODS_X2            9              /* inject if no sync activity for > 4.5 refresh periods */
+enum {
+    OVR_NONE = 0,   /* no per-title entry: global rules apply */
+    OVR_OFF,        /* "off":       no pacing change, no inject */
+    OVR_SCALE,      /* "scale":     SCALE rule + global inject setting, whatever the global mode */
+    OVR_FRAMESKIP,  /* "frameskip": fractional vsync for frame-locked 60 fps games (2 logic frames per 30 Hz vblank) */
+    OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once (like novsync), no inject */
+    OVR_INJECT,     /* "inject":    always wait one period after each flip (Framecapper Inject) */
+    OVR_FORCE       /* "force":     FORCE rule for this title, whatever the global mode */
+};
 typedef struct {
     volatile SceUID pid;
-    volatile SceInt64 last_sync_us;
-    volatile uint32_t cb_synced;
-} vs_entry_t;
-static vs_entry_t g_vs[VS_TRACK_ENTRIES];
-static volatile uint32_t g_vs_next = 0;
+    volatile uint32_t allowed;      /* FORCE title-filter verdict */
+    volatile uint32_t override;     /* OVR_* */
+    volatile uint32_t acc;          /* frameskip credit, units of 1/60 vblank */
+    volatile SceInt64 last_sync_us; /* last vsync-related syscall entry/exit */
+    volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
+    char title[TITLE_ID_LEN];
+} proc_entry_t;
+static proc_entry_t g_procs[PROC_ENTRIES];
+static volatile uint32_t g_procs_next = 0;
+
+/* Per-title overrides (ur0:tai/pstv1080p_games.txt: "TITLEID mode" per line) */
+#define GAMES_LIST_MAX                32
+typedef struct {
+    char title[TITLE_ID_LEN];
+    uint32_t mode;                  /* OVR_* */
+} game_override_t;
+static game_override_t g_games[GAMES_LIST_MAX];
+static uint32_t g_games_count = 0;
 
 /* Title list (ur0:tai/pstv1080p_titles.txt) */
 static volatile uint32_t g_title_filter_active = 0;  /* 1 = only listed titles are paced in FORCE mode */
@@ -554,6 +568,19 @@ static void config_load(void)
     ret = ksceIoRead(fd, &tmp, sizeof(tmp));
     ksceIoClose(fd);
 
+    /* v1.3: a state file written by 1.0/1.1 (version 1) predates the adaptive
+     * inject default; migrate it once to version 2 with fps_inject = AUTO. */
+    if (ret == (int)sizeof(tmp) && tmp.magic == PSTV1080P_CFG_MAGIC && tmp.version == 1u) {
+        tmp.version = PSTV1080P_CFG_VERSION;
+        tmp.fps_inject = 1u;
+        klog("config: migrated state file v1 -> v%u (fps_inject=1 AUTO)", (unsigned)PSTV1080P_CFG_VERSION);
+        if (config_valid(&tmp)) {
+            config_clamp(&tmp);
+            memcpy(&g_cfg, &tmp, sizeof(g_cfg));
+            config_save();
+        }
+    }
+
     if (ret != (int)sizeof(tmp) || !config_valid(&tmp)) {
         klog("config: state file invalid (read=%d magic=0x%08X ver=%u), using defaults",
              ret, (unsigned)tmp.magic, (unsigned)tmp.version);
@@ -572,19 +599,21 @@ static void config_load(void)
 /* Title list (FORCE mode filter)                                             */
 /* ------------------------------------------------------------------------- */
 
-static void pid_cache_clear(void)
+static void proc_clear(void)
 {
     int i;
-    for (i = 0; i < PID_CACHE_ENTRIES; i++) {
-        g_pid_cache[i].pid = 0;
-        g_pid_cache[i].allowed = 0;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        g_procs[i].pid = 0;
+        g_procs[i].allowed = 0;
+        g_procs[i].override = OVR_NONE;
+        g_procs[i].acc = 0;
+        g_procs[i].last_sync_us = 0;
+        g_procs[i].cb_synced = 0;
+        g_procs[i].title[0] = 0;
     }
-    g_pid_cache_next = 0;
+    g_procs_next = 0;
 }
 
-/* Parse ur0:tai/pstv1080p_titles.txt: one title id per line, '#' comments,
- * "*ALL" means every process.  Missing file == "*ALL" (Framecapper-under-*ALL
- * behaviour).  Not for the hot path. */
 static void title_list_load(void)
 {
     static char buf[4096];
@@ -599,7 +628,7 @@ static void title_list_load(void)
 
     fd = ksceIoOpen(PSTV1080P_TITLES_PATH, SCE_O_RDONLY, 0);
     if (fd < 0) {
-        pid_cache_clear();
+        proc_clear();
         klog("titles: no list file, FORCE mode applies to all titles");
         return;
     }
@@ -635,7 +664,7 @@ static void title_list_load(void)
     }
 
     g_title_count = count;
-    pid_cache_clear();
+    proc_clear();
     if (all || count == 0) {
         g_title_filter_active = 0;
         klog("titles: list has *ALL or no entries (%u), FORCE mode applies to all titles", (unsigned)count);
@@ -647,115 +676,235 @@ static void title_list_load(void)
 
 /* Slow path, once per new pid: resolve the title id and decide.  Runs in the
  * caller's context of a display syscall; sysroot lookup only, no file I/O. */
-static uint32_t pid_resolve_allowed(SceUID pid)
+static const char *ovr_name(uint32_t m)
 {
-    char tid[TITLE_ID_LEN];
-    uint32_t i, allowed = 0;
+    switch (m) {
+    case OVR_OFF:       return "off";
+    case OVR_SCALE:     return "scale";
+    case OVR_FRAMESKIP: return "frameskip";
+    case OVR_NOWAIT:    return "nowait";
+    case OVR_INJECT:    return "inject";
+    case OVR_FORCE:     return "force";
+    default:            return "none";
+    }
+}
 
-    memset(tid, 0, sizeof(tid));
-    if (ksceKernelSysrootGetProcessTitleId(pid, tid, sizeof(tid) - 1) < 0)
-        return 0;
-    tid[sizeof(tid) - 1] = 0;
+static int str_ieq(const char *a, int alen, const char *b)
+{
+    int i;
+    for (i = 0; i < alen; i++) {
+        char c = a[i], d = b[i];
+        if (d == 0) return 0;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c != d) return 0;
+    }
+    return b[alen] == 0;
+}
 
+/* Load ur0:tai/pstv1080p_games.txt.  Lines: "TITLEID mode", '#' comments.
+ * Cheap enough to be called on every new process (once per game start), so
+ * edits take effect on the next launch without a reboot. */
+static void games_list_load(int do_log)
+{
+    static char buf[4096];
+    SceUID fd;
+    int len, i, start;
+    uint32_t count = 0, bad = 0;
+
+    fd = ksceIoOpen(PSTV1080P_GAMES_PATH, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        g_games_count = 0;
+        if (do_log)
+            klog("games: no override file (%s)", PSTV1080P_GAMES_PATH);
+        return;
+    }
+    len = ksceIoRead(fd, buf, sizeof(buf) - 1);
+    ksceIoClose(fd);
+    if (len < 0)
+        len = 0;
+    buf[len] = 0;
+
+    start = 0;
+    for (i = 0; i <= len; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == 0) {
+            int s0 = start, e = i, t_end, m_start, m_end;
+            uint32_t mode = OVR_NONE;
+            start = i + 1;
+            while (s0 < e && (buf[s0] == ' ' || buf[s0] == '\t'))
+                s0++;
+            while (e > s0 && (buf[e - 1] == ' ' || buf[e - 1] == '\t'))
+                e--;
+            if (s0 >= e || buf[s0] == '#')
+                continue;
+            t_end = s0;
+            while (t_end < e && buf[t_end] != ' ' && buf[t_end] != '\t')
+                t_end++;
+            m_start = t_end;
+            while (m_start < e && (buf[m_start] == ' ' || buf[m_start] == '\t'))
+                m_start++;
+            m_end = m_start;
+            while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t')
+                m_end++;
+            if ((t_end - s0) >= TITLE_ID_LEN || (t_end - s0) < 4 || m_start >= e) {
+                bad++;
+                continue;
+            }
+            if (str_ieq(buf + m_start, m_end - m_start, "off"))            mode = OVR_OFF;
+            else if (str_ieq(buf + m_start, m_end - m_start, "scale"))     mode = OVR_SCALE;
+            else if (str_ieq(buf + m_start, m_end - m_start, "frameskip")) mode = OVR_FRAMESKIP;
+            else if (str_ieq(buf + m_start, m_end - m_start, "nowait"))    mode = OVR_NOWAIT;
+            else if (str_ieq(buf + m_start, m_end - m_start, "inject"))    mode = OVR_INJECT;
+            else if (str_ieq(buf + m_start, m_end - m_start, "force"))     mode = OVR_FORCE;
+            else { bad++; continue; }
+            if (count < GAMES_LIST_MAX) {
+                memset(g_games[count].title, 0, TITLE_ID_LEN);
+                memcpy(g_games[count].title, buf + s0, (unsigned int)(t_end - s0));
+                g_games[count].mode = mode;
+                count++;
+            }
+        }
+    }
+    g_games_count = count;
+    if (do_log)
+        klog("games: %u override(s) loaded, %u line(s) ignored", (unsigned)count, (unsigned)bad);
+}
+
+/* Fill a fresh per-process entry: title id, FORCE-filter verdict, override. */
+static void proc_resolve(proc_entry_t *e, SceUID pid)
+{
+    uint32_t i;
+
+    memset(e->title, 0, TITLE_ID_LEN);
+    if (ksceKernelSysrootGetProcessTitleId(pid, e->title, TITLE_ID_LEN - 1) < 0)
+        e->title[0] = 0;
+    e->title[TITLE_ID_LEN - 1] = 0;
+
+    e->allowed = 0;
     for (i = 0; i < g_title_count && i < TITLE_LIST_MAX; i++) {
-        if (strncmp(tid, g_titles[i], TITLE_ID_LEN) == 0) {
-            allowed = 1;
+        if (strncmp(e->title, g_titles[i], TITLE_ID_LEN) == 0) {
+            e->allowed = 1;
             break;
         }
     }
-    return allowed;
-}
 
-static uint32_t pid_allowed_cached(SceUID pid)
-{
-    uint32_t i, slot, allowed;
-
-    for (i = 0; i < PID_CACHE_ENTRIES; i++) {
-        if (g_pid_cache[i].pid == pid)
-            return g_pid_cache[i].allowed;
+    games_list_load(0);
+    e->override = OVR_NONE;
+    for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
+        if (strncmp(e->title, g_games[i].title, TITLE_ID_LEN) == 0) {
+            e->override = g_games[i].mode;
+            break;
+        }
     }
-
-    allowed = pid_resolve_allowed(pid);
-
-    /* Insert round-robin.  Invalidate the slot before filling it so that a
-     * concurrent reader never pairs a new pid with an old verdict. */
-    slot = g_pid_cache_next % PID_CACHE_ENTRIES;
-    g_pid_cache_next = slot + 1;
-    g_pid_cache[slot].pid = 0;
-    g_pid_cache[slot].allowed = allowed;
-    g_pid_cache[slot].pid = pid;
-    return allowed;
+    klog("process: pid=0x%08X title=%s override=%s%s", (unsigned)pid,
+         e->title[0] ? e->title : "?", ovr_name(e->override),
+         (pid == g_shell_pid) ? " (shell, never paced)" : "");
 }
 
-/* ------------------------------------------------------------------------- */
-/* Frame pacing hot path                                                      */
-/* ------------------------------------------------------------------------- */
-
-/* Returns PSTV1080P_FPS_OFF (pass through), _SCALE or _FORCE for this caller. */
-static vs_entry_t *vs_lookup(SceUID pid, int create)
+/* pid -> entry, O(PROC_ENTRIES) scan.  On a miss (first display syscall of a
+ * process) the entry is resolved once: one sysroot call, a small file read
+ * and one log line.  Two threads missing at once may create two entries for
+ * the same pid; harmless. */
+static proc_entry_t *proc_lookup(SceUID pid, int create)
 {
     uint32_t i, slot;
-    for (i = 0; i < VS_TRACK_ENTRIES; i++) {
-        if (g_vs[i].pid == pid)
-            return &g_vs[i];
+    proc_entry_t *e;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        if (g_procs[i].pid == pid)
+            return &g_procs[i];
     }
     if (!create)
         return NULL;
-    slot = g_vs_next % VS_TRACK_ENTRIES;
-    g_vs_next = slot + 1;
-    g_vs[slot].pid = 0;
-    g_vs[slot].last_sync_us = 0;
-    g_vs[slot].cb_synced = 0;
-    g_vs[slot].pid = pid;
-    return &g_vs[slot];
+    slot = g_procs_next % PROC_ENTRIES;
+    g_procs_next = slot + 1;
+    e = &g_procs[slot];
+    e->pid = 0;                 /* invalidate first: readers never pair a new pid with old data */
+    e->acc = 0;
+    e->last_sync_us = 0;
+    e->cb_synced = 0;
+    proc_resolve(e, pid);
+    e->pid = pid;
+    return e;
 }
 
-static void vs_clear(void)
+static inline void proc_mark_sync(proc_entry_t *e)
 {
-    uint32_t i;
-    for (i = 0; i < VS_TRACK_ENTRIES; i++) {
-        g_vs[i].pid = 0;
-        g_vs[i].last_sync_us = 0;
-        g_vs[i].cb_synced = 0;
-    }
-    g_vs_next = 0;
+    if (e)
+        e->last_sync_us = now_us();
 }
 
-/* Called on entry and exit of every vsync-related syscall of a user process.
- * O(1), no I/O.  Only needed while fps_inject == AUTO. */
-static inline void vs_mark_sync(void)
+/* Effective pacing for one process. */
+#define PACE_FRAMESKIP                3u
+#define PACE_NOWAIT                   4u
+typedef struct {
+    uint32_t mode;      /* PSTV1080P_FPS_OFF / SCALE / FORCE, PACE_FRAMESKIP, PACE_NOWAIT */
+    uint32_t inject;    /* 0 off, 1 auto, 2 always */
+} pace_t;
+
+static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
 {
-    SceUID pid;
-    vs_entry_t *e;
-    if (g_cfg.fps_inject != 1u)
+    proc_entry_t *e;
+
+    out->mode = PSTV1080P_FPS_OFF;
+    out->inject = 0;
+    *pe = NULL;
+    if (pid <= 0 || pid == KERNEL_PID || pid == g_shell_pid)
         return;
-    pid = ksceKernelGetProcessId();
-    if (pid <= 0 || pid == KERNEL_PID)
+    e = proc_lookup(pid, 1);
+    *pe = e;
+
+    switch (e->override) {
+    case OVR_OFF:
         return;
-    e = vs_lookup(pid, 1);
-    e->last_sync_us = now_us();
-}
-
-static inline uint32_t pacing_mode_for_pid(SceUID pid)
-{
-    uint32_t mode = g_cfg.fps_mode;
-
-    if (mode == PSTV1080P_FPS_OFF)
-        return PSTV1080P_FPS_OFF;
-    if (pid == KERNEL_PID || pid == g_shell_pid || pid <= 0)
-        return PSTV1080P_FPS_OFF;
-    if (mode == PSTV1080P_FPS_FORCE && g_title_filter_active) {
-        if (!pid_allowed_cached(pid))
-            return PSTV1080P_FPS_OFF;
+    case OVR_SCALE:
+        out->mode = PSTV1080P_FPS_SCALE;
+        out->inject = g_cfg.fps_inject;
+        return;
+    case OVR_FRAMESKIP:
+        out->mode = PACE_FRAMESKIP;     /* such games sync themselves: never inject */
+        return;
+    case OVR_NOWAIT:
+        out->mode = PACE_NOWAIT;
+        return;
+    case OVR_INJECT:
+        out->mode = (g_cfg.fps_mode == PSTV1080P_FPS_FORCE) ? PSTV1080P_FPS_FORCE : PSTV1080P_FPS_SCALE;
+        out->inject = 2;
+        return;
+    case OVR_FORCE:
+        out->mode = PSTV1080P_FPS_FORCE;
+        out->inject = g_cfg.fps_inject;
+        return;
+    default:
+        break;
     }
-    return mode;
-}
 
-static inline uint32_t pacing_mode_for_caller(void)
-{
     if (g_cfg.fps_mode == PSTV1080P_FPS_OFF)
-        return PSTV1080P_FPS_OFF;
-    return pacing_mode_for_pid(ksceKernelGetProcessId());
+        return;
+    if (g_cfg.fps_mode == PSTV1080P_FPS_FORCE && g_title_filter_active && !e->allowed)
+        return;
+    out->mode = g_cfg.fps_mode;
+    out->inject = g_cfg.fps_inject;
+}
+
+/* Frameskip (fractional vsync): a request of n vblanks earns n*hz credits in
+ * 1/60-vblank units; the wait really happens only when >= 60 credits are
+ * banked.  At 30 Hz a 1-vblank request alternates skip/wait, so a game that
+ * advances its logic once per wait runs 60 logic frames per second and shows
+ * every second one.  At 60 Hz it is the identity.  Returns the real count,
+ * 0 = return to the game immediately. */
+static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
+{
+    uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
+    uint32_t acc, w;
+    if (hz >= 60 || n > 0x00FFFFFFu || !e)
+        return n;
+    acc = e->acc + n * hz;
+    if (acc < 60) {
+        e->acc = acc;
+        return 0;
+    }
+    w = acc / 60;
+    e->acc = acc - w * 60;
+    return w;
 }
 
 static inline unsigned int scale_vcount(unsigned int vcount)
@@ -796,160 +945,239 @@ static void run_pending_apply(const char *ctx);
  * from the first SceShell display syscall that comes along (frame flip or
  * vblank wait), i.e. from a user-process syscall context.  One volatile load
  * per call when nothing is pending. */
-static inline void shell_apply_check(void)
+static inline void shell_apply_check_pid(SceUID pid)
 {
-    if (g_apply_pending && g_shell_pid > 0 && ksceKernelGetProcessId() == g_shell_pid)
+    if (g_apply_pending && g_shell_pid > 0 && pid == g_shell_pid)
         run_pending_apply("shell");
 }
 
+/* Common prologue of the wait hooks. */
+#define WAIT_PROLOGUE(pid, e, pc) \
+    SceUID pid = ksceKernelGetProcessId(); \
+    proc_entry_t *e; \
+    pace_t pc; \
+    shell_apply_check_pid(pid); \
+    pace_for(pid, &e, &pc); \
+    proc_mark_sync(e)
+
 static int hook_WaitVblankStartMulti(unsigned int vcount)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode != PSTV1080P_FPS_OFF)
-        vcount = pace_vcount(mode, vcount);
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
+        if (vcount == 0)
+            return 0;
+    } else if (pc.mode != PSTV1080P_FPS_OFF) {
+        vcount = pace_vcount(pc.mode, vcount);
+    }
     ret = HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitVblankStartMultiCB(unsigned int vcount)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode != PSTV1080P_FPS_OFF)
-        vcount = pace_vcount(mode, vcount);
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
+        if (vcount == 0)
+            return 0;
+    } else if (pc.mode != PSTV1080P_FPS_OFF) {
+        vcount = pace_vcount(pc.mode, vcount);
+    }
     ret = HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitVblankStart(void)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode == PSTV1080P_FPS_FORCE) {
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
+        if (w == 0)
+            return 0;
+        if (w > 1) {
+            ret = ksceDisplayWaitVblankStartMulti(w);
+            proc_mark_sync(e);
+            return ret;
+        }
+    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
         if (interval > 1) {
             ret = ksceDisplayWaitVblankStartMulti(interval);
-            vs_mark_sync();
+            proc_mark_sync(e);
             return ret;
         }
     }
-    /* SCALE: interval 1 scales to 1 -> always pass through. */
+    /* SCALE: a 1-vblank request stays 1 -> pass through. */
     ret = HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitVblankStartCB(void)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode == PSTV1080P_FPS_FORCE) {
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
+        if (w == 0)
+            return 0;
+        if (w > 1) {
+            ret = ksceDisplayWaitVblankStartMultiCB(w);
+            proc_mark_sync(e);
+            return ret;
+        }
+    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
         unsigned int interval = force_interval();
         if (interval > 1) {
             ret = ksceDisplayWaitVblankStartMultiCB(interval);
-            vs_mark_sync();
+            proc_mark_sync(e);
             return ret;
         }
     }
     ret = HOOK_NEXT(hook_WaitVblankStartCB, g_pacing_ref[PH_WAITVBLANKCB]);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitSetFrameBufMulti(unsigned int vcount)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode != PSTV1080P_FPS_OFF)
-        vcount = pace_vcount(mode, vcount);
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
+        if (vcount == 0)
+            return 0;
+    } else if (pc.mode != PSTV1080P_FPS_OFF) {
+        vcount = pace_vcount(pc.mode, vcount);
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
 {
-    uint32_t mode = pacing_mode_for_caller();
     int ret;
-    shell_apply_check();
-    vs_mark_sync();
-    if (mode != PSTV1080P_FPS_OFF)
-        vcount = pace_vcount(mode, vcount);
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
+        if (vcount == 0)
+            return 0;
+    } else if (pc.mode != PSTV1080P_FPS_OFF) {
+        vcount = pace_vcount(pc.mode, vcount);
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
-/* v1.2 pass-through hooks: they only feed the sync-activity tracker. */
+/* WaitSetFrameBuf(CB): "wait until my last flip was shown" = a 1-vblank class
+ * wait for pacing purposes; otherwise pass-through + tracking. */
 static int hook_WaitSetFrameBuf(void)
 {
     int ret;
-    vs_mark_sync();
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
+        return 0;
     ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
 }
 
 static int hook_WaitSetFrameBufCB(void)
 {
     int ret;
-    vs_mark_sync();
+    WAIT_PROLOGUE(pid, e, pc);
+    if (pc.mode == PACE_NOWAIT)
+        return 0;
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
+        return 0;
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
-    vs_mark_sync();
+    proc_mark_sync(e);
     return ret;
+}
+
+/* Vcount hooks: tracking, plus for "frameskip" titles a count scaled to what
+ * the game expects at 60 Hz (x2 at 30 Hz), 16-bit wrap preserved, so games
+ * that measure elapsed frames by reading the counter keep their speed. */
+static inline int vcount_for(proc_entry_t *e, int v)
+{
+    uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
+    if (!e || e->override != OVR_FRAMESKIP || hz >= 60 || v < 0)
+        return v;
+    return (int)((((uint32_t)v) * 60u / hz) & 0xFFFFu);
 }
 
 static int hook_GetVcount(void)
 {
-    vs_mark_sync();
-    return HOOK_NEXT(hook_GetVcount, g_pacing_ref[PH_GETVCOUNT]);
+    SceUID pid = ksceKernelGetProcessId();
+    proc_entry_t *e = NULL;
+    int v;
+    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+        e = proc_lookup(pid, 1);
+        proc_mark_sync(e);
+    }
+    v = HOOK_NEXT(hook_GetVcount, g_pacing_ref[PH_GETVCOUNT]);
+    return vcount_for(e, v);
 }
 
 static int hook_GetVcountInternal(int head)
 {
-    vs_mark_sync();
-    return HOOK_NEXT(hook_GetVcountInternal, g_pacing_ref[PH_GETVCOUNTINT], head);
+    SceUID pid = ksceKernelGetProcessId();
+    proc_entry_t *e = NULL;
+    int v;
+    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+        e = proc_lookup(pid, 1);
+        proc_mark_sync(e);
+    }
+    v = HOOK_NEXT(hook_GetVcountInternal, g_pacing_ref[PH_GETVCOUNTINT], head);
+    return vcount_for(e, v);
 }
 
 static int hook_RegisterVblankStartCallback(SceUID uid)
 {
     SceUID pid = ksceKernelGetProcessId();
-    if (pid > 0 && pid != KERNEL_PID) {
-        vs_entry_t *e = vs_lookup(pid, 1);
+    if (pid > 0 && pid != KERNEL_PID && pid != g_shell_pid) {
+        proc_entry_t *e = proc_lookup(pid, 1);
         e->cb_synced = 1;            /* this process syncs through a vblank callback: never inject */
     }
     return HOOK_NEXT(hook_RegisterVblankStartCallback, g_pacing_ref[PH_REGVBLANKCB], uid);
 }
 
-/* Adaptive inject (v1.2, fps_inject == 1): after a frame flip, wait one
- * refresh period (FORCE: the forced interval) ONLY if this process showed no
- * vsync activity for more than 4.5 refresh periods, i.e. it does not sync by
+/* Adaptive inject (fps_inject == 1): after a frame flip, wait one refresh
+ * period (FORCE: the forced interval) ONLY if this process showed no vsync
+ * activity for more than 4.5 refresh periods, i.e. it does not sync by
  * itself.  Games that already wait for vblank are never double-waited (the
- * defect of Framecapper's Inject build).  fps_inject == 2 injects always. */
-static inline int inject_wanted(SceUID pid)
+ * defect of Framecapper's Inject build).  inject == 2 injects always. */
+static inline int inject_wanted(proc_entry_t *e, uint32_t inject)
 {
-    vs_entry_t *e;
     SceInt64 idle, limit;
     uint32_t hz;
 
-    if (g_cfg.fps_inject == 2u)
+    if (inject == 2u)
         return 1;
-    if (g_cfg.fps_inject != 1u)
+    if (inject != 1u || !e)
         return 0;
-    e = vs_lookup(pid, 1);
     if (e->cb_synced)
         return 0;
     hz = g_refresh_hz;
@@ -963,15 +1191,20 @@ static inline int inject_wanted(SceUID pid)
 static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
 {
     SceUID pid = ksceKernelGetProcessId();
-    uint32_t mode = pacing_mode_for_pid(pid);
-    int ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
+    proc_entry_t *e;
+    pace_t pc;
+    int ret;
 
-    if (mode != PSTV1080P_FPS_OFF && g_cfg.fps_inject != 0u && inject_wanted(pid)) {
-        unsigned int n = (mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
+    pace_for(pid, &e, &pc);
+    ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
+
+    if (pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT && pc.mode != PACE_FRAMESKIP
+        && pc.inject != 0u && inject_wanted(e, pc.inject)) {
+        unsigned int n = (pc.mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
         ksceDisplayWaitVblankStartMulti(n);
     }
     /* After the flip: run a scheduled HD apply from SceShell's context (A9). */
-    shell_apply_check();
+    shell_apply_check_pid(pid);
     return ret;
 }
 
@@ -1504,6 +1737,7 @@ int pstv1080pGetInfo(pstv1080p_info_t *out)
     info.reserved[1]         = g_apply_total;
     info.reserved[2]         = g_hd_alias;
     info.reserved[3]         = (uint32_t)g_apply_pending;
+    info.reserved[4]         = g_games_count;
     unlock();
 
     ret = ksceKernelCopyToUser(out, &info, sizeof(info));
@@ -1628,8 +1862,7 @@ int module_start(SceSize argc, const void *args)
         g_pacing_ref[i] = 0;
     }
     g_avconfig_ref = 0;
-    pid_cache_clear();
-    vs_clear();
+    proc_clear();
 
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
 
@@ -1640,6 +1873,7 @@ int module_start(SceSize argc, const void *args)
     safe_boot_check();
     if (g_cfg.fps_mode == PSTV1080P_FPS_FORCE)
         title_list_load();
+    games_list_load(1);
 
     /* Refresh cache before hooks go live so the hot path never sees stale 60. */
     refresh_display_cache(1);

@@ -44,6 +44,19 @@ for how they differ.
 
 ## Changelog
 
+- **1.3 (2026-09-11)** — per-game overrides in `ur0:tai/pstv1080p_games.txt`
+  for the few titles that misbehave at 30 Hz. Motivation: Bloodstained:
+  Curse of the Moon runs at half speed with vsync and double speed without
+  it, and Ys VIII runs at half speed; both advance their game logic per
+  vblank (or per vblank count) instead of per elapsed time. New `frameskip`
+  mode: at 30 Hz every second vblank wait returns immediately and the vblank
+  counter is reported doubled, so such games run 60 logic frames per second
+  and show every second one. Also `nowait`, `off`, `inject`, `force`,
+  `scale` per title. Every process is logged once with its title id
+  (`process: pid=... title=PCSxxxxxxx override=...`) so you can find the ids
+  in `kernel.log`. The file is re-read when a game starts: no reboot needed.
+  Also migrates a state file written by 1.0/1.1 (which kept `fps_inject = 0`,
+  so the 1.2 adaptive inject never ran on upgraded consoles) to the AUTO default.
 - **1.2 (2026-09-11)** — adaptive inject. The first game tests showed that
   titles which never wait for vblank themselves ran unpaced at 30 Hz
   (flicker, wrong frame rate); Framecapper's Inject build used to hide that
@@ -216,6 +229,40 @@ with the two `config.txt` lines.
   configured delay (about 9 s after power-on in the log).
 - `ksceDisplayGetOutputMode(1)` reports the plain screen-mode codes
   (`0x8300`, `0x8600`, `0x8710`), so no alias handling was needed.
+
+## Per-game overrides (1.3)
+
+Most games are fine with the defaults. A few advance their game logic once per
+vblank instead of per elapsed time; at 30 Hz they run at half speed, and with
+vsync removed they run too fast. For those, create `ur0:tai/pstv1080p_games.txt`
+with one line per title:
+
+```
+# title id   mode
+PCSE01221    frameskip
+PCSB01206    frameskip
+```
+
+| Mode | Effect for that title |
+|---|---|
+| `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Never injected. |
+| `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. |
+| `off` | No pacing changes and no inject for this title. |
+| `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
+| `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
+| `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
+
+How to find a title id: launch the game once and read `ux0:data/pstv1080p/kernel.log`;
+the plugin logs `process: pid=0x... title=PCSE01221 override=none` the first
+time each process touches the display. The file is read when a game starts,
+so edits take effect on the next launch. Bad lines are ignored and counted in
+the `games:` log line at boot.
+
+**Testing a `frameskip` entry:** start the game, confirm the `process:` log
+line now says `override=frameskip`, then check that the game speed is normal
+(a timer, a run cycle, music sync) and that motion looks like 30 fps. If the
+picture shows tearing or stutter, try `nowait` instead; if the speed is still
+wrong, report the title and the log.
 
 ## Frame pacing
 

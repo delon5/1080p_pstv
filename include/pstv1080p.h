@@ -12,12 +12,13 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0102u      /* 1.2 */
+#define PSTV1080P_VERSION            0x0103u      /* 1.3 */
 
 /* Persistent kernel state (ur0 is always mounted when kernel plugins start). */
 #define PSTV1080P_CFG_PATH           "ur0:tai/pstv1080p.cfg"
 #define PSTV1080P_BOOT_MARKER_PATH   "ur0:tai/pstv1080p.boot"
 #define PSTV1080P_TITLES_PATH        "ur0:tai/pstv1080p_titles.txt"
+#define PSTV1080P_GAMES_PATH         "ur0:tai/pstv1080p_games.txt"   /* v1.3 per-title overrides: "TITLEID mode" */
 /* Diagnostics (best effort, ux0 may not be mounted yet early at boot). */
 #define PSTV1080P_LOG_DIR            "ux0:data/pstv1080p"
 #define PSTV1080P_KERNEL_LOG         "ux0:data/pstv1080p/kernel.log"
@@ -25,7 +26,7 @@ extern "C" {
 #define PSTV1080P_SETTINGS_XML_DUMP  "ux0:data/pstv1080p/settings_page_orig.xml"
 
 #define PSTV1080P_CFG_MAGIC          0x50383150u  /* "P18P" little endian */
-#define PSTV1080P_CFG_VERSION        1u
+#define PSTV1080P_CFG_VERSION        2u   /* 2 since 1.3: fps_inject default became AUTO; v1 files are migrated */
 
 /* SceDisplay screen-mode codes (wiki.henkaku.xyz/vita/SceDisplay, SceDisplayScreenModeFlag). */
 #define PSTV1080P_SCREENMODE_STD     0x8000u
