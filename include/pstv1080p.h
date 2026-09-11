@@ -12,21 +12,25 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0152u      /* 1.5.2 (0xMMmp: major, minor, patch) */
-#define PSTV1080P_VERSION_STR        "1.5.2"
+#define PSTV1080P_VERSION            0x0160u      /* 1.6.0 (0xMMmp: major, minor, patch) */
+#define PSTV1080P_VERSION_STR        "1.6.0"
 
-/* Persistent kernel state (ur0 is always mounted when kernel plugins start). */
-#define PSTV1080P_CFG_PATH           "ur0:tai/pstv1080p.cfg"
-#define PSTV1080P_BOOT_MARKER_PATH   "ur0:tai/pstv1080p.boot"
-#define PSTV1080P_TITLES_PATH        "ur0:tai/pstv1080p_titles.txt"
-#define PSTV1080P_GAMES_PATH         "ur0:tai/pstv1080p_games.txt"   /* v1.3 per-title overrides: "TITLEID mode" */
-#define PSTV1080P_VERBOSE_PATH       "ur0:tai/pstv1080p_verbose.txt" /* v1.5: exists -> full logging (kernel + Settings plugin) */
-/* Diagnostics (best effort, ux0 may not be mounted yet early at boot). */
+/* 1.6: everything the plugin owns lives in ONE directory on ur0 (always
+ * mounted when kernel plugins start).  Users of 1.x move their files from
+ * ur0:tai/ here themselves; the plugin never touches ur0:tai/. */
+#define PSTV1080P_DIR                "ur0:data/pstv1080p"
+#define PSTV1080P_CFG_PATH           "ur0:data/pstv1080p/pstv1080p.cfg"
+#define PSTV1080P_BOOT_MARKER_PATH   "ur0:data/pstv1080p/pstv1080p.boot"
+#define PSTV1080P_TITLES_PATH        "ur0:data/pstv1080p/pstv1080p_titles.txt"
+#define PSTV1080P_GAMES_PATH         "ur0:data/pstv1080p/pstv1080p_games.txt"  /* per-title overrides: "TITLEID mode" */
+#define PSTV1080P_DEBUG_PATH         "ur0:data/pstv1080p/pstv1080p_debug.txt"  /* exists at boot -> logging on; absent -> NO log is written */
+/* The log itself goes to the memory card (easy to fetch, no wear on ur0). */
 #define PSTV1080P_LOG_DIR            "ux0:data/pstv1080p"
-#define PSTV1080P_KERNEL_LOG         "ux0:data/pstv1080p/kernel.log"
-#define PSTV1080P_SETTINGS_LOG       "ux0:data/pstv1080p/settings.log"
+#define PSTV1080P_LOG_PATH           "ux0:data/pstv1080p/pstv1080p.log"        /* the only log (kernel + Settings plugin), debug only */
+/* Developer dumps written by the Settings plugin (a user process: ux0 only), debug mode only. */
+#define PSTV1080P_DUMP_DIR           "ux0:data/pstv1080p"
 #define PSTV1080P_SETTINGS_XML_DUMP  "ux0:data/pstv1080p/settings_page_orig.xml"
-#define PSTV1080P_DUMP_REQUEST       "ux0:data/pstv1080p/dump_request"  /* v1.5: create it -> Settings modules dumped once, file removed */
+#define PSTV1080P_DUMP_REQUEST       "ux0:data/pstv1080p/dump_request"  /* create it -> Settings modules dumped once, file removed */
 
 #define PSTV1080P_CFG_MAGIC          0x50383150u  /* "P18P" little endian */
 #define PSTV1080P_CFG_VERSION        2u   /* 2 since 1.3: fps_inject default became AUTO; v1 files are migrated */
@@ -92,7 +96,7 @@ typedef struct pstv1080p_info {
     int32_t  last_apply_result;   /* return value of the last sceAVConfigHdmiSetResolution we issued */
     uint32_t hooks_ok;            /* bitmask: bit0 AVConfig hook, bit1.. frame pacing hooks (see kernel) */
     uint32_t reserved[7];         /* [0] apply attempts this episode, [1] this session, [2] learned alias readback,
-                                   * [3] attempt pending (v1.1), [4] per-game overrides loaded, [5] verbose logging on (v1.5) */
+                                   * [3] attempt pending (v1.1), [4] per-game overrides loaded, [5] debug logging on (1.5/1.6) */
 } pstv1080p_info_t;               /* 64 bytes */
 
 #define PSTV1080P_STATIC_ASSERT(cond, name) typedef char pstv1080p_assert_##name[(cond) ? 1 : -1]
@@ -104,6 +108,9 @@ int pstv1080pGetConfig(pstv1080p_config_t *out);
 int pstv1080pSetConfig(const pstv1080p_config_t *in);
 int pstv1080pSetMode1080p(int enable);
 int pstv1080pGetInfo(pstv1080p_info_t *out);
+/* 1.6: append one line (NUL-terminated, <= 199 bytes used) to the plugin log.
+ * A no-op unless debug logging is on, so callers may call it freely. */
+int pstv1080pLog(const char *line);
 
 /* Error codes returned by the kernel exports (besides negative SCE errors passed through). */
 #define PSTV1080P_ERR_INVALID_ARG    ((int)0x80F18001)

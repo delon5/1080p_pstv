@@ -15,7 +15,7 @@
  * DESIGN (see docs/DESIGN.md section A — this file implements it verbatim)
  * ---------------------------------------------------------------------------
  *
- *  1. Persistent state lives in ur0:tai/pstv1080p.cfg (pstv1080p_config_t,
+ *  1. Persistent state lives in ur0:data/pstv1080p/pstv1080p.cfg (pstv1080p_config_t,
  *     64 bytes, magic 'P18P').  Missing / invalid file -> defaults with the
  *     1080p mode OFF.  Every change is written back immediately.
  *
@@ -46,7 +46,7 @@
  *     attempt per 5 s, so it can never become a periodic HDMI renegotiation.
  *
  *  4. Safe boot: at module_start, if 1080p is enabled and the marker file
- *     ur0:tai/pstv1080p.boot still exists, the previous boot in 1080p did not
+ *     ur0:data/pstv1080p/pstv1080p.boot still exists, the previous boot in 1080p did not
  *     survive safe_boot_seconds (black screen -> user pulled the plug), so
  *     the option is switched off and persisted before anything is applied.
  *
@@ -61,10 +61,11 @@
  *       FORCE:           interval = max(1, refresh_hz / fps_target), applied
  *                        Framecapper-style (optionally also after SetFrameBuf).
  *
- *  6. Four syscall exports (library "pstv1080p") used by the Settings-app
- *     plugin: Get/SetConfig, SetMode1080p, GetInfo.
+ *  6. Five syscall exports (library "pstv1080p") used by the Settings-app
+ *     plugin: Get/SetConfig, SetMode1080p, GetInfo and (1.6) Log, which
+ *     appends the plugin's lines to the same log (no-op unless debug is on).
  *
- *  7. Best-effort logging to ux0:data/pstv1080p/kernel.log (never from the
+ *  7. Logging (debug only) to ux0:data/pstv1080p/pstv1080p.log (never from the
  *     frame-pacing hot path; every failure is ignored).
  *
  * ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@
  *      from the kernel worker thread left the driver at 480p.  Whether that
  *      is the calling context (no user process) or timing is unknown; v1.1
  *      does the attempt from SceShell's SetFrameBuf syscall and retries with
- *      backoff, which covers both explanations.  kernel.log shows which.
+ *      backoff, which covers both explanations.  The debug log shows which.
  *  A8. _sceDisplaySetFrameBuf (0xF51523CB) is hooked unconditionally at
  *      module_start (DESIGN A.3 lists it as "FORCE+inject only"); the hook
  *      passes straight through unless fps_mode == FORCE && fps_inject.  This
@@ -343,7 +344,7 @@ static proc_entry_t g_procs[PROC_ENTRIES];
  * frame behind the HDMI apply. */
 static SceUID g_tbl_mutex = -1;
 
-/* Per-title overrides (ur0:tai/pstv1080p_games.txt: "TITLEID mode" per line) */
+/* Per-title overrides (ur0:data/pstv1080p/pstv1080p_games.txt: "TITLEID mode" per line) */
 #define GAMES_LIST_MAX                32
 typedef struct {
     char title[TITLE_ID_LEN];
@@ -352,7 +353,7 @@ typedef struct {
 static game_override_t g_games[GAMES_LIST_MAX];
 static uint32_t g_games_count = 0;
 
-/* Title list (ur0:tai/pstv1080p_titles.txt) */
+/* Title list (ur0:data/pstv1080p/pstv1080p_titles.txt) */
 static volatile uint32_t g_title_filter_active = 0;  /* 1 = only listed titles are paced in FORCE mode */
 static uint32_t g_title_count = 0;
 static char g_titles[TITLE_LIST_MAX][TITLE_ID_LEN];
@@ -420,28 +421,47 @@ static void tbl_unlock(void)
         ksceKernelUnlockMutex(g_tbl_mutex, 1);
 }
 
+/* 1.6: the plugin's directory on ur0 (config, overrides, marker, debug switch). */
+static int g_dir_ok = 0;
+static void ensure_dir(void)
+{
+    int r;
+    if (g_dir_ok)
+        return;
+    ksceIoMkdir("ur0:data", 6);                /* may already exist: ignored */
+    r = ksceIoMkdir(PSTV1080P_DIR, 6);
+    if (r == 0 || r == SCE_ERRNO_EEXIST)
+        g_dir_ok = 1;
+}
+
+/* The log directory on the memory card (only touched when logging is on). */
 static void ensure_log_dir(void)
 {
+    int r;
     if (g_log_dir_ok)
         return;
-    int r = ksceIoMkdir(PSTV1080P_LOG_DIR, 6);
+    ksceIoMkdir("ux0:data", 6);
+    r = ksceIoMkdir(PSTV1080P_LOG_DIR, 6);
     if (r == 0 || r == SCE_ERRNO_EEXIST)
         g_log_dir_ok = 1;
 }
 
-/* v1.5: quiet by default (state changes, user actions, failures).  The
- * per-boot inventory lines (every hook, every process, lifecycle events)
- * only appear when ur0:tai/pstv1080p_verbose.txt exists at boot. */
+/* 1.6: NO log is written unless ur0:data/pstv1080p/pstv1080p_debug.txt exists
+ * at boot.  With it, everything is logged (the 1.5 "verbose" set) to
+ * ux0:data/pstv1080p/pstv1080p.log, including the Settings plugin's lines
+ * (they arrive through the pstv1080pLog syscall). */
 static int g_verbose = 0;
 #define kvlog(...) do { if (g_verbose) klog(__VA_ARGS__); } while (0)
 
-/* Append one line to the kernel log.  Never called from the frame-pacing hooks. */
+/* Append one line to the log.  Never called from the frame-pacing hooks. */
 static void klog(const char *fmt, ...)
 {
     char buf[256];
     va_list ap;
     int n, m;
 
+    if (!g_verbose)
+        return;
     ensure_log_dir();
     if (!g_log_dir_ok)
         return;
@@ -467,7 +487,7 @@ static void klog(const char *fmt, ...)
     buf[n++] = '\n';
     buf[n] = 0;
 
-    SceUID fd = ksceIoOpen(PSTV1080P_KERNEL_LOG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 6);
+    SceUID fd = ksceIoOpen(PSTV1080P_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 6);
     if (fd < 0)
         return;
     ksceIoWrite(fd, buf, (SceSize)n);
@@ -485,12 +505,15 @@ static int file_exists(const char *path)
 
 static int file_touch(const char *path)
 {
-    SceUID fd = ksceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    SceUID fd;
+    ensure_dir();
+    fd = ksceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
     if (fd < 0)
         return (int)fd;
     ksceIoClose(fd);
     return 0;
 }
+
 
 /* ------------------------------------------------------------------------- */
 /* Refresh-rate cache                                                         */
@@ -645,8 +668,10 @@ static void config_clamp(pstv1080p_config_t *c)
 
 static int config_save(void)
 {
-    SceUID fd = ksceIoOpen(PSTV1080P_CFG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    SceUID fd;
     int ret;
+    ensure_dir();
+    fd = ksceIoOpen(PSTV1080P_CFG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
     if (fd < 0) {
         klog("config: open for write failed 0x%08X", (unsigned)fd);
         return (int)fd;
@@ -845,7 +870,7 @@ static int str_ieq(const char *a, int alen, const char *b)
     return b[alen] == 0;
 }
 
-/* Load ur0:tai/pstv1080p_games.txt.  Lines: "TITLEID mode", '#' comments.
+/* Load ur0:data/pstv1080p/pstv1080p_games.txt.  Lines: "TITLEID mode", '#' comments.
  * Cheap enough to be called on every new process (once per game start), so
  * edits take effect on the next launch without a reboot.  Caller holds
  * g_tbl_mutex (the parse buffer and g_games[] are shared). */
@@ -2397,6 +2422,30 @@ int pstv1080pSetMode1080p(int enable)
     return ret;
 }
 
+/* 1.6: the Settings plugin logs through the kernel so there is one log file
+ * in one place (a user process cannot write to ur0).  Nothing happens unless
+ * debug logging is on. */
+int pstv1080pLog(const char *line)
+{
+    char buf[200];
+    int n;
+
+    if (!line)
+        return PSTV1080P_ERR_INVALID_ARG;
+    if (!g_verbose)
+        return 0;
+    /* The plugin passes a static 512-byte buffer; a checked copy of a fixed
+     * size is the safest way to read it (no strlen over user memory). */
+    if (ksceKernelCopyFromUser(buf, line, sizeof(buf) - 1) < 0)
+        return PSTV1080P_ERR_INVALID_ARG;
+    buf[sizeof(buf) - 1] = 0;
+    n = (int)strnlen(buf, sizeof(buf) - 1);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+        buf[--n] = 0;
+    klog("settings: %s", buf);
+    return 0;
+}
+
 int pstv1080pGetInfo(pstv1080p_info_t *out)
 {
     pstv1080p_info_t info;
@@ -2576,8 +2625,11 @@ int module_start(SceSize argc, const void *args)
     g_mutex = ksceKernelCreateMutex("pstv1080p_mtx", 0, 0, NULL);
     g_tbl_mutex = ksceKernelCreateMutex("pstv1080p_tbl", 0, 0, NULL);
 
-    g_verbose = file_exists(PSTV1080P_VERBOSE_PATH);
-    klog("pstv1080p kernel module v%s starting%s", PSTV1080P_VERSION_STR, g_verbose ? " (verbose logging)" : "");
+    /* 1.6: one directory for everything the plugin owns; decide first whether
+     * anything at all gets logged this boot. */
+    ensure_dir();
+    g_verbose = file_exists(PSTV1080P_DEBUG_PATH);
+    klog("pstv1080p kernel module v%s starting (debug logging on)", PSTV1080P_VERSION_STR);
     if (g_tbl_mutex < 0)
         klog("table mutex create failed 0x%08X (miss path unserialised)", (unsigned)g_tbl_mutex);
 

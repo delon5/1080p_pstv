@@ -47,12 +47,15 @@
  *     the UTF-16 string "1080p (30 Hz)" for msg id "msg_pstv1080p_1080p".
  *  7. Kernel config is fetched with pstv1080pGetConfig at module_start, again
  *     when the page is loaded, on every access to our key and after every Set.
- *  8. Logged to ux0:data/pstv1080p/settings.log (append, best effort): quiet
- *     by default (user actions, state changes, failures); everything when the
- *     kernel reports verbose mode (ur0:tai/pstv1080p_verbose.txt exists).
- *  9. Creating ux0:data/pstv1080p/dump_request makes the plugin write the
- *     Settings modules (as mapped in memory) to dump_*.bin once, for analysis
- *     on another firmware; the request file is removed afterwards.
+ *  8. (1.6) No log file of its own: lines go through the pstv1080pLog syscall
+ *     into ux0:data/pstv1080p/pstv1080p.log, and only when the kernel has
+ *     debug logging on (ur0:data/pstv1080p/pstv1080p_debug.txt exists at boot).
+ *     With it off, nothing is written anywhere.
+ *  9. Debug mode only: the original page XML is saved once to
+ *     ux0:data/pstv1080p/settings_page_orig.xml, and creating
+ *     ux0:data/pstv1080p/dump_request makes the plugin write the Settings
+ *     modules (as mapped in memory) to dump_*.bin once, for analysis on
+ *     another firmware; the request file is removed afterwards.
  *
  * Safety rules followed by every hook: NULL/length checks on every pointer,
  * all string compares/searches are bounded, no heap, no libc, no floats, and
@@ -167,44 +170,42 @@ static wchar_t g_text_1080p[] = L"1080p (30 Hz)";
 /* Logging                                                                   */
 /* ------------------------------------------------------------------------- */
 
+/* Developer dumps (page XML, module dumps) go to ux0: this is a user process. */
 static void ensure_log_dir(void)
 {
     if (!g_log_dir_done) {
         g_log_dir_done = 1;
         sceIoMkdir("ux0:data", 0777);
-        sceIoMkdir(PSTV1080P_LOG_DIR, 0777);
+        sceIoMkdir(PSTV1080P_DUMP_DIR, 0777);
     }
 }
 
+/* 1.6: no file of our own.  Lines go to the kernel (pstv1080pLog), which
+ * appends them to ux0:data/pstv1080p/pstv1080p.log only when debug logging
+ * is on; until GetInfo has told us whether it is, the syscall decides. */
+static int g_verbose_known;
+
 static void pstv_log(const char *fmt, ...)
 {
-    char line[LOG_LINE_MAX];
+    static char line[LOG_LINE_MAX];
     va_list ap;
     int len;
-    SceUID fd;
 
     if (!fmt)
+        return;
+    if (g_verbose_known && !g_verbose)
         return;
     va_start(ap, fmt);
     len = sceClibVsnprintf(line, sizeof(line) - 1, fmt, ap);
     va_end(ap);
     if (len < 0)
         return;
-    if (len > (int)sizeof(line) - 2)
-        len = (int)sizeof(line) - 2;
-    line[len++] = '\n';
-    line[len] = '\0';
-
-    ensure_log_dir();
-    fd = sceIoOpen(PSTV1080P_SETTINGS_LOG, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
-    if (fd < 0)
-        return;
-    sceIoWrite(fd, line, (SceSize)len);
-    sceIoClose(fd);
+    line[sizeof(line) - 1] = '\0';
+    pstv1080pLog(line);
 }
 
-#define LOG(fmt, ...) pstv_log("[pstv1080p] " fmt, ##__VA_ARGS__)
-#define VLOG(fmt, ...) do { if (g_verbose) pstv_log("[pstv1080p] " fmt, ##__VA_ARGS__); } while (0)
+#define LOG(fmt, ...) pstv_log(fmt, ##__VA_ARGS__)
+#define VLOG(fmt, ...) do { if (g_verbose) pstv_log(fmt, ##__VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------------------------- */
 /* Kernel config cache                                                       */
@@ -256,6 +257,7 @@ static void log_kernel_info(void)
         return;
     }
     g_verbose = info.reserved[5] ? 1 : 0;
+    g_verbose_known = 1;
     LOG("GetInfo: version=0x%04X mode_1080p=%u N=%u output_mode=0x%04X refresh=%u Hz "
         "last_system_mode=0x%04X last_apply=0x%08X hooks_ok=0x%08X",
         (unsigned)info.version, (unsigned)info.mode_1080p, (unsigned)info.settings_item_value,
@@ -427,8 +429,8 @@ static int get_attr(const char *tag, int tag_len, const char *name, char *out, i
 static void dump_original_xml(const char *buf, int len)
 {
     SceUID fd;
-    if (g_xml_dumped)
-        return;
+    if (g_xml_dumped || !g_verbose)
+        return;                                   /* 1.6: a debug-only artefact */
     g_xml_dumped = 1;
     ensure_log_dir();
     fd = sceIoOpen(PSTV1080P_SETTINGS_XML_DUMP, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
@@ -968,7 +970,7 @@ static void dump_module(SceUID modid, const char *tag)
     tinfo.size = sizeof(tinfo);
     taiGetModuleInfo(info.module_name, &tinfo);
 
-    sceClibSnprintf(path, sizeof(path), PSTV1080P_LOG_DIR "/dump_%s.txt", tag);
+    sceClibSnprintf(path, sizeof(path), PSTV1080P_DUMP_DIR "/dump_%s.txt", tag);
     fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
     if (fd >= 0) {
         char line[256];
@@ -990,7 +992,7 @@ static void dump_module(SceUID modid, const char *tag)
         SceSize left = info.segments[i].memsz, off = 0;
         if (!base || left == 0)
             continue;
-        sceClibSnprintf(path, sizeof(path), PSTV1080P_LOG_DIR "/dump_%s_seg%d.bin", tag, i);
+        sceClibSnprintf(path, sizeof(path), PSTV1080P_DUMP_DIR "/dump_%s_seg%d.bin", tag, i);
         fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
         if (fd < 0) {
             LOG("dump: cannot create %s (0x%08X)", path, (unsigned)fd);
@@ -1015,8 +1017,8 @@ static void dump_settings_modules_on_request(void)
     SceIoStat st;
     tai_module_info_t tinfo;
 
-    if (sceIoGetstat(PSTV1080P_DUMP_REQUEST, &st) < 0)
-        return;                                   /* nobody asked */
+    if (!g_verbose || sceIoGetstat(PSTV1080P_DUMP_REQUEST, &st) < 0)
+        return;                                   /* not in debug mode, or nobody asked */
     sceIoRemove(PSTV1080P_DUMP_REQUEST);
     ensure_log_dir();
     LOG("dump: " PSTV1080P_DUMP_REQUEST " found, writing the Settings modules (request file removed)");
@@ -1074,8 +1076,8 @@ int module_start(SceSize argc, const void *args)
         g_hooks[i] = -1;
         g_refs[i] = 0;
     }
+    log_kernel_info();                 /* learns whether debug logging is on */
     LOG("module_start (version " PSTV1080P_VERSION_STR ")");
-    log_kernel_info();                 /* also learns the verbose flag */
     refresh_config("module_start");
 
     install_hook(HOOK_LOADSTART, "SceSettings", NID_LIB_SCELIBKERNEL, NID_SCEKERNELLOADSTARTMODULE,

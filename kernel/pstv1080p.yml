@@ -14,3 +14,4 @@ pstv1080p:
         - pstv1080pSetConfig
         - pstv1080pSetMode1080p
         - pstv1080pGetInfo
+        - pstv1080pLog
