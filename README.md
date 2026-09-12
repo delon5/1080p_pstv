@@ -48,6 +48,24 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.12 (2026-09-12)** — **`frameskip force`, `immflip` removed, and two
+  stack overflows fixed.** (1) Writing both `frameskip` and `force` on one
+  line now combines them instead of the later word winning: the fractional
+  wait accounting of `frameskip`, paced to `fps_target` instead of a fixed 60,
+  so a target the refresh rate does not divide still comes out right on
+  average. With the default target of 60 it is identical to `frameskip` alone.
+  The vblank counter a game reads is scaled by the same ratio. (2) `immflip`
+  (1.6.11 only) is gone after testing found no use for it; the word is still
+  accepted and ignored so a line carrying it keeps its rule instead of being
+  discarded, and the Configurator drops it on the next save. (3) `ovr_desc`
+  added snprintf's return value without clamping it, so a rule using enough
+  words wrote past the 48-byte buffers its three callers pass. One of those
+  callers builds the description on a game's first display syscall whether or
+  not logging is on, so this was live kernel stack corruption. It now clamps
+  after every word and the buffers are 80 bytes. (4) The Configurator's
+  per-line buffer was sized for one switch word; with more than one it
+  overflowed and could write a corrupted rules file. Both were found by review
+  and reproduced on the host before release.
 - **1.6.10 (2026-09-12)** — **`novsync` now does what novsync.suprx does.**
   The reference plugin (junminlee2004/novsync, after Electry's VGi) hooks the
   eight vblank wait calls and returns from each immediately; it never touches
@@ -570,7 +588,7 @@ PCSB01206    frameskip
 
 | Mode | Effect for that title |
 |---|---|
-| `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
+| `frameskip` (add `force` to pace it to `fps_target`) | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
 | `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |

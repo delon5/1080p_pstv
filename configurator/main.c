@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.10"
+#define APP_VERSION      "1.6.12"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -74,10 +74,10 @@
 /* Override modes (must match kernel/main.c games_list_load)                  */
 /* ------------------------------------------------------------------------- */
 
-enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_INJECT, M_FORCE, M_SCALE, M_SPOOF720, M_TRACE, M_COUNT };
+enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_INJECT, M_FORCE, M_FRAMEFORCE, M_SCALE, M_SPOOF720, M_TRACE, M_COUNT };
 
 static const char *k_mode_name[M_COUNT] = {
-    "none", "frameskip", "nowait", "off", "inject", "force", "scale", "spoof720", "trace"
+    "none", "frameskip", "nowait", "off", "inject", "force", "frameskip force", "scale", "spoof720", "trace"
 };
 
 static const char *k_mode_desc[M_COUNT] = {
@@ -87,6 +87,7 @@ static const char *k_mode_desc[M_COUNT] = {
     "No pacing change and no inject for this title.",
     "Always wait one period after each frame flip (Framecapper \"Inject\").",
     "Framecapper-style fixed target (the global target fps) for this title.",
+    "Frameskip paced to the global FORCE target instead of 60: keeps a target the refresh rate does not divide.",
     "The default rule; use it to exempt a title from a global FORCE mode.",
     "Diagnostic: answer display queries as if the output were 720p60.",
     "Diagnostic: log this title's process lifecycle and allocations (slower start).",
@@ -134,6 +135,8 @@ typedef struct {
     int  orig_mode;
     int  novsync;          /* 1.6.3: the "novsync" switch attached to the option */
     int  orig_novsync;
+    int  syncflip;         /* 1.6.11: the "syncflip" switch (flips latched at a vblank) */
+    int  orig_syncflip;
     int  installed;
     int  from_file;        /* this title had a line in the file (first line wins, like the kernel) */
     int  file_order;       /* 1.6.6: 1-based position of its line in the file (0 = not from the file) */
@@ -143,6 +146,8 @@ typedef struct {
 
 static const char k_novsync_desc[] =
     "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.";
+static const char k_syncflip_desc[] =
+    "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.";
 
 static game_t g_games[MAX_GAMES];
 static int g_ngames;
@@ -181,12 +186,12 @@ static void set_status(unsigned color, const char *fmt, ...)
 
 static int game_changed(const game_t *g)
 {
-    return g->mode != g->orig_mode || g->novsync != g->orig_novsync;
+    return g->mode != g->orig_mode || g->novsync != g->orig_novsync || g->syncflip != g->orig_syncflip;
 }
 
 static int game_active(const game_t *g)
 {
-    return g->mode != M_NONE || g->novsync;
+    return g->mode != M_NONE || g->novsync || g->syncflip;
 }
 
 static int dirty(void)
@@ -337,9 +342,13 @@ static void load_games_file(void)
             m_end = m_start;
             while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t') m_end++;
             mode = (m_start < e) ? mode_from_name(buf + m_start, m_end - m_start) : -1;
-            /* "TITLEID novsync ..." (no option): the switch alone. */
+            /* "TITLEID novsync ..." / "TITLEID immflip ...": a switch alone. */
             if (mode < 0 && m_start < e && (m_end - m_start) == 7 &&
-                strncasecmp(buf + m_start, "novsync", 7) == 0)
+                (strncasecmp(buf + m_start, "novsync", 7) == 0 ||
+                 strncasecmp(buf + m_start, "immflip", 7) == 0))   /* immflip: dropped on save */
+                mode = M_NONE;
+            if (mode < 0 && m_start < e && (m_end - m_start) == 8 &&
+                strncasecmp(buf + m_start, "syncflip", 8) == 0)
                 mode = M_NONE;
             if ((t_end - s0) != 9 || mode < 0) {
                 /* The kernel ignores such a line too; keep it so nothing is lost. */
@@ -370,7 +379,6 @@ static void load_games_file(void)
                 g->note_len = g_comments_len - g_trail_off;
                 g_trail_off = g_comments_len;
                 g->mode = mode;
-                g->orig_mode = mode;
                 /* Everything after the option is kept and written back on the
                  * same line; the "novsync" word in it is our switch. */
                 ts = (mode == M_NONE) ? m_start : m_end;   /* line was "ID novsync ..." */
@@ -381,9 +389,18 @@ static void load_games_file(void)
                     tl = TAIL_LEN - 1;
                 memcpy(g->tail, buf + ts, (size_t)tl);
                 g->tail[tl] = 0;
+                if (mode == M_FRAMESKIP && strip_word(g->tail, "force"))
+                    g->mode = M_FRAMEFORCE;     /* "ID frameskip force" */
+                else if (mode == M_FORCE && strip_word(g->tail, "frameskip"))
+                    g->mode = M_FRAMEFORCE;     /* "ID force frameskip" */
                 if (strip_word(g->tail, "novsync"))
                     g->novsync = 1;
+                strip_word(g->tail, "immflip");     /* 1.6.12: removed, drop it from the line */
+                if (strip_word(g->tail, "syncflip"))
+                    g->syncflip = 1;
+                g->orig_mode = g->mode;
                 g->orig_novsync = g->novsync;
+                g->orig_syncflip = g->syncflip;
             }
         }
     }
@@ -448,7 +465,7 @@ static int save_games_file(void)
 
         for (i = 0; i < n_order; i++) {
             const game_t *g = order[i];
-            char line[9 + 1 + 12 + 8 + TAIL_LEN + 4];
+            char line[128];     /* id + "frameskip force" + " novsync" + " syncflip" + tail + NUL */
             int n = 0, ok;
             /* 1.6.6: the comment lines that sat above this entry go back above
              * it; an entry added here gets the game's name as its comment. */
@@ -466,6 +483,8 @@ static int save_games_file(void)
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_mode_name[g->mode]);
             if (g->novsync)
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " novsync");
+            if (g->syncflip)
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " syncflip");
             if (g->tail[0])
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", g->tail);
             n += snprintf(line + n, sizeof(line) - (size_t)n, "\n");
@@ -490,6 +509,7 @@ static int save_games_file(void)
     for (i = 0; i < g_ngames; i++) {
         g_games[i].orig_mode = g_games[i].mode;
         g_games[i].orig_novsync = g_games[i].novsync;
+        g_games[i].orig_syncflip = g_games[i].syncflip;
     }
     g_file_present = 1;
     /* Re-read what is on disk so the comment blocks and the file order of
@@ -854,7 +874,7 @@ static void draw_games(void)
         text(COL_NAME_X, y + 20, name_col, nm);
         text(COL_ID_X, y + 20, C_DIM, g->id);
         textf(COL_MODE_X, y + 20, game_active(g) ? mode_color(g->mode == M_NONE ? M_NOWAIT : g->mode) : (unsigned)C_DIM,
-              "%s%s%s", (g->mode == M_NONE && g->novsync) ? "" : k_mode_name[g->mode],
+              "%s%s%s", (g->mode == M_NONE && (g->novsync || g->syncflip)) ? "" : k_mode_name[g->mode],
               g->novsync ? ((g->mode == M_NONE) ? "novsync" : "+novsync") : "",
               game_changed(g) ? " *" : "");
     }
@@ -887,7 +907,7 @@ static void draw_popup_box(int w, int h, const char *title)
     text(x + 20, y + 32, C_TEXT, title);
 }
 
-#define PICK_ROWS (M_COUNT + 1)          /* the options + the novsync switch */
+#define PICK_ROWS (M_COUNT + 2)          /* the options + the novsync and syncflip switches */
 
 static void draw_modepick(void)
 {
@@ -911,9 +931,14 @@ static void draw_modepick(void)
         if (g_pick_sel == M_COUNT)
             vita2d_draw_rectangle(x + 12, ry, w - 24, 28, C_SEL);
         textf(x + 24, ry + 20, g->novsync ? C_WARN : C_DIM, "[%s] novsync", g->novsync ? "X" : " ");
+        if (g_pick_sel == M_COUNT + 1)
+            vita2d_draw_rectangle(x + 12, ry + 30, w - 24, 26, C_SEL);
+        textf(x + 24, ry + 50, g->syncflip ? C_WARN : C_DIM, "[%s] syncflip", g->syncflip ? "X" : " ");
         text(x + 160, ry + 20, C_DIM, "attach to any option (X toggles)");
     }
-    text(x + 20, y + h - 40, C_DIM, g_pick_sel == M_COUNT ? k_novsync_desc : k_mode_desc[g_pick_sel]);
+    text(x + 20, y + h - 40, C_DIM,
+         g_pick_sel == M_COUNT ? k_novsync_desc :
+         g_pick_sel == M_COUNT + 1 ? k_syncflip_desc : k_mode_desc[g_pick_sel]);
     text(x + 20, y + h - 14, C_DIM, "X choose / toggle   O close");
 }
 
@@ -935,7 +960,10 @@ static void draw_help(void)
         y += 28;
     }
     textf(70, y, C_WARN, "%-10s", "novsync");
-    text(190, y, C_TEXT, "Switch on top of any option: immediate flips (+ no waits when alone). Old novsync+Framecapper60Inject = nowait+novsync+inject.");
+    text(190, y, C_TEXT, "Same as the nowait option: all vblank waits return at once, like novsync.suprx.");
+    y += ROW_H;
+    textf(70, y, C_WARN, "%-10s", "syncflip");
+    text(190, y, C_TEXT, "Latch each flip at a vblank instead of mid-scan. Against tearing, e.g. together with frameskip.");
     y += 28;
     text(70, y + 12, C_DIM, "Changes apply the next time the game is started; no reboot needed.");
     text(70, y + 40, C_DIM, "O close");
@@ -1095,6 +1123,7 @@ static void input_games(unsigned b)
     if (g && (b & SCE_CTRL_SQUARE)) {
         g->mode = M_NONE;
         g->novsync = 0;
+        g->syncflip = 0;
         set_status(C_DIM, "Override removed for %s (press START to save)", g->id);
     }
     if (g && (b & SCE_CTRL_CROSS)) { g_pick_sel = g->mode; g_screen = SCR_MODEPICK; }
@@ -1114,6 +1143,8 @@ static void input_modepick(unsigned b)
     if (b & SCE_CTRL_CROSS) {
         if (g_pick_sel == M_COUNT) {
             g_games[g_sel].novsync = !g_games[g_sel].novsync;   /* toggle, stay open */
+        } else if (g_pick_sel == M_COUNT + 1) {
+            g_games[g_sel].syncflip = !g_games[g_sel].syncflip; /* toggle, stay open */
         } else {
             g_games[g_sel].mode = g_pick_sel;
             g_screen = SCR_GAMES;
