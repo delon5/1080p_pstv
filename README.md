@@ -48,6 +48,19 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.9 (2026-09-12)** — **Per-game rules reach games again.** The override
+  table was re-read from `ur0:data/pstv1080p/pstv1080p_games.txt` inside the
+  first display call of every process, which runs on that process's own
+  thread. A sandboxed retail game cannot open that file, and a failed open
+  emptied the table, so the game was resolved with `override=none` while its
+  line sat in the file. On hardware three of four titles lost their rule this
+  way (`PCSE00120`, `PCSE01262`, `PCSE00015` all came up `none`, while
+  `PCSG00009` happened to read the file successfully and got its `nowait`).
+  The plugin thread now refreshes the table every two seconds, where the file
+  is always readable; process resolution does no file I/O at all; and a failed
+  read never empties an already loaded table. Edits still take effect a couple
+  of seconds later without a reboot. The `process:` log line now ends with
+  `rules=N`, so an empty table is visible at a glance.
 - **1.6.8 (2026-09-12)** — **Reverts 1.6.7's frame-pacing change; keeps its
   logging and config fixes.** 1.6.7 assumed a flip set to "next frame" blocks
   the caller for a whole output period and shortened the following wait by

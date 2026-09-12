@@ -315,3 +315,15 @@ callback). Subtracting a "flip debt" from that wait therefore removed the only
 throttle: the Configurator ran at 400+ fps and Curse of the Moon at 130. Pace
 ONLY the wait calls. The per-frame cost a rule must reason about is the number
 of vblank-class waits a game makes, which is what the `trace` profile counts.
+
+## U. The rules file must not be read from a game's thread (1.6.9)
+
+Same root as section S: every display hook runs on the calling process's
+thread, and a sandboxed retail game cannot open ur0 (or ux0). proc_resolve
+called games_list_load() there, and that function set g_games_count = 0 when
+the open failed, so the per-game rule silently became "none" for exactly the
+titles the user cared about, while a title whose first display call happened
+to succeed kept its rule. Fix: the plugin thread (kernel context) reloads the
+table every 2 s under g_tbl_mutex, proc_resolve only reads the cached table,
+and a failed open or read keeps whatever is already loaded. The process log
+line reports g_games_count so this class of failure is visible.

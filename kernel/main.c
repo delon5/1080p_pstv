@@ -228,6 +228,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define SHELL_WAIT_POLL_US            (500u * 1000u)
 #define SHELL_WAIT_MAX_POLLS          120            /* 60 s */
 #define THREAD_TICK_US                (250u * 1000u)
+#define GAMES_RELOAD_US               (2000u * 1000u)  /* 1.6.9: rules refresh period (plugin thread) */
 #define WATCHDOG_MIN_PERIOD_MS        500u
 #define BOOT_DELAY_MAX_MS             60000u
 #define SAFE_BOOT_MAX_SECONDS         3600u
@@ -893,8 +894,11 @@ static void title_list_load(void)
     }
     len = ksceIoRead(fd, buf, sizeof(buf) - 1);
     ksceIoClose(fd);
-    if (len < 0)
+    if (len < 0) {
+        if (g_games_count > 0)
+            return;                     /* 1.6.9: keep what we have */
         len = 0;
+    }
     buf[len] = 0;
 
     start = 0;
@@ -990,15 +994,28 @@ static void games_list_load(int do_log)
 
     fd = ksceIoOpen(PSTV1080P_GAMES_PATH, SCE_O_RDONLY, 0);
     if (fd < 0) {
-        g_games_count = 0;
+        /* 1.6.9: a failed open must NEVER empty the table.  This read used to
+         * happen on the game's own thread, where a sandboxed retail game
+         * cannot open ur0 at all: the rules were wiped and the game came up
+         * with override=none while the file plainly listed it (hardware:
+         * PCSE00120, PCSE01262, PCSE00015 all showed override=none). */
+        if (g_games_count > 0) {
+            if (do_log)
+                klog("games: %s unreadable (0x%08X), keeping the %u rule(s) already loaded",
+                     PSTV1080P_GAMES_PATH, (unsigned)fd, (unsigned)g_games_count);
+            return;
+        }
         if (do_log)
             klog("games: no override file (%s)", PSTV1080P_GAMES_PATH);
         return;
     }
     len = ksceIoRead(fd, buf, sizeof(buf) - 1);
     ksceIoClose(fd);
-    if (len < 0)
+    if (len < 0) {
+        if (g_games_count > 0)
+            return;                     /* 1.6.9: keep what we have */
         len = 0;
+    }
     buf[len] = 0;
 
     start = 0;
@@ -1137,7 +1154,8 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
         }
     }
 
-    games_list_load(0);
+    /* 1.6.9: NO file read here.  This runs on the game's own thread, where the
+     * read can fail; the plugin thread refreshes the table instead. */
     e->override = OVR_NONE;
     e->flags = 0;
     for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
@@ -1151,9 +1169,10 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
      * are noise for the user; they still show up in verbose mode). */
     if (g_verbose || (pid != g_shell_pid && strncmp(e->title, "NPXS", 4) != 0)) {
         char d[48];
-        klog("process: pid=0x%08X title=%s override=%s%s hz=%u", (unsigned)pid,
+        klog("process: pid=0x%08X title=%s override=%s%s hz=%u rules=%u", (unsigned)pid,
              e->title[0] ? e->title : "?", ovr_desc(e->override, e->flags, d, sizeof(d)),
-             (pid == g_shell_pid) ? " (shell, never paced)" : "", (unsigned)g_refresh_hz);
+             (pid == g_shell_pid) ? " (shell, never paced)" : "", (unsigned)g_refresh_hz,
+             (unsigned)g_games_count);
     }
 }
 
@@ -2552,7 +2571,7 @@ static void watchdog_tick(void)
 static int pstv1080p_thread(SceSize args, void *argp)
 {
     int polls = 0;
-    SceInt64 last_wd = 0;
+    SceInt64 last_wd = 0, last_rules = 0;
 
     /* 1. Wait for SceShell (max 60 s), caching its pid for the process filter. */
     while (!g_thread_stop) {
@@ -2600,6 +2619,15 @@ static int pstv1080p_thread(SceSize args, void *argp)
             break;
 
         klog_flush();
+        /* 1.6.9: refresh the per-game rules from the plugin thread, where ur0
+         * is always readable, so an edit takes effect within a couple of
+         * seconds and a game's own thread never has to read the file. */
+        if (now_us() - last_rules >= (SceInt64)GAMES_RELOAD_US) {
+            last_rules = now_us();
+            tbl_lock();
+            games_list_load(0);
+            tbl_unlock();
+        }
         marker_tick();
         trace_profile_tick();
 
