@@ -537,19 +537,25 @@ with the two `config.txt` lines.
 
 - **Settings confirmed on hardware (2026-09-12, 1.6.10):** Persona 4 Golden
   (`PCSE00120`) runs correctly on `frameskip`; Tales of Innocence R
-  (`PCSG00009`) on `nowait`; **Tales of Hearts R (`PCSE00429`) runs at a
-  correct 30 fps on `frameskip novsync`**, which is the first setting that has
-  ever made that title work under 1080p30. Note what that line does: `novsync`
-  maps to the `nowait` rule, so it overrides `frameskip` and the effective
-  pacing is `nowait` alone. The game limits itself to 30 fps once nothing else
-  throttles it. Tales of Innocence R behaves the same way.
+  (`PCSE00120`) runs correctly on `frameskip`; **Tales of Hearts R
+  (`PCSE00429`) and Tales of Innocence R (`PCSG00009`) run at a correct 30 fps
+  on `frameskip novsync`**, the first setting that has ever made Hearts R work
+  under 1080p30. That line is NOT the same as `nowait`, measured: Innocence R
+  gives 20 fps on `nowait` and 30 on `frameskip novsync`. Two things combine
+  in it. `novsync` maps the effective pacing to `nowait`, so every vblank wait
+  returns at once; but the vblank counter hook keys off the rule word written
+  in the file, so `frameskip` still makes `sceDisplayGetVcount` report a
+  doubled count. Both games pace themselves by reading that counter, so they
+  need the doubling as well as the missing waits.
 
-- **A rule of thumb that follows from the above.** Try `nowait` first. A game
+- **A rule of thumb that follows from the above.** Try `frameskip novsync`
+  first, then `nowait`, A game
   with a frame limiter of its own (both Tales titles) then settles at its
-  intended rate and is fixed; a game without one (Bloodstained: Curse of the
-  Moon) free-runs and obviously so within seconds. Only the second kind needs
-  `frameskip`, which paces it at 60 logic frames per second on a 30 Hz head.
-  This is two launches per title and it replaces guessing. Bloodstained: Curse of the Moon (`PCSE01262`)
+  intended rate; if it lands below that rate, it is reading the vblank counter
+  and wants `frameskip novsync` rather than `nowait`. A game without a limiter
+  (Bloodstained: Curse of the Moon) free-runs and obviously so within seconds,
+  and that kind needs plain `frameskip`. Three launches per title at most, and
+  it replaces guessing. Bloodstained: Curse of the Moon (`PCSE01262`)
   runs far too fast on `nowait`: it has no limiter of its own, so with every
   vblank wait removed it free-runs. A 60 fps game like that wants `frameskip`,
   which keeps its 60 logic frames while showing every second one. Note that every per-game result recorded before

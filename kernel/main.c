@@ -1858,6 +1858,12 @@ static int hook_WaitSetFrameBufCB(void)
  * plain "vblanks since boot" int, so the scaled value stays monotonic too
  * (no artificial 16-bit wrap: a game computing now - last must never see a
  * negative delta the stock driver would not produce). */
+/* NOTE, load-bearing: this keys off the RULE WORD in the file (e->override),
+ * not off the effective pacing mode.  "frameskip novsync" therefore skips
+ * every wait (novsync maps the mode to nowait) AND still reports a doubled
+ * counter, which is what makes Tales of Hearts R and Tales of Innocence R run
+ * at 30 fps instead of 20: they pace themselves by reading this counter.
+ * Do not "tidy" it to use pc.mode. */
 static inline int vcount_for(proc_entry_t *e, int v)
 {
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
