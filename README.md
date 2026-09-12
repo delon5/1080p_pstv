@@ -48,6 +48,15 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.5 (2026-09-12)** — **Fixes 1.6.4, which halved every game.** The
+  1.6.4 callback doubler was a kernel thread that waited on the display's
+  vblank every frame. The display driver wakes one waiter per vblank, in
+  queue order, so that thread and the game took turns: every game vblank
+  wait lasted two vblanks and every title ran at half rate (30 fps games
+  at 15, `frameskip` titles too, Tales of Hearts R at 15 under
+  `scale novsync`). The thread and the Unregister hook are gone;
+  `frameskip` is exactly the 1.6.3 rule again. Rule: no plugin thread may
+  ever wait on vblank. Only the kernel module changed.
 - **1.6.4 (2026-09-12)** — **`frameskip` now also covers games that pace on
   the vblank callback.** Under a 30 Hz head the display fires a game's
   registered vblank callback 30 times a second; a game whose logic counts those
@@ -464,7 +473,7 @@ PCSB01206    frameskip
 
 | Mode | Effect for that title |
 |---|---|
-| `frameskip` | At 30 Hz, every second vblank wait returns immediately, the vblank counter is reported doubled and (1.6.4) a registered vblank callback is fired twice per vblank: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
+| `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
 | `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |

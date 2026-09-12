@@ -218,8 +218,6 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
 #define HOOK_BIT_GETREFRESHRATE       (1u << 15)
 #define HOOK_BIT_ALLOCMEMBLOCK        (1u << 16)
 #define HOOK_BIT_GETFREEMEM           (1u << 17)
-#define HOOK_BIT_UNREGVBLANKCB        (1u << 18)
-#define NID_UNREGISTERVBLANKCB        0x98436A80u   /* sceDisplayUnregisterVblankStartCallback */
 
 #define SCE_ERRNO_EEXIST              ((int)0x80010011)
 
@@ -274,7 +272,6 @@ enum {
     PH_GETREFRESHRATE,
     PH_ALLOCMEMBLOCK,
     PH_GETFREEMEM,
-    PH_UNREGVBLANKCB,   /* 1.6.4 */
     PH_COUNT
 };
 static SceUID g_pacing_uid[PH_COUNT];
@@ -340,8 +337,6 @@ typedef struct {
     volatile uint32_t acc;          /* frameskip credit, units of 1/60 vblank */
     volatile SceInt64 last_sync_us; /* last vsync-related syscall entry/exit */
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
-    volatile SceUID   vblank_cb;    /* 1.6.4: that callback's UID (0 = none), doubled for frameskip titles */
-    volatile uint32_t cb_doubled;   /* logged once when doubling starts */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
@@ -763,8 +758,6 @@ static void proc_clear(void)
         g_procs[i].allowed = 0;
         g_procs[i].override = OVR_NONE;
         g_procs[i].flags = 0;
-        g_procs[i].vblank_cb = 0;
-        g_procs[i].cb_doubled = 0;
         g_procs[i].acc = 0;
         g_procs[i].last_sync_us = 0;
         g_procs[i].cb_synced = 0;
@@ -1061,8 +1054,6 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
     games_list_load(0);
     e->override = OVR_NONE;
     e->flags = 0;
-    e->vblank_cb = 0;
-    e->cb_doubled = 0;
     for (i = 0; i < g_games_count && i < GAMES_LIST_MAX; i++) {
         if (strncmp(e->title, g_games[i].title, TITLE_ID_LEN) == 0) {
             e->override = g_games[i].mode;
@@ -1734,68 +1725,7 @@ static int hook_RegisterVblankStartCallback(SceUID uid)
         e->cb_synced = 1;            /* this process syncs through a vblank callback: never inject */
     }
     ret = HOOK_NEXT(hook_RegisterVblankStartCallback, g_pacing_ref[PH_REGVBLANKCB], uid);
-    if (e && ret >= 0)
-        e->vblank_cb = uid;          /* 1.6.4: doubled at 30 Hz for "frameskip" titles */
     return ret;
-}
-
-static int hook_UnregisterVblankStartCallback(SceUID uid)
-{
-    SceUID pid = ksceKernelGetProcessId();
-    if (pid > 0 && pid != KERNEL_PID && pid != shell_pid_now()) {
-        proc_entry_t *e = proc_lookup(pid, 1);
-        if (e->vblank_cb == uid)
-            e->vblank_cb = 0;
-    }
-    return HOOK_NEXT(hook_UnregisterVblankStartCallback, g_pacing_ref[PH_UNREGVBLANKCB], uid);
-}
-
-/* 1.6.4 vblank-callback doubler.  A game that paces its logic on the display's
- * vblank callback (not on a wait call) sees 30 callbacks per second under a
- * 30 Hz head and runs at half speed; no wait hook can change that.  For
- * "frameskip" titles this thread fires the game's registered callback once
- * more half a period after every real vblank, so the game counts 60 a second,
- * exactly what the frameskip rule does for the wait calls and GetVcount.
- * Plain kernel thread, no I/O except a one-line log when it starts doubling. */
-static SceUID g_doubler_uid = -1;
-
-static int vblank_doubler_thread(SceSize args, void *argp)
-{
-    (void)args; (void)argp;
-    while (!g_thread_stop) {
-        uint32_t hz;
-        int i, any = 0;
-        if (ksceDisplayWaitVblankStart() < 0) {
-            ksceKernelDelayThread(16000);
-            continue;
-        }
-        hz = g_refresh_hz;
-        if (hz == 0 || hz >= 60)
-            continue;                       /* nothing to double at 60 Hz */
-        for (i = 0; i < PROC_ENTRIES; i++)
-            if (g_procs[i].pid > 0 && g_procs[i].vblank_cb != 0 && g_procs[i].override == OVR_FRAMESKIP)
-                any = 1;
-        if (!any)
-            continue;
-        ksceKernelDelayThread((1000000u / hz) / 2u);   /* half a 30 Hz period: 16.7 ms */
-        if (g_thread_stop)
-            break;
-        for (i = 0; i < PROC_ENTRIES; i++) {
-            proc_entry_t *e = &g_procs[i];
-            SceUID cb = e->vblank_cb;
-            if (e->pid <= 0 || cb == 0 || e->override != OVR_FRAMESKIP)
-                continue;
-            if (ksceKernelNotifyCallback(cb, 0) < 0) {
-                e->vblank_cb = 0;           /* gone (process exit / unregister): stop trying */
-                continue;
-            }
-            if (!e->cb_doubled) {
-                e->cb_doubled = 1;
-                klog("frameskip: %s paces on a vblank callback: firing it twice per %u Hz vblank", e->title, (unsigned)hz);
-            }
-        }
-    }
-    return 0;
 }
 
 /* v1.4 "spoof720": for the listed titles, the two display-information
@@ -2837,7 +2767,6 @@ static void install_hooks(void)
     install_pacing_hook(PH_GETVCOUNT,         NID_GETVCOUNT,              hook_GetVcount,              HOOK_BIT_GETVCOUNT,         "GetVcount");
     install_pacing_hook(PH_GETVCOUNTINT,      NID_GETVCOUNTINTERNAL,      hook_GetVcountInternal,      HOOK_BIT_GETVCOUNTINT,      "GetVcountInternal");
     install_pacing_hook(PH_REGVBLANKCB,       NID_REGISTERVBLANKCB,       hook_RegisterVblankStartCallback, HOOK_BIT_REGVBLANKCB,  "RegisterVblankStartCallback");
-    install_pacing_hook(PH_UNREGVBLANKCB,     NID_UNREGISTERVBLANKCB,     hook_UnregisterVblankStartCallback, HOOK_BIT_UNREGVBLANKCB, "UnregisterVblankStartCallback");
     install_pacing_hook(PH_GETMAXFBRES,       NID_GETMAXFBRES,            hook_GetMaximumFrameBufResolution, HOOK_BIT_GETMAXFBRES, "_sceDisplayGetMaximumFrameBufResolution");
     install_pacing_hook(PH_GETRESINFO,        NID_GETRESINFOINTERNAL,     hook_GetResolutionInfoInternal,    HOOK_BIT_GETRESINFO,  "_sceDisplayGetResolutionInfoInternal");
     install_pacing_hook(PH_GETREFRESHRATE,    NID_GETREFRESHRATE,         hook_GetRefreshRate,               HOOK_BIT_GETREFRESHRATE, "sceDisplayGetRefreshRate");
@@ -2955,17 +2884,11 @@ int module_start(SceSize argc, const void *args)
         klog("procevent: register -> 0x%08X", (unsigned)g_procevent_uid);
 
     g_thread_stop = 0;
-    /* 1.6.4: the vblank-callback doubler (high priority, tiny stack, no I/O
-     * on its hot path). */
-    g_doubler_uid = ksceKernelCreateThread("pstv1080p_vb", vblank_doubler_thread, 0x40, 0x1000, 0, 0, NULL);
-    if (g_doubler_uid >= 0) {
-        if (ksceKernelStartThread(g_doubler_uid, 0, NULL) < 0) {
-            ksceKernelDeleteThread(g_doubler_uid);
-            g_doubler_uid = -1;
-        }
-    }
-    if (g_doubler_uid < 0)
-        klog("thread: vblank doubler unavailable (0x%08X): callback-paced frameskip titles stay at half speed", (unsigned)g_doubler_uid);
+    /* 1.6.5: NO plugin thread may ever wait on the display's vblank.  The
+     * driver wakes one waiter per vblank in queue order, so a kernel thread
+     * looping on ksceDisplayWaitVblankStart (the 1.6.4 callback doubler)
+     * alternated with the game: every game wait took two vblanks and every
+     * title ran at half rate (30 fps games at 15, frameskip titles too). */
     g_thread_uid = ksceKernelCreateThread("pstv1080p", pstv1080p_thread, 0x10000100, 0x2000, 0, 0, NULL);
     if (g_thread_uid >= 0) {
         int r = ksceKernelStartThread(g_thread_uid, 0, NULL);
@@ -2992,12 +2915,6 @@ int module_stop(SceSize argc, const void *args)
         ksceKernelWaitThreadEnd(g_thread_uid, NULL, &timeout);
         ksceKernelDeleteThread(g_thread_uid);
         g_thread_uid = -1;
-    }
-    if (g_doubler_uid >= 0) {
-        SceUInt timeout = 1000u * 1000u;
-        ksceKernelWaitThreadEnd(g_doubler_uid, NULL, &timeout);
-        ksceKernelDeleteThread(g_doubler_uid);
-        g_doubler_uid = -1;
     }
 
     release_hooks();

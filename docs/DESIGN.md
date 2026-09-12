@@ -230,3 +230,15 @@ not `none`. Titles present in the file but not installed are kept as
 -mfpu=neon`) and needs `SceSharedFb` (a library of the SceAppMgr module whose
 stub the SDK snapshot lacks: the Makefile generates it from the NID database
 into build/stubs_appmgr as a regenerated libSceAppMgr_stub.a) and `sceAppMgrGetBudgetInfo` (SceDriverUser).
+
+## P. 1.6.4 callback doubler — REMOVED in 1.6.5
+
+1.6.4 added a kernel thread that looped on `ksceDisplayWaitVblankStart()` and,
+half a period after each vblank, fired the vblank callback of `frameskip`
+titles a second time. On hardware every title then ran at half rate
+(30 fps games at 15, `frameskip` titles at 15). The display driver wakes ONE
+vblank waiter per vblank in queue order: the plugin thread and the game
+thread alternated, so each game wait took two vblanks. Rule, alongside the
+1.5.1 lesson: no plugin thread may ever wait on the display's vblank; every
+vblank wait the plugin issues happens on the game's own thread, inside a
+hook, on that game's behalf.
