@@ -555,7 +555,15 @@ with the two `config.txt` lines.
   and wants `frameskip novsync` rather than `nowait`. A game without a limiter
   (Bloodstained: Curse of the Moon) free-runs and obviously so within seconds,
   and that kind needs plain `frameskip`. Three launches per title at most, and
-  it replaces guessing. Bloodstained: Curse of the Moon (`PCSE01262`)
+  it replaces guessing.
+
+- **What `frameskip` costs depends on the game's intended rate.** For a 30 fps
+  game it is free: Persona 4 Golden asks for two vblanks per frame, gets one
+  real wait at 30 Hz, and renders thirty frames into thirty display slots, so
+  the speed is right and there are no artifacts. For a 60 fps game it is not:
+  Curse of the Moon takes sixty logic steps and renders sixty frames into
+  thirty slots, so the speed is right and the picture tears. That is a limit
+  of the output rate, not of the rule. Bloodstained: Curse of the Moon (`PCSE01262`)
   runs far too fast on `nowait`: it has no limiter of its own, so with every
   vblank wait removed it free-runs. A 60 fps game like that wants `frameskip`,
   which keeps its 60 logic frames while showing every second one. Note that every per-game result recorded before
