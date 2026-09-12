@@ -1662,6 +1662,12 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
+    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
+        vcount = flip_debt_take(e, vcount);
+        if (vcount == 0) {
+            return 0;
+        }
+    }
     ret = HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1684,6 +1690,13 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
+    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
+        vcount = flip_debt_take(e, vcount);
+        if (vcount == 0) {
+            ksceKernelCheckCallback();
+            return 0;
+        }
+    }
     ret = HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1696,8 +1709,13 @@ static int hook_WaitVblankStart(void)
     PF_INC(e, PF_WAITVB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode == PACE_FRAMESKIP) {
-        unsigned int w = frameskip_count(e, 1);
+    if (pc.mode != PSTV1080P_FPS_OFF) {
+        unsigned int w = 1;                     /* SCALE: a 1-vblank request stays 1 */
+        if (pc.mode == PACE_FRAMESKIP)
+            w = frameskip_count(e, 1);
+        else if (pc.mode == PSTV1080P_FPS_FORCE)
+            w = force_interval();
+        w = flip_debt_take(e, w);               /* 1.6.7: the flip already waited */
         if (w == 0)
             return 0;
         if (w > 1) {
@@ -1705,15 +1723,7 @@ static int hook_WaitVblankStart(void)
             proc_mark_sync(e);
             return ret;
         }
-    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
-        unsigned int interval = force_interval();
-        if (interval > 1) {
-            ret = ksceDisplayWaitVblankStartMulti(interval);
-            proc_mark_sync(e);
-            return ret;
-        }
     }
-    /* SCALE: a 1-vblank request stays 1 -> pass through. */
     ret = HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
     proc_mark_sync(e);
     return ret;
@@ -1728,19 +1738,19 @@ static int hook_WaitVblankStartCB(void)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode == PACE_FRAMESKIP) {
-        unsigned int w = frameskip_count(e, 1);
-        if (w == 0)
+    if (pc.mode != PSTV1080P_FPS_OFF) {
+        unsigned int w = 1;                     /* SCALE: a 1-vblank request stays 1 */
+        if (pc.mode == PACE_FRAMESKIP)
+            w = frameskip_count(e, 1);
+        else if (pc.mode == PSTV1080P_FPS_FORCE)
+            w = force_interval();
+        w = flip_debt_take(e, w);               /* 1.6.7: the flip already waited */
+        if (w == 0) {
+            ksceKernelCheckCallback();
             return 0;
+        }
         if (w > 1) {
             ret = ksceDisplayWaitVblankStartMultiCB(w);
-            proc_mark_sync(e);
-            return ret;
-        }
-    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
-        unsigned int interval = force_interval();
-        if (interval > 1) {
-            ret = ksceDisplayWaitVblankStartMultiCB(interval);
             proc_mark_sync(e);
             return ret;
         }
@@ -1765,6 +1775,12 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
+    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
+        vcount = flip_debt_take(e, vcount);
+        if (vcount == 0) {
+            return 0;
+        }
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1787,6 +1803,13 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
+    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
+        vcount = flip_debt_take(e, vcount);
+        if (vcount == 0) {
+            ksceKernelCheckCallback();
+            return 0;
+        }
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1803,6 +1826,8 @@ static int hook_WaitSetFrameBuf(void)
         return 0;
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
+    if (pc.mode != PSTV1080P_FPS_OFF && flip_debt_take(e, 1) == 0)
+        return 0;                               /* 1.6.7: the flip already waited */
     ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
     proc_mark_sync(e);
     return ret;
@@ -1819,6 +1844,10 @@ static int hook_WaitSetFrameBufCB(void)
     }
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
+    if (pc.mode != PSTV1080P_FPS_OFF && flip_debt_take(e, 1) == 0) {
+        ksceKernelCheckCallback();              /* 1.6.7: the flip already waited */
+        return 0;
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
     proc_mark_sync(e);
     return ret;
