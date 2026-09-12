@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.5"
+#define APP_VERSION      "1.6.6"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -136,6 +136,9 @@ typedef struct {
     int  orig_novsync;
     int  installed;
     int  from_file;        /* this title had a line in the file (first line wins, like the kernel) */
+    int  file_order;       /* 1.6.6: 1-based position of its line in the file (0 = not from the file) */
+    int  note_off;         /* 1.6.6: the comment lines that sat right above its line, kept in */
+    int  note_len;         /*        g_comments[note_off .. note_off+note_len), written back above it */
 } game_t;
 
 static const char k_novsync_desc[] =
@@ -143,8 +146,11 @@ static const char k_novsync_desc[] =
 
 static game_t g_games[MAX_GAMES];
 static int g_ngames;
-static char g_comments[COMMENTS_LEN];   /* '#' and unparsable lines, kept verbatim */
+static char g_comments[COMMENTS_LEN];   /* '#' and unparsable lines, kept verbatim, in file order */
+static int g_comments_len;
 static int g_comments_lost;             /* a kept line did not fit: saving would lose it */
+static int g_trail_off, g_trail_len;    /* 1.6.6: comment lines after the last entry */
+static int g_file_entries;              /* entries seen in the file (file_order counter) */
 static int g_file_present;
 static int g_load_failed;               /* file unreadable or larger than the kernel buffer: saving disabled */
 
@@ -157,6 +163,11 @@ static int g_kernel_old;          /* module loaded but older than 1.6.1: it lack
 static char g_status[160];
 static unsigned g_status_color = C_DIM;
 static int g_status_frames;
+static int g_sel = 0, g_top = 0;         /* list selection (used by the post-save reload too) */
+static void load_everything(void);
+/* 1.6.6: an active Framecapper / novsync line in taiHEN's config.txt double-
+ * caps every game together with pstv1080p; shown permanently until fixed. */
+static char g_warn[200];
 
 static void set_status(unsigned color, const char *fmt, ...)
 {
@@ -251,7 +262,7 @@ static game_t *add_game(const char *id)
  * entries.  Never overflows; a line that does not fit disables saving. */
 static void comments_append2(const char *prefix, const char *s, int len)
 {
-    int cur = (int)strlen(g_comments);
+    int cur = g_comments_len;
     int plen = prefix ? (int)strlen(prefix) : 0;
     if (cur + plen + len + 2 >= (int)COMMENTS_LEN) {
         g_comments_lost = 1;
@@ -262,6 +273,15 @@ static void comments_append2(const char *prefix, const char *s, int len)
     memcpy(g_comments + cur + plen, s, (size_t)len);
     g_comments[cur + plen + len] = '\n';
     g_comments[cur + plen + len + 1] = 0;
+    g_comments_len = cur + plen + len + 1;
+}
+
+/* Our own header lines are regenerated on every save: never keep them. */
+static int is_own_header(const char *s, int len)
+{
+    return (len >= 31 && strncmp(s, "# pstv1080p per-title overrides", 31) == 0) ||
+           (len >= 8  && strncmp(s, "# modes:", 8) == 0) ||
+           (len >= 35 && strncmp(s, "# written by pstv1080p Configurator", 35) == 0);
 }
 
 static void comments_append(const char *s, int len)
@@ -275,7 +295,10 @@ static void load_games_file(void)
     int n, i, start;
 
     g_comments[0] = 0;
+    g_comments_len = 0;
     g_comments_lost = 0;
+    g_trail_off = g_trail_len = 0;
+    g_file_entries = 0;
     g_load_failed = 0;
     n = pstv1080pReadGames(buf, sizeof(buf));
     if (n < 0) {
@@ -290,6 +313,9 @@ static void load_games_file(void)
     g_file_present = n > 0;
     buf[n] = 0;
 
+    /* 1.6.6: comment lines stay with the entry they sit above.  Lines are
+     * kept in g_comments in file order; "pend" marks where the block that
+     * belongs to the NEXT entry starts. */
     start = 0;
     for (i = 0; i <= n; i++) {
         if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == 0) {
@@ -300,7 +326,8 @@ static void load_games_file(void)
             if (s0 >= e)
                 continue;
             if (buf[s0] == '#') {
-                comments_append(buf + s0, e - s0);
+                if (!is_own_header(buf + s0, e - s0))
+                    comments_append(buf + s0, e - s0);
                 continue;
             }
             t_end = s0;
@@ -338,6 +365,10 @@ static void load_games_file(void)
                 if (!g)
                     continue;
                 g->from_file = 1;
+                g->file_order = ++g_file_entries;
+                g->note_off = g_trail_off;              /* the block pending since the last entry */
+                g->note_len = g_comments_len - g_trail_off;
+                g_trail_off = g_comments_len;
                 g->mode = mode;
                 g->orig_mode = mode;
                 /* Everything after the option is kept and written back on the
@@ -356,10 +387,34 @@ static void load_games_file(void)
             }
         }
     }
+    g_trail_len = g_comments_len - g_trail_off;     /* comments after the last entry */
     if (g_comments_lost) {
         g_load_failed = 1;
         set_status(C_ERR, "pstv1080p_games.txt has more comment text than fits: edit it by hand (saving here is off)");
     }
+}
+
+/* Save order: the file's own entries in their original order, then the
+ * ones added in the app (list order). */
+static int cmp_save_order(const void *a, const void *b)
+{
+    const game_t *ga = *(const game_t *const *)a, *gb = *(const game_t *const *)b;
+    int oa = ga->file_order ? ga->file_order : 0x7FFFFFFF;
+    int ob = gb->file_order ? gb->file_order : 0x7FFFFFFF;
+    if (oa != ob)
+        return oa < ob ? -1 : 1;
+    return (int)(ga - gb);
+}
+
+/* Append len bytes; 0 if they do not fit. */
+static int out_put(char *buf, int cap, int *pos, const char *src, int len)
+{
+    if (*pos + len + 1 >= cap)
+        return 0;
+    memcpy(buf + *pos, src, (size_t)len);
+    *pos += len;
+    buf[*pos] = 0;
+    return 1;
 }
 
 static int save_games_file(void)
@@ -383,46 +438,47 @@ static int save_games_file(void)
                     "# pstv1080p per-title overrides: \"TITLEID mode\" per line\n"
                     "# modes: frameskip nowait off inject force scale spoof720 trace\n"
                     "# written by pstv1080p Configurator " APP_VERSION "\n");
-    if (g_comments[0]) {
-        /* Drop our own header lines from an earlier save; keep the user's. */
-        const char *p = g_comments;
-        while (*p) {
-            const char *nl = strchr(p, '\n');
-            int len = nl ? (int)(nl - p) : (int)strlen(p);
-            if (strncmp(p, "# pstv1080p per-title overrides", 31) != 0 &&
-                strncmp(p, "# modes:", 8) != 0 &&
-                strncmp(p, "# written by pstv1080p Configurator", 35) != 0) {
-                if (pos + len + 2 >= (int)sizeof(buf)) {
-                    set_status(C_ERR, "Comments and overrides do not fit in one file: nothing saved");
-                    return -1;
-                }
-                memcpy(buf + pos, p, (size_t)len);
-                pos += len;
-                buf[pos++] = '\n';
+    {
+        static const game_t *order[MAX_GAMES];
+        int n_order = 0;
+        for (i = 0; i < g_ngames; i++)
+            if (game_active(&g_games[i]))
+                order[n_order++] = &g_games[i];
+        qsort(order, (size_t)n_order, sizeof(order[0]), cmp_save_order);
+
+        for (i = 0; i < n_order; i++) {
+            const game_t *g = order[i];
+            char line[9 + 1 + 12 + 8 + TAIL_LEN + 4];
+            int n = 0, ok;
+            /* 1.6.6: the comment lines that sat above this entry go back above
+             * it; an entry added here gets the game's name as its comment. */
+            if (g->note_len > 0) {
+                ok = out_put(buf, (int)sizeof(buf), &pos, g_comments + g->note_off, g->note_len);
+            } else if (g->installed && g->name[0]) {
+                char c[NAME_LEN + 4];
+                int cl = snprintf(c, sizeof(c), "# %s\n", g->name);
+                ok = out_put(buf, (int)sizeof(buf), &pos, c, cl);
+            } else {
+                ok = 1;
             }
-            if (!nl) break;
-            p = nl + 1;
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s", g->id);
+            if (g->mode != M_NONE)
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_mode_name[g->mode]);
+            if (g->novsync)
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " novsync");
+            if (g->tail[0])
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", g->tail);
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "\n");
+            if (!ok || !out_put(buf, (int)sizeof(buf), &pos, line, n)) {
+                set_status(C_ERR, "Comments and overrides do not fit in one file (limit reached after %d): nothing saved", count);
+                return -1;
+            }
+            count++;
         }
-    }
-    for (i = 0; i < g_ngames; i++) {
-        const game_t *g = &g_games[i];
-        char line[9 + 1 + 12 + 8 + TAIL_LEN + 4];
-        int n = 0;
-        if (!game_active(g))
-            continue;
-        n += snprintf(line + n, sizeof(line) - (size_t)n, "%s", g->id);
-        if (g->mode != M_NONE)
-            n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_mode_name[g->mode]);
-        if (g->novsync)
-            n += snprintf(line + n, sizeof(line) - (size_t)n, " novsync");
-        if (g->tail[0])
-            n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", g->tail);
-        if (pos + n + 2 >= (int)sizeof(buf)) {
-            set_status(C_ERR, "Too many overrides for one file (limit reached after %d): nothing saved", count);
+        if (g_trail_len > 0 && !out_put(buf, (int)sizeof(buf), &pos, g_comments + g_trail_off, g_trail_len)) {
+            set_status(C_ERR, "Comments and overrides do not fit in one file: nothing saved");
             return -1;
         }
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "%s\n", line);
-        count++;
     }
     buf[pos] = 0;
 
@@ -436,6 +492,13 @@ static int save_games_file(void)
         g_games[i].orig_novsync = g_games[i].novsync;
     }
     g_file_present = 1;
+    /* Re-read what is on disk so the comment blocks and the file order of
+     * the next save match it (an entry added here now has a file position). */
+    {
+        int keep_sel = g_sel;
+        load_everything();
+        g_sel = keep_sel < g_ngames ? keep_sel : (g_ngames ? g_ngames - 1 : 0);
+    }
     set_status(C_OK, "Saved %d override(s) to ur0:data/pstv1080p/pstv1080p_games.txt", count);
     return 0;
 }
@@ -676,8 +739,64 @@ static void draw_footer(const char *hints)
     text(COL_NAME_X, SCREEN_H - 13, C_DIM, hints);
 }
 
+/* 1.6.6: taiHEN uses ux0:tai/config.txt when it exists, else ur0:tai/config.txt.
+ * An active (uncommented) Framecapper*.suprx or novsync.suprx line makes that
+ * plugin pace the same games as pstv1080p: every wait doubles (30 fps games at
+ * 15, 60 fps games at half speed).  The kernel module steps aside in such a
+ * process, so the per-game rules set here do nothing there: say so on screen. */
+static void check_taihen_config(void)
+{
+    static char buf[16384];
+    static const char *paths[] = { "ux0:tai/config.txt", "ur0:tai/config.txt" };
+    char section[48] = "(top)";
+    int fd = -1, n, i, start;
+    const char *used = NULL;
+
+    g_warn[0] = 0;
+    for (i = 0; i < 2 && fd < 0; i++) {
+        fd = sceIoOpen(paths[i], SCE_O_RDONLY, 0);
+        if (fd >= 0)
+            used = paths[i];
+    }
+    if (fd < 0)
+        return;
+    n = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    if (n <= 0)
+        return;
+    buf[n] = 0;
+    start = 0;
+    for (i = 0; i <= n; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r' || buf[i] == 0) {
+            int s0 = start, e = i, k;
+            start = i + 1;
+            while (s0 < e && (buf[s0] == ' ' || buf[s0] == '\t')) s0++;
+            while (e > s0 && (buf[e - 1] == ' ' || buf[e - 1] == '\t')) e--;
+            if (s0 >= e || buf[s0] == '#')
+                continue;
+            if (buf[s0] == '*') {
+                int l = e - s0 < (int)sizeof(section) - 1 ? e - s0 : (int)sizeof(section) - 1;
+                memcpy(section, buf + s0, (size_t)l);
+                section[l] = 0;
+                continue;
+            }
+            for (k = s0; k + 11 <= e; k++) {
+                if (strncasecmp(buf + k, "framecapper", 11) == 0 || strncasecmp(buf + k, "novsync.sup", 11) == 0) {
+                    const char *slash = buf + e;
+                    while (slash > buf + s0 && slash[-1] != '/' && slash[-1] != ':') slash--;
+                    snprintf(g_warn, sizeof(g_warn), "%s: %.*s is active under %s - it double-caps; pstv1080p steps aside there. Comment it out.",
+                             used, (int)(buf + e - slash), slash, section);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void draw_status(void)
 {
+    if (!(g_status_frames > 0 && g_status[0]) && g_warn[0])
+        text(COL_NAME_X, SCREEN_H - 50, C_ERR, g_warn);
     if (g_status_frames > 0 && g_status[0]) {
         text(COL_NAME_X, SCREEN_H - 50, g_status_color, g_status);
         g_status_frames--;
@@ -691,7 +810,6 @@ static void draw_status(void)
 enum { SCR_GAMES = 0, SCR_SETTINGS, SCR_MODEPICK, SCR_CONFIRM_EXIT, SCR_HELP, SCR_NOKERNEL };
 
 static int g_screen = SCR_GAMES;
-static int g_sel = 0, g_top = 0;
 static int g_pick_sel = 0;
 static int g_set_sel = 0;
 
@@ -1050,6 +1168,7 @@ int main(int argc, char *argv[])
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
 
     refresh_kernel();
+    check_taihen_config();
     if (g_kernel_ok) {
         load_everything();
         if (!g_file_present && !g_load_failed)

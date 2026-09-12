@@ -338,6 +338,7 @@ typedef struct {
     volatile SceInt64 last_sync_us; /* last vsync-related syscall entry/exit */
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
+    volatile SceInt64 checked_us;   /* 1.6.6: last title re-check on the hit path */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -598,7 +599,7 @@ static void config_defaults(pstv1080p_config_t *c)
     c->hd_mode_code        = PSTV1080P_MODE_1080P30;
     c->settings_item_value = 3;
     c->fps_mode            = PSTV1080P_FPS_SCALE;
-    c->fps_target          = 30;
+    c->fps_target          = 60;    /* 1.6.6: Framecapper60 semantics by default (one vblank per wait at 30 Hz) */
     c->fps_inject          = 1;     /* AUTO: inject only for games that do not vsync themselves */
     c->safe_boot_seconds   = 120;
     c->boot_apply_delay_ms = 3000;
@@ -697,6 +698,8 @@ static int config_save(void)
     return 0;
 }
 
+static int g_target_fixed = 0;
+
 static void config_load(void)
 {
     pstv1080p_config_t tmp;
@@ -714,10 +717,20 @@ static void config_load(void)
     ret = ksceIoRead(fd, &tmp, sizeof(tmp));
     ksceIoClose(fd);
 
+    /* 1.6.6: the FORCE target default became 60 (Framecapper60 semantics: one
+     * vblank per wait at 30 Hz).  A state file still carrying the old default
+     * 30 is corrected in place and written back once; 20 is a deliberate
+     * choice and is kept.  The file version is NOT bumped for this: every
+     * other version is rejected by config_valid and would reset the console. */
+    if (ret == (int)sizeof(tmp) && tmp.magic == PSTV1080P_CFG_MAGIC && tmp.fps_target == 30u) {
+        tmp.fps_target = 60u;
+        g_target_fixed = 1;
+    }
+
     /* v1.3: a state file written by 1.0/1.1 (version 1) predates the adaptive
      * inject default; migrate it once to version 2 with fps_inject = AUTO. */
     if (ret == (int)sizeof(tmp) && tmp.magic == PSTV1080P_CFG_MAGIC && tmp.version == 1u) {
-        tmp.version = PSTV1080P_CFG_VERSION;
+        tmp.version = 2u;
         tmp.fps_inject = 1u;
         klog("config: migrated state file v1 -> v%u (fps_inject=1 AUTO)", (unsigned)PSTV1080P_CFG_VERSION);
         if (config_valid(&tmp)) {
@@ -737,8 +750,11 @@ static void config_load(void)
     /* v1.5.2: a state file carrying a mode the hardware cannot deliver (1.5.1
      * shipped one console a 0x8700 file) is repaired here and written back, so
      * the boot apply cannot spend its whole budget on a mode that always fails. */
-    if (hd_mode_repair(&g_cfg, "state file"))
+    if (hd_mode_repair(&g_cfg, "state file") || g_target_fixed) {
+        if (g_target_fixed)
+            klog("config: FORCE target 30 -> 60 (1.6.6 default: one vblank per wait at 30 Hz)");
         config_save();
+    }
     klog("config: loaded mode_1080p=%u hd_mode=0x%04X item=%u fps_mode=%u target=%u inject=%u safe=%us delay=%ums wd=%ums",
          (unsigned)g_cfg.mode_1080p, (unsigned)g_cfg.hd_mode_code, (unsigned)g_cfg.settings_item_value,
          (unsigned)g_cfg.fps_mode, (unsigned)g_cfg.fps_target, (unsigned)g_cfg.fps_inject,
@@ -762,6 +778,7 @@ static void proc_clear(void)
         g_procs[i].last_sync_us = 0;
         g_procs[i].cb_synced = 0;
         g_procs[i].created_us = 0;
+        g_procs[i].checked_us = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -1034,6 +1051,11 @@ static int trace_configured(void)
 }
 
 /* Fill a fresh per-process entry: title id, FORCE-filter verdict, override. */
+/* Fill a fresh per-process entry: title id, FORCE-filter verdict, override.
+ * Runs inside the FIRST display syscall of a process, holding g_tbl_mutex.
+ * Keep it to the sysroot title call, the override lists and one log line:
+ * 1.6.6 briefly queried the display driver and taiHEN's module list here and
+ * games stopped being resolved at all (no "process:" line, no pacing). */
 static void proc_resolve(proc_entry_t *e, SceUID pid)
 {
     uint32_t i;
@@ -1065,9 +1087,9 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
      * are noise for the user; they still show up in verbose mode). */
     if (g_verbose || (pid != g_shell_pid && strncmp(e->title, "NPXS", 4) != 0)) {
         char d[48];
-        klog("process: pid=0x%08X title=%s override=%s%s", (unsigned)pid,
+        klog("process: pid=0x%08X title=%s override=%s%s hz=%u", (unsigned)pid,
              e->title[0] ? e->title : "?", ovr_desc(e->override, e->flags, d, sizeof(d)),
-             (pid == g_shell_pid) ? " (shell, never paced)" : "");
+             (pid == g_shell_pid) ? " (shell, never paced)" : "", (unsigned)g_refresh_hz);
     }
 }
 
@@ -1293,14 +1315,45 @@ static const SceProcEventHandler g_procevent_handler = {
  * publishes the pid.  A pid never has two entries, so cb_synced / acc /
  * override cannot be split across slots, and a live game is not pushed out
  * by newly started background processes. */
+#define PROC_RECHECK_US               (3000000LL)   /* 1.6.6: title re-check period on the hit path */
+
 static proc_entry_t *proc_lookup(SceUID pid, int create)
 {
     uint32_t i, slot;
     proc_entry_t *e;
     SceInt64 oldest = 0;
     for (i = 0; i < PROC_ENTRIES; i++) {
-        if (g_procs[i].pid == pid)
-            return &g_procs[i];
+        if (g_procs[i].pid == pid) {
+            e = &g_procs[i];
+            if (create) {
+                /* 1.6.6: a pid can be reused by a new process before any
+                 * lifecycle event dropped the old entry (or if that handler
+                 * is not installed).  Every few seconds compare the title the
+                 * kernel reports with the one stored; on a mismatch resolve
+                 * the entry again.  One sysroot call per 3 s per process. */
+                SceInt64 now = now_us();
+                if (now - e->checked_us > PROC_RECHECK_US) {
+                    char t[TITLE_ID_LEN];
+                    e->checked_us = now;
+                    memset(t, 0, sizeof(t));
+                    if (ksceKernelSysrootGetProcessTitleId(pid, t, TITLE_ID_LEN - 1) >= 0
+                        && strncmp(t, e->title, TITLE_ID_LEN) != 0) {
+                        tbl_lock();
+                        if (e->pid == pid) {
+                            e->pid = 0;
+                            e->acc = 0;
+                            e->last_sync_us = 0;
+                            e->cb_synced = 0;
+                            e->created_us = now;
+                            proc_resolve(e, pid);
+                            e->pid = pid;
+                        }
+                        tbl_unlock();
+                    }
+                }
+            }
+            return e;
+        }
     }
     if (!create)
         return NULL;
@@ -1333,6 +1386,7 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
     e->last_sync_us = 0;
     e->cb_synced = 0;
     e->created_us = now_us();
+    e->checked_us = e->created_us;
     proc_resolve(e, pid);
     e->pid = pid;
     tbl_unlock();
@@ -2015,8 +2069,17 @@ static int hook_HdmiSetResolution(int mode, int known, int flag)
         g_last_sys_setres_us = now_us();
         g_last_native_us = g_last_sys_setres_us;
         klog("avconfig: native request 0x%04X from Settings (known=%d) ret=0x%08X", (unsigned)mode, known, (unsigned)ret);
-        if (ret >= 0)
+        if (ret >= 0) {
             record_applied((uint32_t)mode, 1);
+            /* 1.6.6: the user chose our entry through Sony's own code: that is
+             * "1080p on" for the boot apply and the watchdog, whatever the
+             * Settings plugin's registry hook managed to record. */
+            if (!g_cfg.mode_1080p) {
+                g_cfg.mode_1080p = 1;
+                config_save();
+                klog("avconfig: native 1080p selection recorded (mode_1080p=1)");
+            }
+        }
         return ret;
     }
 
@@ -2369,17 +2432,33 @@ static void watchdog_tick(void)
     int gret;
 
     lock();
-    if (!g_cfg.mode_1080p || g_cfg.watchdog_period_ms == 0) {
+    if (g_cfg.watchdog_period_ms == 0) {
         unlock();
         return;
     }
 
+    /* 1.6.6: the refresh-rate cache is corrected here no matter who changed
+     * the output (Sony's Settings code through the native entry, an HDMI
+     * re-plug, a late readback after our own apply).  Hardware finding: with
+     * mode_1080p == 0 (the 1.5.1 safe-boot revert left it so) and 1080p30
+     * selected through the native entry, the cache stayed at 60 Hz for the
+     * whole session and every rule was an identity: 30 fps games at 15,
+     * frameskip titles at half speed. */
     gret = ksceDisplayGetOutputMode(HDMI_HEAD, &cur, &pf);
     if (gret >= 0) {
-        if (cur != g_current_output_mode) {
-            klog("watchdog: output mode changed 0x%04X -> 0x%04X", (unsigned)g_current_output_mode, cur);
+        uint32_t want = (g_hd_alias != 0 && cur == g_hd_alias) ? refresh_from_mode(g_cfg.hd_mode_code)
+                                                               : refresh_from_mode(cur);
+        if (cur != g_current_output_mode || g_refresh_hz != want) {
+            klog("watchdog: driver reports 0x%04X (cache 0x%04X, %u Hz): refresh cache updated",
+                 cur, (unsigned)g_current_output_mode, (unsigned)g_refresh_hz);
             refresh_display_cache(1);
         }
+    }
+    if (!g_cfg.mode_1080p) {
+        unlock();
+        return;
+    }
+    if (gret >= 0) {
         if (hd_in_effect(cur)) {
             if (g_apply_attempts != 0 || g_apply_pending) {
                 klog("watchdog: HD mode in effect (0x%04X)", cur);

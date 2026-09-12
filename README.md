@@ -48,15 +48,36 @@ for how they differ.
 
 ## Changelog
 
-- **1.6.5 (2026-09-12)** — **Fixes 1.6.4, which halved every game.** The
-  1.6.4 callback doubler was a kernel thread that waited on the display's
-  vblank every frame. The display driver wakes one waiter per vblank, in
-  queue order, so that thread and the game took turns: every game vblank
-  wait lasted two vblanks and every title ran at half rate (30 fps games
-  at 15, `frameskip` titles too, Tales of Hearts R at 15 under
-  `scale novsync`). The thread and the Unregister hook are gone;
-  `frameskip` is exactly the 1.6.3 rule again. Rule: no plugin thread may
-  ever wait on vblank. Only the kernel module changed.
+- **1.6.6 (2026-09-12)** — **Per-game rules reach games again, `force` target
+  is 60.** Two fixes and one regression of my own. (1) The per-process entry
+  is resolved inside the *first display syscall* of a game, so that code must
+  stay minimal: an interim 1.6.6 build queried the display driver and taiHEN's
+  module list there and games were never resolved at all (hardware log:
+  `proc: create` for the title, then no `process:` line and no pacing). Both
+  calls are gone; the resolve is what it was in 1.6.3 plus the current refresh
+  rate in its log line. (2) The cached refresh rate that every rule divides by
+  was corrected only by the watchdog, and the watchdog returned immediately
+  while the plugin's "1080p on" flag was 0 — which the 1.5.1 safe-boot revert
+  had left it, with 1080p coming from the native Settings entry instead. The
+  cache then stayed at 60 Hz for the whole session and `scale` and `frameskip`
+  are identities at 60 Hz. Now the watchdog corrects the cache whatever that
+  flag says, a native 1080p selection sets the flag, and a process entry
+  re-checks its title every 3 s so a reused pid cannot keep another game's
+  rules. (3) The FORCE target now defaults to 60 (Framecapper60 semantics: one
+  vblank per wait at 30 Hz, no cap at 60 Hz), and a state file still at 30 is
+  corrected in place on load — the file version is deliberately NOT bumped,
+  since `config_valid` rejects every other version and that would reset a
+  working console. `force inject` is now exactly Framecapper60Inject.
+  (4) Configurator: comment lines stay above the entry they belonged to
+  instead of being collected at the top, entries the app adds get the game's
+  name above them, and an active Framecapper or novsync line in taiHEN's
+  config.txt (`ux0:tai` first, then `ur0:tai`) is reported in red — those
+  plugins pace the same waits and would double-cap.
+- **1.6.5 (2026-09-12)** — Removes the 1.6.4 callback-doubler kernel thread
+  (a plugin thread waiting on vblank has no business in the display's wait
+  queue) and the Unregister hook; `frameskip` is the 1.6.3 rule again. Its
+  release note blamed that thread for the half-rate reports; 1.6.6 found the
+  real cause (Framecapper stacking). Only the kernel module changed.
 - **1.6.4 (2026-09-12)** — **`frameskip` now also covers games that pace on
   the vblank callback.** Under a 30 Hz head the display fires a game's
   registered vblank callback 30 times a second; a game whose logic counts those
@@ -477,7 +498,7 @@ PCSB01206    frameskip
 | `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
-| `force` | Framecapper-style fixed target (`fps_target`) for this title regardless of the global mode. |
+| `force` | Framecapper-style fixed target (`fps_target`, default 60 since 1.6.6) for this title regardless of the global mode. With `inject` added this is exactly Framecapper60Inject: one vblank per wait and one after every flip at 30 Hz. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
 | `trace` | Diagnostic only: logs the title's process lifecycle, every memory block allocation with its result, free-memory queries and (1.6.2) a display-call profile every 5 s to `pstv1080p.log` (debug logging must be on). Slows that game's start-up slightly. Remove the line when done. |
 | `novsync` | Switch that attaches to any option (or stands alone): every flip is made immediate (`SCE_DISPLAY_SETBUF_IMMEDIATE`), which is what `novsync.suprx` does; alone it also returns every vblank wait at once. For games that throttle themselves through the flip rather than through a wait call, which no other option can reach. **Also the fix for Tales of Hearts R (PCSE00429)**, which crashed with C2-12828-1 before its first frame under any 1080-line head: with `novsync` it starts and runs. The old `novsync.suprx` + `Framecapper60Inject.suprx` pair = `nowait novsync inject`. |
@@ -524,8 +545,10 @@ VitaShell).
 
 A `*` after an override marks an unsaved change. Titles that have an entry in
 the file but are not installed are listed at the end as "(not installed)" so
-their lines are preserved. Comment lines you wrote in the file by hand are
-kept; the app only rewrites the `TITLEID mode` lines. The header shows the
+their lines are preserved. Comment lines you wrote in the file by hand stay
+above the entry they were above (1.6.6); an entry the app adds gets the game's
+name written above it. If taiHEN's config.txt still loads a Framecapper or
+novsync plugin, a red line at the bottom names it (1.6.6). The header shows the
 plugin version, whether 1080p is on and the current output mode; if the
 kernel module is not loaded the app says so and does nothing else.
 
@@ -765,7 +788,7 @@ validation, defaults are used and `mode_1080p` is 0.
 | 0x0C | `hd_mode_code` | u32 | `0x8710` | SceDisplay screen-mode code applied when `mode_1080p` = 1. `0x8710` = 1080p30 (the one that works). Advanced/experimental: `0x8720` = 1080p24 (untested), `0x8700` = 1080p60 (expected to fail). Must have bit 0x8000 set and a resolution field in 0x300..0x700. |
 | 0x10 | `settings_item_value` | u32 | 3 | the `value="N"` number of the injected `list_item`. The Settings plugin bumps it to the smallest free number ≥ 3 if Sony's list already uses it (allowed range 1..255). |
 | 0x14 | `fps_mode` | u32 | 1 | 0 = OFF, 1 = SCALE, 2 = FORCE (see [frame-pacing model](#frame-pacing-model)) |
-| 0x18 | `fps_target` | u32 | 30 | FORCE mode target fps: 20, 30 or 60 |
+| 0x18 | `fps_target` | u32 | 60 | FORCE mode target fps: 20, 30 or 60 (default 30 before 1.6.6; a state file still at 30 is corrected to 60 once on load, without a version change) |
 | 0x1C | `fps_inject` | u32 | 1 | 0 = off. 1 = AUTO (default): after a frame flip, wait one refresh period (FORCE: the forced interval) only if the process made no vsync call of its own for more than 4.5 refresh periods, so games that already sync are never double-waited. 2 = always (Framecapper "Inject" semantics). |
 | 0x20 | `safe_boot_seconds` | u32 | 120 | how long a 1080p boot must survive before it is considered good; 0 disables the safe-boot revert. Clamp: values above 3600 are lowered to 3600. |
 | 0x24 | `boot_apply_delay_ms` | u32 | 3000 | delay after SceShell appears before the first apply at boot. Clamp: values above 60000 are lowered to 60000. |

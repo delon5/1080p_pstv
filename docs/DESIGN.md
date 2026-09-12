@@ -242,3 +242,41 @@ thread alternated, so each game wait took two vblanks. Rule, alongside the
 1.5.1 lesson: no plugin thread may ever wait on the display's vblank; every
 vblank wait the plugin issues happens on the game's own thread, inside a
 hook, on that game's behalf.
+
+## Q. Framecapper (1.6.6)
+
+Framecapper60 / Framecapper60Inject (disassembly in RESEARCH_NOTES §16) hook,
+per game process, the imports of sceDisplayWaitVblankStart/CB/Multi/MultiCB and
+force the count to 1; the Inject build also hooks sceDisplaySetFrameBuf and
+calls WaitVblankStartMulti(1) after the original. Loaded next to pstv1080p every
+wait would double. The kernel module does NOT try to detect this: an interim
+1.6.6 build called taiGetModuleInfoForKernel from proc_resolve, which runs
+inside a game's first display syscall under g_tbl_mutex, and games stopped being
+resolved entirely. The Configurator reports the config.txt line instead, where
+the work is free. The FORCE target default is 60 (Framecapper60 semantics), set
+in config_defaults and corrected in place in config_load; PSTV1080P_CFG_VERSION
+stays 2, because config_valid rejects every other version and a bump silently
+resets a working console to defaults.
+
+## R. The stale refresh-rate cache (1.6.6)
+
+
+g_refresh_hz is what every pacing hook divides by; it was written only by
+record_applied (after a SetResolution seen or issued by the plugin) and by the
+watchdog, and the watchdog returned at once while cfg.mode_1080p == 0. The
+1.5.1 reboot tripped the safe-boot revert, which stores mode_1080p = 0. From
+1.5.0 on the user selects 1080p through the native Settings entry: Sony's code
+sends 0x8710, the hook records it, but if the driver's readback lags the link
+renegotiation the cache keeps 60, nothing corrects it, and every rule is an
+identity at 60 Hz. Symptoms on hardware: 30 fps games at 15, frameskip titles
+at half speed, novsync (a flag, not a rate) still working, no crash, no log
+unless debug mode. Fix: the watchdog refreshes the cache unconditionally (only
+the re-apply logic stays gated on mode_1080p), proc_resolve refreshes it once
+per process start, the native request path sets mode_1080p = 1, and
+proc_lookup re-validates an entry's title every 3 s (a reused pid must never
+inherit an older process's rules even without the lifecycle handler).
+
+Rule added with this fix: proc_resolve and everything it calls run in the hot
+path of a game's first display syscall. Sysroot title lookup, the override
+lists and one log line only — no display-driver query, no module-manager or
+taiHEN query, no large stack objects.

@@ -12,8 +12,8 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0165u      /* 1.6.5 (0xMMmp: major, minor, patch) */
-#define PSTV1080P_VERSION_STR        "1.6.5"
+#define PSTV1080P_VERSION            0x0166u      /* 1.6.6 (0xMMmp: major, minor, patch) */
+#define PSTV1080P_VERSION_STR        "1.6.6"
 
 /* 1.6: everything the plugin owns lives in ONE directory on ur0 (always
  * mounted when kernel plugins start).  Users of 1.x move their files from
@@ -34,7 +34,10 @@ extern "C" {
 #define PSTV1080P_DUMP_REQUEST       "ux0:data/pstv1080p/dump_request"  /* create it -> Settings modules dumped once, file removed */
 
 #define PSTV1080P_CFG_MAGIC          0x50383150u  /* "P18P" little endian */
-#define PSTV1080P_CFG_VERSION        2u   /* 2 since 1.3: fps_inject default became AUTO; v1 files are migrated */
+#define PSTV1080P_CFG_VERSION        2u   /* 2 since 1.3: fps_inject default became AUTO; v1 files are migrated.
+                                           * NEVER bump this to change a default: config_valid() rejects every
+                                           * other version, which silently resets a working console to defaults.
+                                           * Adjust the value in config_load() instead (see fps_target, 1.6.6). */
 
 /* SceDisplay screen-mode codes (wiki.henkaku.xyz/vita/SceDisplay, SceDisplayScreenModeFlag). */
 #define PSTV1080P_SCREENMODE_STD     0x8000u
@@ -77,7 +80,7 @@ typedef struct pstv1080p_config {
     uint32_t hd_mode_code;        /* screen mode applied when mode_1080p, default PSTV1080P_MODE_1080P30 */
     uint32_t settings_item_value; /* registry-style value of the injected list_item, default 3 */
     uint32_t fps_mode;            /* PSTV1080P_FPS_* , default SCALE */
-    uint32_t fps_target;          /* FORCE mode target fps: 20/30/60, default 30 */
+    uint32_t fps_target;          /* FORCE mode target fps: 20/30/60, default 60 since 1.6.6 (Framecapper60 semantics) */
     uint32_t fps_inject;          /* 0 off, 1 AUTO (default): after a flip wait one period only for processes that
                                    * made no vsync call of their own, 2 always (Framecapper "Inject" semantics) */
     uint32_t safe_boot_seconds;   /* revert-on-quick-reboot window, default 120, 0 disables */

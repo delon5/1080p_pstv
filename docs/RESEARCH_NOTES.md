@@ -198,3 +198,22 @@ SCE_DISPLAY_SETBUF_NEXTFRAME)` under a 1080-line head (the kernel kill with
 the 0x10 status word and no core dump is consistent with the process aborting
 inside that call). Not investigated further: it is fixed for the user, and
 the wait-based hypotheses in sections 11-14 are closed.
+
+## 16. Framecapper60 / Framecapper60Inject (user's builds, 2026-09-12)
+
+Both are module "Framecapper" v2.1, user plugins hooking the game's imports
+with taiHookFunctionImportForUser (library NID 0xFFFFFFFF = any):
+
+| NID | Function | Framecapper60 | Framecapper60Inject |
+|---|---|---|---|
+| 0xDD0A13B8 | sceDisplayWaitVblankStartMulti | r0 := 1, original | same |
+| 0x5795E898 | sceDisplayWaitVblankStart | replaced by WaitVblankStartMulti(1) | same |
+| 0x05F27764 | sceDisplayWaitVblankStartMultiCB | r0 := 1, original | same |
+| 0x78B41B92 | sceDisplayWaitVblankStartCB | replaced by WaitVblankStartMultiCB(1) | same |
+| 0x7A410B64 | sceDisplaySetFrameBuf | not hooked | original, then WaitVblankStartMulti(1) |
+
+"Modified to 60" = the count immediate is 1 (the 30 builds use 2). At a
+30 Hz output that is one vblank (33 ms) per wait and per flip, i.e. a 30 fps
+cap; the 30 builds double-wait to 15 fps there, which is why only the 60
+builds ever worked on the 1080p30 PS TV. pstv1080p `force` + `inject` with
+target 60 is the same thing; the two must not run together (1.6.6 detects it).
