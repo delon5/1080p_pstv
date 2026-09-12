@@ -512,6 +512,12 @@ with the two `config.txt` lines.
 
 ## Hardware findings (PS TV, FW 3.60)
 
+- **Settings confirmed on hardware (2026-09-12, 1.6.10):** Persona 4 Golden
+  (`PCSE00120`) runs correctly on `frameskip`; Tales of Innocence R
+  (`PCSG00009`) on `nowait`. Note that every per-game result recorded before
+  1.6.9 is void: the rules were not reaching most games at all (see the 1.6.9
+  entry), so a title that "did not respond" to a setting was very likely never
+  given it.
 - **`nowait inject` reproduces `novsync.suprx` + `Framecapper60Inject.suprx`**
   and is confirmed working on hardware (2026-09-12). Every vblank wait the
   game makes returns at once and exactly one real vblank is waited after each
