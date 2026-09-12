@@ -512,6 +512,14 @@ with the two `config.txt` lines.
 
 ## Hardware findings (PS TV, FW 3.60)
 
+- **`nowait inject` reproduces `novsync.suprx` + `Framecapper60Inject.suprx`**
+  and is confirmed working on hardware (2026-09-12). Every vblank wait the
+  game makes returns at once and exactly one real vblank is waited after each
+  flip, so the game is paced by one output period per frame and nothing else.
+  `novsync inject` is the same line since 1.6.10. Use it for games that ran
+  correctly under that plugin pair; `nowait` on its own leaves the game
+  unthrottled, which is what made Tales of Hearts R crash in game.
+
 - **Tales of Hearts R (PCSE00429) under a 1080-line head (1080i or 1080p30):**
   the process was created and started, then died before its first frame
   (kernel kill, error C2-12828-1, no core dump). Memory budget, the launcher
