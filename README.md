@@ -48,6 +48,22 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.15 (2026-09-12)** — **Fixes `smooth`, which 1.6.14 got wrong twice.**
+  Review before it reached hardware, with both cases traced: (1) a fixed half
+  period pause does not merely fill idle time, it moves the start of the
+  second logic step, capping that step at half a period. A pair such as a 5 ms
+  frame followed by a 20 ms one then misses its vblank on every cycle and the
+  game sits at a stable half speed, with no self-correction. The pause is now
+  adaptive: it starts at nothing, creeps up while pairs keep fitting inside
+  one output period, and is quartered the moment one does not, so a game with
+  no slack behaves exactly like plain `frameskip`. Simulated across workloads,
+  the hard case lands at 59 logic steps per second instead of 30, and an
+  overloaded game settles at plain `frameskip` behaviour. (2) The pause
+  restamped its own clock, so a run of consecutive skips, which `frameskip`
+  produces at 24 and 25 Hz, slept once per skip and could consume a whole
+  output period before the game ran at all. Only real waits re-anchor it now.
+  The claim in the 1.6.14 notes that `smooth` can never slow a game down was
+  wrong; it can, which is why it now measures and backs off.
 - **1.6.14 (2026-09-12)** — **New `smooth` extra.** With `frameskip` at 30 Hz a
   game that waits once per frame gets one wait back instantly and the next
   after a full 33 ms, so its logic advances in pairs: the average speed is

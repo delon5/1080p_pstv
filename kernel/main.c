@@ -341,12 +341,12 @@ enum {
                                *             mid-scan.  For a game that flips IMMEDIATE itself and therefore
                                *             tears, especially under "frameskip" where it renders twice per
                                *             output period at 30 Hz. */
-#define OVRF_SMOOTH    0x40u  /* "smooth":   with "frameskip", a skipped wait sleeps until half an output
-                               *             period has passed since the previous one instead of returning at
-                               *             once, so the game's logic steps are evenly spaced (16.7 ms at
-                               *             30 Hz) instead of arriving in pairs.  Same number of steps, same
-                               *             speed; it cannot slow a game down, because a frame that already
-                               *             took longer than half a period sleeps for nothing. */
+#define OVRF_SMOOTH    0x40u  /* "smooth":   with "frameskip", a skipped wait sleeps part of the gap instead
+                               *             of returning at once, so the game's logic steps are evenly spaced
+                               *             instead of arriving in pairs.  The pause is adaptive (see
+                               *             frameskip_smooth_pause): it grows while the game keeps meeting its
+                               *             vblank and is cut back as soon as it does not, so a game with no
+                               *             slack ends up behaving like plain frameskip. */
 #define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
 #define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
@@ -359,7 +359,9 @@ typedef struct {
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     volatile SceInt64 checked_us;   /* 1.6.6: last title re-check on the hit path */
-    volatile SceInt64 step_us;      /* 1.6.14 ("smooth"): when this process's last wait returned */
+    volatile SceInt64 step_us;      /* 1.6.14 ("smooth"): when this process's last REAL wait returned */
+    volatile SceInt64 pair_us;      /* 1.6.15: the one before that, to measure a skip+wait pair */
+    volatile uint32_t pause_us;     /* 1.6.15: how long a skipped wait may currently sleep (adaptive) */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -865,6 +867,8 @@ static void proc_clear(void)
         g_procs[i].created_us = 0;
         g_procs[i].checked_us = 0;
         g_procs[i].step_us = 0;
+        g_procs[i].pair_us = 0;
+        g_procs[i].pause_us = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -1627,35 +1631,66 @@ static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
  * shortening that wait therefore removed the only throttle a normal frame
  * loop has: the Configurator ran at 400+ fps.  Never do this again -- pace
  * ONLY the wait calls. */
-/* 1.6.14 "smooth": called where "frameskip" would return from a wait without
- * waiting at all.  Sleeps only the remainder of half an output period since
- * this process's previous wait returned, so the logic steps are evenly spaced
- * instead of arriving in pairs.  Runs on the GAME's own thread (never a plugin
- * thread) and never sleeps longer than half a period. */
+/* 1.6.14 "smooth", corrected in 1.6.15.  Called where "frameskip" would hand a
+ * wait straight back: sleeps part of the gap so the game's logic steps are
+ * evenly spaced instead of arriving in pairs.
+ *
+ * The pause is ADAPTIVE, because a fixed half period is not safe: under plain
+ * frameskip the two steps of a pair share one output period between them, so
+ * starting the second step at a fixed 16.7 ms caps it at half a period, and a
+ * step that needs longer misses the vblank every time -- a stable half speed
+ * (found in review before release, with cheap frame 5 ms + heavy frame 20 ms).
+ * So: start at zero, creep up while the pairs keep fitting inside one output
+ * period, and cut back hard the moment one does not.  A game with no slack
+ * therefore behaves exactly like plain frameskip.
+ *
+ * Runs on the GAME's own thread, never a plugin thread. */
 static inline void frameskip_smooth_pause(proc_entry_t *e)
 {
+    SceInt64 now, due;
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
-    SceInt64 half, now, due;
 
-    if (!e || hz == 0 || hz >= 60)
+    if (!e || hz >= 60 || e->pause_us == 0 || e->step_us == 0)
         return;
-    half = (SceInt64)(1000000u / hz) / 2;
     now = now_us();
-    due = e->step_us + half;
-    if (e->step_us != 0 && due > now) {
+    due = e->step_us + (SceInt64)e->pause_us;
+    if (due > now) {
         SceInt64 d = due - now;
-        if (d > half)
-            d = half;                   /* clock went backwards: never oversleep */
+        if (d > (SceInt64)e->pause_us)      /* clock went backwards: never oversleep */
+            d = (SceInt64)e->pause_us;
         ksceKernelDelayThread((SceUInt)d);
     }
-    e->step_us = now_us();
+    /* step_us is NOT restamped here: a run of consecutive skips (which
+     * frameskip produces below 30 Hz, e.g. two in a row at 24 Hz) must cost
+     * one pause between real waits, not one each. */
 }
 
-/* Remember when a real wait returned, so the next skipped one can be spaced. */
+/* A real wait returned: re-anchor the spacing clock and adjust how much the
+ * next skipped wait may sleep, from whether the last pair fitted in a period. */
 static inline void frameskip_mark_step(proc_entry_t *e)
 {
-    if (e)
-        e->step_us = now_us();
+    SceInt64 now, period;
+    uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
+
+    if (!e)
+        return;
+    now = now_us();
+    period = (SceInt64)(1000000u / hz);
+    if (e->pause_us == 0 && e->pair_us == 0 && period > 0)
+        e->pause_us = (uint32_t)(period / 256) ? (uint32_t)(period / 256) : 1u;
+    if (e->pair_us != 0 && period > 0) {
+        SceInt64 pair = now - e->pair_us;
+        if (pair > period + period / 8) {
+            e->pause_us /= 4;               /* missed its vblank: give the budget back */
+        } else if ((SceInt64)e->pause_us < period / 2) {
+            uint32_t step = (uint32_t)(period / 256);   /* ~2 s to reach full spacing */
+            e->pause_us += step ? step : 1; /* fitting comfortably: creep up */
+            if ((SceInt64)e->pause_us > period / 2)
+                e->pause_us = (uint32_t)(period / 2);
+        }
+    }
+    e->pair_us = now;
+    e->step_us = now;
 }
 
 static inline unsigned int scale_vcount(unsigned int vcount)

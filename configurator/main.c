@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.14"
+#define APP_VERSION      "1.6.15"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -148,7 +148,7 @@ typedef struct {
 static const char k_novsync_desc[] =
     "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.";
 static const char k_smooth_desc[] =
-    "smooth: with frameskip, space the logic steps evenly instead of in pairs. Against judder, not tearing.";
+    "smooth: with frameskip, space the logic steps as evenly as the game's own timing allows. Judder, not tearing.";
 static const char k_syncflip_desc[] =
     "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.";
 
