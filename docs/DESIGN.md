@@ -294,7 +294,7 @@ KERNEL_PID: kernel context writes directly, everything else is queued in a
 This is also the last file I/O removed from the hook path (section on the
 1.5.1 lesson).
 
-## T. The flip is a frame time too (1.6.7)
+## T. The flip is NOT a frame time (1.6.7, reverted in 1.6.8)
 
 sceDisplaySetFrameBuf with SETBUF_NEXTFRAME blocks until the next output
 period: 16.7 ms at 60 Hz, 33 ms at 30 Hz. Every rule here rescaled the wait
@@ -306,3 +306,12 @@ flip below 60 Hz and flip_debt_take() subtracts it from the next computed
 real wait (bounded at two, so a mistake cannot free-run a game); frameskip
 additionally forces flips to IMMEDIATE below 60 Hz, which is what novsync did
 by hand.
+
+Correction (1.6.8): the premise of section T is wrong. sceDisplaySetFrameBuf
+with SETBUF_NEXTFRAME does not block the caller for an output period; it sets
+when the buffer becomes visible and returns. The throttle in a normal frame
+loop is the vblank wait made after it (vita2d does exactly this in its display
+callback). Subtracting a "flip debt" from that wait therefore removed the only
+throttle: the Configurator ran at 400+ fps and Curse of the Moon at 130. Pace
+ONLY the wait calls. The per-frame cost a rule must reason about is the number
+of vblank-class waits a game makes, which is what the `trace` profile counts.

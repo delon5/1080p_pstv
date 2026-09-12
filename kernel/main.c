@@ -339,7 +339,6 @@ typedef struct {
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     volatile SceInt64 checked_us;   /* 1.6.6: last title re-check on the hit path */
-    volatile uint32_t flip_debt;    /* 1.6.7: output periods already spent inside vsynced flips */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -776,7 +775,7 @@ static void config_load(void)
      * a console back to Sony's defaults (1080p off) whenever the version moved.
      * Anything from v1 on is accepted and stamped with the current version. */
     if (ret == (int)sizeof(tmp) && tmp.magic == PSTV1080P_CFG_MAGIC
-        && tmp.version != 0 && tmp.version < PSTV1080P_CFG_VERSION) {
+        && tmp.version != 0 && tmp.version != PSTV1080P_CFG_VERSION) {
         klog("config: state file v%u accepted as v%u", (unsigned)tmp.version, (unsigned)PSTV1080P_CFG_VERSION);
         tmp.version = PSTV1080P_CFG_VERSION;
         g_target_fixed = 1;             /* write the upgraded file back once */
@@ -844,7 +843,6 @@ static void proc_clear(void)
         g_procs[i].cb_synced = 0;
         g_procs[i].created_us = 0;
         g_procs[i].checked_us = 0;
-        g_procs[i].flip_debt = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -1408,7 +1406,6 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
                         if (e->pid == pid) {
                             e->pid = 0;
                             e->acc = 0;
-                            e->flip_debt = 0;
                             e->last_sync_us = 0;
                             e->cb_synced = 0;
                             e->created_us = now;
@@ -1450,7 +1447,6 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
     e = &g_procs[slot];
     e->pid = 0;                 /* invalidate first: readers never pair a new pid with old data */
     e->acc = 0;
-    e->flip_debt = 0;
     e->last_sync_us = 0;
     e->cb_synced = 0;
     e->created_us = now_us();
@@ -1486,13 +1482,6 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         if (f & OVRF_INJECT)  out->inject = 2;
         if (f & OVRF_NOVSYNC) out->novsync = 1;
     }
-    /* 1.6.7: "frameskip" means 60 logic frames per second on a 30 Hz head.
-     * A flip that waits for the next frame blocks a whole 33 ms period, which
-     * alone caps the game at 30 logic frames, so such a flip must not wait.
-     * (Hardware: Bloodstained: Curse of the Moon ran at 30 fps in slow motion
-     * until novsync was added by hand; this makes the rule complete.) */
-    if (out->mode == PACE_FRAMESKIP && g_refresh_hz && g_refresh_hz < 60)
-        out->novsync = 1;
 }
 
 static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
@@ -1562,30 +1551,13 @@ static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
     return w;
 }
 
-/* 1.6.7: a flip that waits for the next frame costs a WHOLE output period:
- * 16.7 ms at 60 Hz but 33 ms at 30 Hz, i.e. two 60 Hz frame times.  The game
- * then waits for the rest of its frame budget on top, so a 30 fps game that
- * vsyncs its flip and waits two vblanks spends two periods per frame and runs
- * at 15 fps on a 30 Hz head (hardware: Persona 4 Golden).  Every vsynced flip
- * is counted here and the next wait is shortened by what the flip already
- * spent.  Bounded at two periods so a mistake can never free-run a game. */
-static inline void flip_debt_add(proc_entry_t *e)
-{
-    if (e && e->flip_debt < 2u)
-        e->flip_debt++;
-}
-
-static inline unsigned int flip_debt_take(proc_entry_t *e, unsigned int w)
-{
-    if (!e)
-        return w;
-    while (w > 0 && e->flip_debt > 0) {
-        e->flip_debt--;
-        w--;
-    }
-    return w;
-}
-
+/* 1.6.7 was wrong about the flip: sceDisplaySetFrameBuf(SETBUF_NEXTFRAME)
+ * does NOT block the caller for an output period.  It only says when the
+ * buffer becomes visible; the throttle is the vblank wait the game (or
+ * vita2d's display callback) makes afterwards.  Counting the flip and
+ * shortening that wait therefore removed the only throttle a normal frame
+ * loop has: the Configurator ran at 400+ fps.  Never do this again -- pace
+ * ONLY the wait calls. */
 static inline unsigned int scale_vcount(unsigned int vcount)
 {
     uint32_t hz = g_refresh_hz;
@@ -1662,12 +1634,6 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
-    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
-        vcount = flip_debt_take(e, vcount);
-        if (vcount == 0) {
-            return 0;
-        }
-    }
     ret = HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1690,13 +1656,6 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
-    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
-        vcount = flip_debt_take(e, vcount);
-        if (vcount == 0) {
-            ksceKernelCheckCallback();
-            return 0;
-        }
-    }
     ret = HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1709,13 +1668,8 @@ static int hook_WaitVblankStart(void)
     PF_INC(e, PF_WAITVB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode != PSTV1080P_FPS_OFF) {
-        unsigned int w = 1;                     /* SCALE: a 1-vblank request stays 1 */
-        if (pc.mode == PACE_FRAMESKIP)
-            w = frameskip_count(e, 1);
-        else if (pc.mode == PSTV1080P_FPS_FORCE)
-            w = force_interval();
-        w = flip_debt_take(e, w);               /* 1.6.7: the flip already waited */
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
         if (w == 0)
             return 0;
         if (w > 1) {
@@ -1723,7 +1677,15 @@ static int hook_WaitVblankStart(void)
             proc_mark_sync(e);
             return ret;
         }
+    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
+        unsigned int interval = force_interval();
+        if (interval > 1) {
+            ret = ksceDisplayWaitVblankStartMulti(interval);
+            proc_mark_sync(e);
+            return ret;
+        }
     }
+    /* SCALE: a 1-vblank request stays 1 -> pass through. */
     ret = HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
     proc_mark_sync(e);
     return ret;
@@ -1738,19 +1700,19 @@ static int hook_WaitVblankStartCB(void)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode != PSTV1080P_FPS_OFF) {
-        unsigned int w = 1;                     /* SCALE: a 1-vblank request stays 1 */
-        if (pc.mode == PACE_FRAMESKIP)
-            w = frameskip_count(e, 1);
-        else if (pc.mode == PSTV1080P_FPS_FORCE)
-            w = force_interval();
-        w = flip_debt_take(e, w);               /* 1.6.7: the flip already waited */
-        if (w == 0) {
-            ksceKernelCheckCallback();
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
+        if (w == 0)
             return 0;
-        }
         if (w > 1) {
             ret = ksceDisplayWaitVblankStartMultiCB(w);
+            proc_mark_sync(e);
+            return ret;
+        }
+    } else if (pc.mode == PSTV1080P_FPS_FORCE) {
+        unsigned int interval = force_interval();
+        if (interval > 1) {
+            ret = ksceDisplayWaitVblankStartMultiCB(interval);
             proc_mark_sync(e);
             return ret;
         }
@@ -1775,12 +1737,6 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
-    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
-        vcount = flip_debt_take(e, vcount);
-        if (vcount == 0) {
-            return 0;
-        }
-    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1803,13 +1759,6 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
-    if (pc.mode != PSTV1080P_FPS_OFF) {         /* 1.6.7: the flip already waited */
-        vcount = flip_debt_take(e, vcount);
-        if (vcount == 0) {
-            ksceKernelCheckCallback();
-            return 0;
-        }
-    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
     proc_mark_sync(e);
     return ret;
@@ -1826,8 +1775,6 @@ static int hook_WaitSetFrameBuf(void)
         return 0;
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
-    if (pc.mode != PSTV1080P_FPS_OFF && flip_debt_take(e, 1) == 0)
-        return 0;                               /* 1.6.7: the flip already waited */
     ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
     proc_mark_sync(e);
     return ret;
@@ -1844,10 +1791,6 @@ static int hook_WaitSetFrameBufCB(void)
     }
     if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
-    if (pc.mode != PSTV1080P_FPS_OFF && flip_debt_take(e, 1) == 0) {
-        ksceKernelCheckCallback();              /* 1.6.7: the flip already waited */
-        return 0;
-    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
     proc_mark_sync(e);
     return ret;
@@ -2081,12 +2024,6 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
     if (pc.novsync && sync != 0)
         sync = 0;                                   /* SCE_DISPLAY_SETBUF_IMMEDIATE */
     ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
-    /* 1.6.7: that flip has just spent a whole output period; let the wait that
-     * follows spend one less (only where we pace at all, and only below 60 Hz
-     * where a period is longer than the 60 Hz frame time the game assumes). */
-    if (sync != 0 && ret >= 0 && g_refresh_hz && g_refresh_hz < 60
-        && pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT)
-        flip_debt_add(e);
 
     /* Inject: an explicit "inject" extra applies with any rule (Framecapper
      * Inject); the automatic kind only where the rule allows it. */

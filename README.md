@@ -48,6 +48,20 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.8 (2026-09-12)** — **Reverts 1.6.7's frame-pacing change; keeps its
+  logging and config fixes.** 1.6.7 assumed a flip set to "next frame" blocks
+  the caller for a whole output period and shortened the following wait by
+  that much. It does not block: it only says when the buffer becomes visible,
+  and the vblank wait after it is the only throttle a normal frame loop has.
+  Removing it let everything free-run (the Configurator at 400+ fps,
+  Bloodstained: Curse of the Moon at 130). Every pacing function is now
+  byte-identical to 1.6.6 again. What 1.6.7 got right and 1.6.8 keeps:
+  (1) log lines produced on a game's own thread are queued and written by the
+  plugin thread, because a sandboxed game cannot open a file on ux0 and every
+  line it produced was silently dropped; (2) a state file is never rejected
+  over its version, in either direction, so 1.6.6's brief version change
+  cannot leave the console booting with 1080p off (i.e. in 1080i);
+  (3) reverting 1080p after a short boot takes three such boots, not one.
 - **1.6.7 (2026-09-12)** — **The log was lying, the flip was the missing frame
   time, and a rejected state file was booting the console into 1080i.**
   (1) A retail game is sandboxed: `ksceIoOpen("ux0:...")` on its own thread
