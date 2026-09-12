@@ -48,6 +48,16 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.4 (2026-09-12)** — **`frameskip` now also covers games that pace on
+  the vblank callback.** Under a 30 Hz head the display fires a game's
+  registered vblank callback 30 times a second; a game whose logic counts those
+  runs at half speed and no wait hook could change it (Tales of Hearts R with
+  `frameskip novsync` got in-game but stayed at half speed). For `frameskip`
+  titles a small kernel thread now fires the game's own callback once more
+  half a period after every real vblank, so the game counts 60 a second, the
+  same thing the rule already did for the wait calls and the vblank counter.
+  The callback is tracked through `sceDisplayRegister/UnregisterVblankStartCallback`;
+  nothing happens for games that never register one or at 60 Hz.
 - **1.6.3 (2026-09-12)** — **`novsync` switch.** A game can now carry any of
   the existing options *plus* `novsync` (`PCSE00080 nowait novsync inject`).
   `novsync` makes every `sceDisplaySetFrameBuf` flip immediate, exactly what
@@ -454,7 +464,7 @@ PCSB01206    frameskip
 
 | Mode | Effect for that title |
 |---|---|
-| `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Never injected. |
+| `frameskip` | At 30 Hz, every second vblank wait returns immediately, the vblank counter is reported doubled and (1.6.4) a registered vblank callback is fired twice per vblank: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
 | `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |
