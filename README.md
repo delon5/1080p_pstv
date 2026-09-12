@@ -48,6 +48,11 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.13 (2026-09-12)** — **`frameskip force` removed.** Tested and wrong
+  for what it was meant to do, and not wanted. `frameskip` and `force` on one
+  line go back to the documented last-word-wins behaviour. The wait hooks, the
+  frameskip accounting and the vblank counter are byte-identical to 1.6.10
+  again. The 1.6.12 overflow fixes stay.
 - **1.6.12 (2026-09-12)** — **`frameskip force`, `immflip` removed, and two
   stack overflows fixed.** (1) Writing both `frameskip` and `force` on one
   line now combines them instead of the later word winning: the fractional
@@ -588,7 +593,7 @@ PCSB01206    frameskip
 
 | Mode | Effect for that title |
 |---|---|
-| `frameskip` (add `force` to pace it to `fps_target`) | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
+| `frameskip` | At 30 Hz, every second vblank wait returns immediately and the vblank counter is reported doubled: 60 logic frames per second, every second frame shown. Identity at 60 Hz. Use for games that run at half speed. Not injected unless `inject` is added. |
 | `nowait` | Every vblank wait returns immediately, like `novsync.suprx`, for this title only. No inject. Use for games that sleep on a timer *and* wait for vblank (they land at 15 fps under 30 Hz and `frameskip` does not fully fix them). |
 | `off` | No pacing changes and no inject for this title. |
 | `inject` | Always wait one period after each frame flip (Framecapper "Inject" semantics) for this title. |

@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.12"
+#define APP_VERSION      "1.6.13"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -74,10 +74,10 @@
 /* Override modes (must match kernel/main.c games_list_load)                  */
 /* ------------------------------------------------------------------------- */
 
-enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_INJECT, M_FORCE, M_FRAMEFORCE, M_SCALE, M_SPOOF720, M_TRACE, M_COUNT };
+enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_INJECT, M_FORCE, M_SCALE, M_SPOOF720, M_TRACE, M_COUNT };
 
 static const char *k_mode_name[M_COUNT] = {
-    "none", "frameskip", "nowait", "off", "inject", "force", "frameskip force", "scale", "spoof720", "trace"
+    "none", "frameskip", "nowait", "off", "inject", "force", "scale", "spoof720", "trace"
 };
 
 static const char *k_mode_desc[M_COUNT] = {
@@ -87,7 +87,6 @@ static const char *k_mode_desc[M_COUNT] = {
     "No pacing change and no inject for this title.",
     "Always wait one period after each frame flip (Framecapper \"Inject\").",
     "Framecapper-style fixed target (the global target fps) for this title.",
-    "Frameskip paced to the global FORCE target instead of 60: keeps a target the refresh rate does not divide.",
     "The default rule; use it to exempt a title from a global FORCE mode.",
     "Diagnostic: answer display queries as if the output were 720p60.",
     "Diagnostic: log this title's process lifecycle and allocations (slower start).",
@@ -389,10 +388,6 @@ static void load_games_file(void)
                     tl = TAIL_LEN - 1;
                 memcpy(g->tail, buf + ts, (size_t)tl);
                 g->tail[tl] = 0;
-                if (mode == M_FRAMESKIP && strip_word(g->tail, "force"))
-                    g->mode = M_FRAMEFORCE;     /* "ID frameskip force" */
-                else if (mode == M_FORCE && strip_word(g->tail, "frameskip"))
-                    g->mode = M_FRAMEFORCE;     /* "ID force frameskip" */
                 if (strip_word(g->tail, "novsync"))
                     g->novsync = 1;
                 strip_word(g->tail, "immflip");     /* 1.6.12: removed, drop it from the line */

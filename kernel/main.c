@@ -323,10 +323,7 @@ enum {
     OVR_SCALE,      /* "scale":     SCALE rule + global inject setting, whatever the global mode */
     OVR_FRAMESKIP,  /* "frameskip": fractional vsync for frame-locked 60 fps games (2 logic frames per 30 Hz vblank) */
     OVR_NOWAIT,     /* "nowait":    every vblank wait returns at once */
-    OVR_FORCE,      /* "force":     FORCE rule for this title, whatever the global mode */
-    OVR_FRAMEFORCE  /* "frameskip force" on one line: frameskip's fractional waits, but paced to the
-                     * global FORCE target instead of 60, so a target the refresh rate does not divide
-                     * (60 fps on a 30 Hz head, 30 fps on a 50 Hz head) still comes out right on average */
+    OVR_FORCE       /* "force":     FORCE rule for this title, whatever the global mode */
 };
 #define OVRF_INJECT    0x1u   /* "inject":   always wait one period after each flip (Framecapper Inject) */
 #define OVRF_NOVSYNC   0x2u   /* "novsync":  exactly what novsync.suprx does -- the eight vblank wait calls
@@ -965,7 +962,6 @@ static const char *ovr_name(uint32_t m)
     case OVR_FRAMESKIP: return "frameskip";
     case OVR_NOWAIT:    return "nowait";
     case OVR_FORCE:     return "force";
-    case OVR_FRAMEFORCE: return "frameskip+force";
     default:            return "none";
     }
 }
@@ -1089,15 +1085,11 @@ static void games_list_load(int do_log)
              * or an extra flag; any unknown word rejects the line. */
             while (m_start < e) {
                 int tl = m_end - m_start;
-                /* 1.6.12: "frameskip" and "force" on the same line combine
-                 * instead of the later word winning. */
                 if      (str_ieq(buf + m_start, tl, "off"))       mode = OVR_OFF;
                 else if (str_ieq(buf + m_start, tl, "scale"))     mode = OVR_SCALE;
-                else if (str_ieq(buf + m_start, tl, "frameskip"))
-                    mode = (mode == OVR_FORCE || mode == OVR_FRAMEFORCE) ? OVR_FRAMEFORCE : OVR_FRAMESKIP;
+                else if (str_ieq(buf + m_start, tl, "frameskip")) mode = OVR_FRAMESKIP;
                 else if (str_ieq(buf + m_start, tl, "nowait"))    mode = OVR_NOWAIT;
-                else if (str_ieq(buf + m_start, tl, "force"))
-                    mode = (mode == OVR_FRAMESKIP || mode == OVR_FRAMEFORCE) ? OVR_FRAMEFORCE : OVR_FORCE;
+                else if (str_ieq(buf + m_start, tl, "force"))     mode = OVR_FORCE;
                 else if (str_ieq(buf + m_start, tl, "inject"))    flags |= OVRF_INJECT;
                 else if (str_ieq(buf + m_start, tl, "novsync"))   flags |= OVRF_NOVSYNC;
                 else if (str_ieq(buf + m_start, tl, "immflip"))   { /* removed in 1.6.12, accepted and ignored */ }
@@ -1528,7 +1520,6 @@ static inline void proc_mark_sync(proc_entry_t *e)
 /* Effective pacing for one process. */
 #define PACE_FRAMESKIP                3u
 #define PACE_NOWAIT                   4u
-#define PACE_FRAMEFORCE               5u
 typedef struct {
     uint32_t mode;      /* PSTV1080P_FPS_OFF / SCALE / FORCE, PACE_FRAMESKIP, PACE_NOWAIT */
     uint32_t inject;    /* 0 off, 1 auto, 2 always (explicit: honoured with every rule) */
@@ -1544,7 +1535,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         uint32_t f = (*pe)->flags;
         if (f & OVRF_INJECT)  out->inject = 2;
         if (f & OVRF_NOVSYNC) out->mode = PACE_NOWAIT;   /* every vblank wait returns at once */
-        if (f & OVRF_SYNCFLIP) out->syncflip = 1;   /* wins over immflip if both are given */
+        if (f & OVRF_SYNCFLIP) out->syncflip = 1;   /* 1.6.11 */
     }
 }
 
@@ -1571,9 +1562,6 @@ static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
     case OVR_FRAMESKIP:
         out->mode = PACE_FRAMESKIP;     /* such games sync themselves: no automatic inject */
         return;
-    case OVR_FRAMEFORCE:
-        out->mode = PACE_FRAMEFORCE;    /* frameskip paced to fps_target */
-        return;
     case OVR_NOWAIT:
         out->mode = PACE_NOWAIT;
         return;
@@ -1599,15 +1587,11 @@ static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
  * advances its logic once per wait runs 60 logic frames per second and shows
  * every second one.  At 60 Hz it is the identity.  Returns the real count,
  * 0 = return to the game immediately. */
-/* target = the logic rate the game should keep (60 for plain "frameskip",
- * cfg.fps_target for "frameskip force"). */
-static inline unsigned int frameskip_count_t(proc_entry_t *e, unsigned int n, uint32_t target)
+static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
 {
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
     uint32_t old, acc, w, nw;
-    if (target == 0)
-        target = 60;
-    if (hz >= target || n > 0x00FFFFFFu || !e)
+    if (hz >= 60 || n > 0x00FFFFFFu || !e)
         return n;
     /* Two threads of one process may wait at the same instant: update the
      * accumulator with a CAS (ldrex/strex) so no credit is counted twice or
@@ -1615,25 +1599,13 @@ static inline unsigned int frameskip_count_t(proc_entry_t *e, unsigned int n, ui
     old = e->acc;
     do {
         acc = old + n * hz;
-        w = acc / target;
-        nw = acc - w * target;
+        w = acc / 60;
+        nw = acc - w * 60;
     } while (!__atomic_compare_exchange_n(&e->acc, &old, nw, 0,
                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED));
     return w;
 }
 
-static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
-{
-    return frameskip_count_t(e, n, 60);
-}
-
-/* The count for whichever of the two fractional rules is in effect. */
-static inline unsigned int pace_frac_count(const pace_t *pc, proc_entry_t *e, unsigned int n)
-{
-    return (pc->mode == PACE_FRAMEFORCE)
-             ? frameskip_count_t(e, n, g_cfg.fps_target ? g_cfg.fps_target : 60u)
-             : frameskip_count(e, n);
-}
 
 /* 1.6.7 was wrong about the flip: sceDisplaySetFrameBuf(SETBUF_NEXTFRAME)
  * does NOT block the caller for an output period.  It only says when the
@@ -1711,8 +1683,8 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
     PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        vcount = pace_frac_count(&pc, e, vcount);
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
         if (vcount == 0)
             return 0;
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
@@ -1733,8 +1705,8 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        vcount = pace_frac_count(&pc, e, vcount);
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
         if (vcount == 0)
             return 0;
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
@@ -1752,8 +1724,8 @@ static int hook_WaitVblankStart(void)
     PF_INC(e, PF_WAITVB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        unsigned int w = pace_frac_count(&pc, e, 1);
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
         if (w == 0)
             return 0;
         if (w > 1) {
@@ -1784,8 +1756,8 @@ static int hook_WaitVblankStartCB(void)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        unsigned int w = pace_frac_count(&pc, e, 1);
+    if (pc.mode == PACE_FRAMESKIP) {
+        unsigned int w = frameskip_count(e, 1);
         if (w == 0)
             return 0;
         if (w > 1) {
@@ -1814,8 +1786,8 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
     PF_MAX(e, PF_MULTI_MAX, vcount);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        vcount = pace_frac_count(&pc, e, vcount);
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
         if (vcount == 0)
             return 0;
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
@@ -1836,8 +1808,8 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) {
-        vcount = pace_frac_count(&pc, e, vcount);
+    if (pc.mode == PACE_FRAMESKIP) {
+        vcount = frameskip_count(e, vcount);
         if (vcount == 0)
             return 0;
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
@@ -1857,7 +1829,7 @@ static int hook_WaitSetFrameBuf(void)
     PF_INC(e, PF_WAITSETFB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if ((pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) && pace_frac_count(&pc, e, 1) == 0)
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
     ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
     proc_mark_sync(e);
@@ -1873,7 +1845,7 @@ static int hook_WaitSetFrameBufCB(void)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if ((pc.mode == PACE_FRAMESKIP || pc.mode == PACE_FRAMEFORCE) && pace_frac_count(&pc, e, 1) == 0)
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
         return 0;
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
     proc_mark_sync(e);
@@ -1889,20 +1861,11 @@ static int hook_WaitSetFrameBufCB(void)
 static inline int vcount_for(proc_entry_t *e, int v)
 {
     uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
-    uint32_t target;
-    if (!e || v < 0)
+    if (!e || e->override != OVR_FRAMESKIP || hz >= 60 || v < 0)
         return v;
-    if (e->override == OVR_FRAMESKIP)
-        target = 60;
-    else if (e->override == OVR_FRAMEFORCE)
-        target = g_cfg.fps_target ? g_cfg.fps_target : 60u;
-    else
+    if ((uint32_t)v > 0x03FFFFFFu)          /* keep v*60 inside 32 bits (years of uptime) */
         return v;
-    if (hz >= target)
-        return v;
-    if ((uint32_t)v > 0x03FFFFFFu)          /* keep v*target inside 32 bits (years of uptime) */
-        return v;
-    return (int)(((uint32_t)v) * target / hz);
+    return (int)(((uint32_t)v) * 60u / hz);
 }
 
 static int hook_GetVcount(void)
@@ -2121,7 +2084,6 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
      * Inject); the automatic kind only where the rule allows it. */
     if (pc.inject == 2u ||
         (pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT && pc.mode != PACE_FRAMESKIP
-         && pc.mode != PACE_FRAMEFORCE
          && pc.inject != 0u && inject_wanted(e, pc.inject))) {
         unsigned int n = (pc.mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
         ksceDisplayWaitVblankStartMulti(n);
