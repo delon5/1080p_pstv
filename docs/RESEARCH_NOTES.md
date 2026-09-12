@@ -217,3 +217,41 @@ with taiHookFunctionImportForUser (library NID 0xFFFFFFFF = any):
 cap; the 30 builds double-wait to 15 fps there, which is why only the 60
 builds ever worked on the 1080p30 PS TV. pstv1080p `force` + `inject` with
 target 60 is the same thing; the two must not run together (1.6.6 detects it).
+
+## 17. novsync.suprx, from its source (2026-09-12)
+
+https://github.com/junminlee2004/novsync (per-game via a taiHEN config
+section, "based on Electry's VGi functionality for disabling vsync"). It hooks
+eight imports in the game and returns 0 from every one:
+
+| NID | Function |
+|---|---|
+| 0x5795E898 | sceDisplayWaitVblankStart |
+| 0x78B41B92 | sceDisplayWaitVblankStartCB |
+| 0xDD0A13B8 | sceDisplayWaitVblankStartMulti |
+| 0x05F27764 | sceDisplayWaitVblankStartMultiCB |
+| 0x9423560C | sceDisplayWaitSetFrameBuf |
+| 0x814C90AF | sceDisplayWaitSetFrameBufCB |
+| 0x7D9864A8 | sceDisplayWaitSetFrameBufMulti |
+| 0x3E796EF5 | sceDisplayWaitSetFrameBufMultiCB |
+
+It does NOT touch sceDisplaySetFrameBuf. "No vsync" here means "make no
+vblank wait block", not "display the buffer immediately". The same eight
+functions are what this plugin's `nowait` rule short-circuits, so `novsync`
+and `nowait` are the same thing. Forcing SETBUF_IMMEDIATE instead (1.6.3 to
+1.6.9) produced games that ran with no picture at all.
+
+### The user's known-good pair, and its exact equivalent here
+
+taiHEN config order was novsync.suprx then Framecapper60Inject.suprx. Both
+hook the GAME's imports, so they chain; Framecapper's own calls go through its
+own import table, which novsync does not hook. Net behaviour, either order:
+
+- every vblank wait the game makes returns at once (novsync), and
+- one real vblank is waited after every flip (Framecapper60Inject's inject,
+  count 1 because it is a "60" build).
+
+So the game is paced by exactly one output period per frame and nothing else.
+The equivalent line here is `TITLEID nowait inject` (`novsync inject` is the
+same thing since 1.6.10). `force inject` with the target at 60 is the same
+again, because force_interval() is max(1, hz/60) = 1 at any refresh rate.

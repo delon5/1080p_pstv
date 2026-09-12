@@ -48,6 +48,15 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.10 (2026-09-12)** — **`novsync` now does what novsync.suprx does.**
+  The reference plugin (junminlee2004/novsync, after Electry's VGi) hooks the
+  eight vblank wait calls and returns from each immediately; it never touches
+  the sync argument of `sceDisplaySetFrameBuf`. 1.6.3 to 1.6.9 instead forced
+  every flip to IMMEDIATE, which on hardware left games running with a black
+  screen or stuck on their splash. That is gone: the flip's sync argument is
+  passed through untouched and `novsync` makes the waits return at once, the
+  same thing the `nowait` rule does. Existing lines keep working; `novsync`
+  next to another rule now means `nowait`.
 - **1.6.9 (2026-09-12)** — **Per-game rules reach games again.** The override
   table was re-read from `ur0:data/pstv1080p/pstv1080p_games.txt` inside the
   first display call of every process, which runs on that process's own
@@ -551,7 +560,7 @@ PCSB01206    frameskip
 | `force` | Framecapper-style fixed target (`fps_target`, default 60 since 1.6.6) for this title regardless of the global mode. With `inject` added this is exactly Framecapper60Inject: one vblank per wait and one after every flip at 30 Hz. |
 | `scale` | The default rule, useful to exempt a title from a global FORCE mode. |
 | `trace` | Diagnostic only: logs the title's process lifecycle, every memory block allocation with its result, free-memory queries and (1.6.2) a display-call profile every 5 s to `pstv1080p.log` (debug logging must be on). Slows that game's start-up slightly. Remove the line when done. |
-| `novsync` | Switch that attaches to any option (or stands alone): every flip is made immediate (`SCE_DISPLAY_SETBUF_IMMEDIATE`), which is what `novsync.suprx` does; alone it also returns every vblank wait at once. For games that throttle themselves through the flip rather than through a wait call, which no other option can reach. **Also the fix for Tales of Hearts R (PCSE00429)**, which crashed with C2-12828-1 before its first frame under any 1080-line head: with `novsync` it starts and runs. The old `novsync.suprx` + `Framecapper60Inject.suprx` pair = `nowait novsync inject`. |
+| `novsync` (= `nowait`) | Switch that attaches to any option (or stands alone): every flip is made immediate (`SCE_DISPLAY_SETBUF_IMMEDIATE`), which is what `novsync.suprx` does; alone it also returns every vblank wait at once. For games that throttle themselves through the flip rather than through a wait call, which no other option can reach. **Also the fix for Tales of Hearts R (PCSE00429)**, which crashed with C2-12828-1 before its first frame under any 1080-line head: with `novsync` it starts and runs. The old `novsync.suprx` + `Framecapper60Inject.suprx` pair = `nowait novsync inject`. |
 | `spoof720` | Pacing as usual, but the display-information queries a game makes at start-up (`sceDisplayGetMaximumFrameBufResolution`, `sceDisplayGetResolutionInfoInternal`, `sceDisplayGetRefreshRate`) answer as if the output were 720p60. Was tried for Tales of Hearts R and did not help; kept as a diagnostic. |
 
 How to find a title id: launch the game once and read `ux0:data/pstv1080p/pstv1080p.log`;

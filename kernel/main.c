@@ -326,8 +326,12 @@ enum {
     OVR_FORCE       /* "force":     FORCE rule for this title, whatever the global mode */
 };
 #define OVRF_INJECT    0x1u   /* "inject":   always wait one period after each flip (Framecapper Inject) */
-#define OVRF_NOVSYNC   0x2u   /* "novsync":  every flip is made IMMEDIATE (what novsync.suprx does); with no
-                               *             rule given it also implies "nowait" (novsync.suprx behaviour) */
+#define OVRF_NOVSYNC   0x2u   /* "novsync":  exactly what novsync.suprx does -- the eight vblank wait calls
+                               *             return at once.  That plugin does NOT touch the flip's sync
+                               *             argument (junminlee2004/novsync, after Electry's VGi), and
+                               *             1.6.3..1.6.9 wrongly forced flips to IMMEDIATE here, which left
+                               *             games on a black screen or their splash.  Same effect as the
+                               *             "nowait" rule; kept as a word so existing files stay valid. */
 #define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
 #define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
@@ -1488,7 +1492,6 @@ static inline void proc_mark_sync(proc_entry_t *e)
 typedef struct {
     uint32_t mode;      /* PSTV1080P_FPS_OFF / SCALE / FORCE, PACE_FRAMESKIP, PACE_NOWAIT */
     uint32_t inject;    /* 0 off, 1 auto, 2 always (explicit: honoured with every rule) */
-    uint32_t novsync;   /* 1.6.3: make every flip IMMEDIATE (novsync.suprx) */
 } pace_t;
 
 static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out);
@@ -1499,7 +1502,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
     if (*pe) {                              /* 1.6.3 extras on top of the rule */
         uint32_t f = (*pe)->flags;
         if (f & OVRF_INJECT)  out->inject = 2;
-        if (f & OVRF_NOVSYNC) out->novsync = 1;
+        if (f & OVRF_NOVSYNC) out->mode = PACE_NOWAIT;   /* every vblank wait returns at once */
     }
 }
 
@@ -1509,7 +1512,6 @@ static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
 
     out->mode = PSTV1080P_FPS_OFF;
     out->inject = 0;
-    out->novsync = 0;
     *pe = NULL;
     if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return;
@@ -2037,11 +2039,6 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
 
     pace_for(pid, &e, &pc);
     PF_INC(e, sync ? PF_SETFB_NEXT : PF_SETFB_IMM);
-    /* 1.6.3 "novsync": the flip never waits for the next frame, exactly what
-     * novsync.suprx does; a game that throttles itself through the flip is
-     * otherwise capped at the output rate no matter what the wait hooks do. */
-    if (pc.novsync && sync != 0)
-        sync = 0;                                   /* SCE_DISPLAY_SETBUF_IMMEDIATE */
     ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
 
     /* Inject: an explicit "inject" extra applies with any rule (Framecapper

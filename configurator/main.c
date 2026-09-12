@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.9"
+#define APP_VERSION      "1.6.10"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -142,7 +142,7 @@ typedef struct {
 } game_t;
 
 static const char k_novsync_desc[] =
-    "novsync: every flip is immediate and (with no option) all vblank waits return at once, like novsync.suprx.";
+    "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.";
 
 static game_t g_games[MAX_GAMES];
 static int g_ngames;
