@@ -54,8 +54,7 @@ derived by reading theirs.
 - **[taiHEN](https://github.com/yifanlu/taiHEN)** by **Yifan Lu** — the plugin
   framework everything here runs on.
 - **[Sharpscale](https://github.com/psv-plugins-archive/sharpscale)** by
-  **浅倉麗子 (Asakura Reiko)**, published as **cuevavirus** — required for 1080p
-  output on PS TV.
+  **cuevavirus** — required for 1080p output on PS TV.
 - **[novsync](https://github.com/junminlee2004/novsync)** by **junminlee2004** —
   its source defined what `novsync` means here: the eight vblank wait calls
   return at once and the flip is left alone. It credits
