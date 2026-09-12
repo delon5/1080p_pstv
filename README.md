@@ -542,7 +542,14 @@ with the two `config.txt` lines.
   ever made that title work under 1080p30. Note what that line does: `novsync`
   maps to the `nowait` rule, so it overrides `frameskip` and the effective
   pacing is `nowait` alone. The game limits itself to 30 fps once nothing else
-  throttles it. Bloodstained: Curse of the Moon (`PCSE01262`)
+  throttles it. Tales of Innocence R behaves the same way.
+
+- **A rule of thumb that follows from the above.** Try `nowait` first. A game
+  with a frame limiter of its own (both Tales titles) then settles at its
+  intended rate and is fixed; a game without one (Bloodstained: Curse of the
+  Moon) free-runs and obviously so within seconds. Only the second kind needs
+  `frameskip`, which paces it at 60 logic frames per second on a 30 Hz head.
+  This is two launches per title and it replaces guessing. Bloodstained: Curse of the Moon (`PCSE01262`)
   runs far too fast on `nowait`: it has no limiter of its own, so with every
   vblank wait removed it free-runs. A 60 fps game like that wants `frameskip`,
   which keeps its 60 logic frames while showing every second one. Note that every per-game result recorded before
