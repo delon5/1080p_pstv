@@ -513,11 +513,11 @@ with the two `config.txt` lines.
 ## Hardware findings (PS TV, FW 3.60)
 
 - **Settings confirmed on hardware (2026-09-12, 1.6.10):** Persona 4 Golden
-  (`PCSE00120`) runs correctly on `frameskip`; Bloodstained: Curse of the Moon
-  (`PCSE01262`) and Tales of Innocence R (`PCSG00009`) on `nowait`. A 60 fps
-  game like Curse of the Moon can sit on `nowait` because it limits itself
-  once nothing else does; `frameskip` is the alternative when a title free-runs
-  without its vblank waits. Note that every per-game result recorded before
+  (`PCSE00120`) runs correctly on `frameskip`; Tales of Innocence R
+  (`PCSG00009`) on `nowait`. Bloodstained: Curse of the Moon (`PCSE01262`)
+  runs far too fast on `nowait`: it has no limiter of its own, so with every
+  vblank wait removed it free-runs. A 60 fps game like that wants `frameskip`,
+  which keeps its 60 logic frames while showing every second one. Note that every per-game result recorded before
   1.6.9 is void: the rules were not reaching most games at all (see the 1.6.9
   entry), so a title that "did not respond" to a setting was very likely never
   given it.
