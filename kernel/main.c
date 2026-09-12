@@ -341,6 +341,12 @@ enum {
                                *             mid-scan.  For a game that flips IMMEDIATE itself and therefore
                                *             tears, especially under "frameskip" where it renders twice per
                                *             output period at 30 Hz. */
+#define OVRF_SMOOTH    0x40u  /* "smooth":   with "frameskip", a skipped wait sleeps until half an output
+                               *             period has passed since the previous one instead of returning at
+                               *             once, so the game's logic steps are evenly spaced (16.7 ms at
+                               *             30 Hz) instead of arriving in pairs.  Same number of steps, same
+                               *             speed; it cannot slow a game down, because a frame that already
+                               *             took longer than half a period sleeps for nothing. */
 #define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
 #define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
@@ -353,6 +359,7 @@ typedef struct {
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     volatile SceInt64 checked_us;   /* 1.6.6: last title re-check on the hit path */
+    volatile SceInt64 step_us;      /* 1.6.14 ("smooth"): when this process's last wait returned */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -857,6 +864,7 @@ static void proc_clear(void)
         g_procs[i].cb_synced = 0;
         g_procs[i].created_us = 0;
         g_procs[i].checked_us = 0;
+        g_procs[i].step_us = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -994,6 +1002,7 @@ static const char *ovr_desc(uint32_t mode, uint32_t flags, char *buf, int len)
         ovr_append(buf, len, &n, ovr_name(mode));
     if (flags & OVRF_NOVSYNC)  ovr_append(buf, len, &n, "novsync");
     if (flags & OVRF_SYNCFLIP) ovr_append(buf, len, &n, "syncflip");
+    if (flags & OVRF_SMOOTH)   ovr_append(buf, len, &n, "smooth");
     if (flags & OVRF_INJECT)   ovr_append(buf, len, &n, "inject");
     if (flags & OVRF_SPOOF720) ovr_append(buf, len, &n, "spoof720");
     if (flags & OVRF_TRACE)    ovr_append(buf, len, &n, "trace");
@@ -1094,6 +1103,7 @@ static void games_list_load(int do_log)
                 else if (str_ieq(buf + m_start, tl, "novsync"))   flags |= OVRF_NOVSYNC;
                 else if (str_ieq(buf + m_start, tl, "immflip"))   { /* removed in 1.6.12, accepted and ignored */ }
                 else if (str_ieq(buf + m_start, tl, "syncflip"))  flags |= OVRF_SYNCFLIP;
+                else if (str_ieq(buf + m_start, tl, "smooth"))    flags |= OVRF_SMOOTH;
                 else if (str_ieq(buf + m_start, tl, "spoof720"))  flags |= OVRF_SPOOF720;
                 else if (str_ieq(buf + m_start, tl, "trace"))     flags |= OVRF_TRACE;
                 else { unknown = 1; break; }
@@ -1524,6 +1534,7 @@ typedef struct {
     uint32_t mode;      /* PSTV1080P_FPS_OFF / SCALE / FORCE, PACE_FRAMESKIP, PACE_NOWAIT */
     uint32_t inject;    /* 0 off, 1 auto, 2 always (explicit: honoured with every rule) */
     uint32_t syncflip;  /* 1.6.11: force SETBUF_NEXTFRAME on every flip ("syncflip") */
+    uint32_t smooth;    /* 1.6.14: even out frameskip's skipped waits ("smooth") */
 } pace_t;
 
 static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out);
@@ -1536,6 +1547,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         if (f & OVRF_INJECT)  out->inject = 2;
         if (f & OVRF_NOVSYNC) out->mode = PACE_NOWAIT;   /* every vblank wait returns at once */
         if (f & OVRF_SYNCFLIP) out->syncflip = 1;   /* 1.6.11 */
+        if (f & OVRF_SMOOTH)   out->smooth = 1;     /* 1.6.14 */
     }
 }
 
@@ -1546,6 +1558,7 @@ static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
     out->mode = PSTV1080P_FPS_OFF;
     out->inject = 0;
     out->syncflip = 0;
+    out->smooth = 0;
     *pe = NULL;
     if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return;
@@ -1614,6 +1627,37 @@ static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
  * shortening that wait therefore removed the only throttle a normal frame
  * loop has: the Configurator ran at 400+ fps.  Never do this again -- pace
  * ONLY the wait calls. */
+/* 1.6.14 "smooth": called where "frameskip" would return from a wait without
+ * waiting at all.  Sleeps only the remainder of half an output period since
+ * this process's previous wait returned, so the logic steps are evenly spaced
+ * instead of arriving in pairs.  Runs on the GAME's own thread (never a plugin
+ * thread) and never sleeps longer than half a period. */
+static inline void frameskip_smooth_pause(proc_entry_t *e)
+{
+    uint32_t hz = g_refresh_hz ? g_refresh_hz : 60;
+    SceInt64 half, now, due;
+
+    if (!e || hz == 0 || hz >= 60)
+        return;
+    half = (SceInt64)(1000000u / hz) / 2;
+    now = now_us();
+    due = e->step_us + half;
+    if (e->step_us != 0 && due > now) {
+        SceInt64 d = due - now;
+        if (d > half)
+            d = half;                   /* clock went backwards: never oversleep */
+        ksceKernelDelayThread((SceUInt)d);
+    }
+    e->step_us = now_us();
+}
+
+/* Remember when a real wait returned, so the next skipped one can be spaced. */
+static inline void frameskip_mark_step(proc_entry_t *e)
+{
+    if (e)
+        e->step_us = now_us();
+}
+
 static inline unsigned int scale_vcount(unsigned int vcount)
 {
     uint32_t hz = g_refresh_hz;
@@ -1685,13 +1729,18 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
-        if (vcount == 0)
+        if (vcount == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
     ret = HOOK_NEXT(hook_WaitVblankStartMulti, g_pacing_ref[PH_WAITVBLANKMULTI], vcount);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1707,13 +1756,18 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
     }
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
-        if (vcount == 0)
+        if (vcount == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
     ret = HOOK_NEXT(hook_WaitVblankStartMultiCB, g_pacing_ref[PH_WAITVBLANKMULTICB], vcount);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1726,11 +1780,16 @@ static int hook_WaitVblankStart(void)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
         unsigned int w = frameskip_count(e, 1);
-        if (w == 0)
+        if (w == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
         if (w > 1) {
             ret = ksceDisplayWaitVblankStartMulti(w);
             proc_mark_sync(e);
+            if (pc.smooth)
+                frameskip_mark_step(e);
             return ret;
         }
     } else if (pc.mode == PSTV1080P_FPS_FORCE) {
@@ -1744,6 +1803,8 @@ static int hook_WaitVblankStart(void)
     /* SCALE: a 1-vblank request stays 1 -> pass through. */
     ret = HOOK_NEXT(hook_WaitVblankStart, g_pacing_ref[PH_WAITVBLANK]);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1758,11 +1819,16 @@ static int hook_WaitVblankStartCB(void)
     }
     if (pc.mode == PACE_FRAMESKIP) {
         unsigned int w = frameskip_count(e, 1);
-        if (w == 0)
+        if (w == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
         if (w > 1) {
             ret = ksceDisplayWaitVblankStartMultiCB(w);
             proc_mark_sync(e);
+            if (pc.smooth)
+                frameskip_mark_step(e);
             return ret;
         }
     } else if (pc.mode == PSTV1080P_FPS_FORCE) {
@@ -1775,6 +1841,8 @@ static int hook_WaitVblankStartCB(void)
     }
     ret = HOOK_NEXT(hook_WaitVblankStartCB, g_pacing_ref[PH_WAITVBLANKCB]);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1788,13 +1856,18 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
         return 0;
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
-        if (vcount == 0)
+        if (vcount == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMulti, g_pacing_ref[PH_WAITSETFBMULTI], vcount);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1810,13 +1883,18 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
     }
     if (pc.mode == PACE_FRAMESKIP) {
         vcount = frameskip_count(e, vcount);
-        if (vcount == 0)
+        if (vcount == 0) {
+            if (pc.smooth)
+                frameskip_smooth_pause(e);
             return 0;
+        }
     } else if (pc.mode != PSTV1080P_FPS_OFF) {
         vcount = pace_vcount(pc.mode, vcount);
     }
     ret = HOOK_NEXT(hook_WaitSetFrameBufMultiCB, g_pacing_ref[PH_WAITSETFBMULTICB], vcount);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1829,10 +1907,15 @@ static int hook_WaitSetFrameBuf(void)
     PF_INC(e, PF_WAITSETFB);
     if (pc.mode == PACE_NOWAIT)
         return 0;
-    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0) {
+        if (pc.smooth)
+            frameskip_smooth_pause(e);
         return 0;
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBuf, g_pacing_ref[PH_WAITSETFB]);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 
@@ -1845,10 +1928,15 @@ static int hook_WaitSetFrameBufCB(void)
         ksceKernelCheckCallback();  /* the CB variants are the caller's callback-delivery point */
         return 0;
     }
-    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0)
+    if (pc.mode == PACE_FRAMESKIP && frameskip_count(e, 1) == 0) {
+        if (pc.smooth)
+            frameskip_smooth_pause(e);
         return 0;
+    }
     ret = HOOK_NEXT(hook_WaitSetFrameBufCB, g_pacing_ref[PH_WAITSETFBCB]);
     proc_mark_sync(e);
+    if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
+        frameskip_mark_step(e);
     return ret;
 }
 

@@ -48,6 +48,20 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.14 (2026-09-12)** — **New `smooth` extra.** With `frameskip` at 30 Hz a
+  game that waits once per frame gets one wait back instantly and the next
+  after a full 33 ms, so its logic advances in pairs: the average speed is
+  right, the spacing is not. `smooth` makes the skipped wait sleep the
+  remainder of half an output period instead of returning at once, so the
+  steps land every 16.7 ms. Same number of steps, same speed, and it can never
+  slow a game down, because a frame that already took longer than half a
+  period sleeps for nothing. It is for judder only: it does not reduce how
+  many frames the game renders, so it does not remove tearing. Trace evidence
+  behind it (Bloodstained: Curse of the Moon, `PCSE01262`): one
+  `WaitVblankStart` and one next-frame flip per frame, no immediate flips, no
+  `GetVcount`, no vblank callback, which is also why `syncflip` cannot help
+  that title and why `frameskip inject` gave exactly 20 fps (33 ms injected
+  plus 16.7 ms average).
 - **1.6.13 (2026-09-12)** — **`frameskip force` removed.** Tested and wrong
   for what it was meant to do, and not wanted. `frameskip` and `force` on one
   line go back to the documented last-word-wins behaviour. The wait hooks, the
