@@ -537,7 +537,12 @@ with the two `config.txt` lines.
 
 - **Settings confirmed on hardware (2026-09-12, 1.6.10):** Persona 4 Golden
   (`PCSE00120`) runs correctly on `frameskip`; Tales of Innocence R
-  (`PCSG00009`) on `nowait`. Bloodstained: Curse of the Moon (`PCSE01262`)
+  (`PCSG00009`) on `nowait`; **Tales of Hearts R (`PCSE00429`) runs at a
+  correct 30 fps on `frameskip novsync`**, which is the first setting that has
+  ever made that title work under 1080p30. Note what that line does: `novsync`
+  maps to the `nowait` rule, so it overrides `frameskip` and the effective
+  pacing is `nowait` alone. The game limits itself to 30 fps once nothing else
+  throttles it. Bloodstained: Curse of the Moon (`PCSE01262`)
   runs far too fast on `nowait`: it has no limiter of its own, so with every
   vblank wait removed it free-runs. A 60 fps game like that wants `frameskip`,
   which keeps its 60 logic frames while showing every second one. Note that every per-game result recorded before
