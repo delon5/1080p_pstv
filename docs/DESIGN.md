@@ -280,3 +280,29 @@ Rule added with this fix: proc_resolve and everything it calls run in the hot
 path of a game's first display syscall. Sysroot title lookup, the override
 lists and one log line only — no display-driver query, no module-manager or
 taiHEN query, no large stack objects.
+
+## S. Logging from a game's thread (1.6.7)
+
+Every display hook runs on the calling process's thread. A retail game is
+sandboxed and kernel file I/O on its thread inherits that: ksceIoOpen on
+ux0 returns an error, so klog wrote nothing. Only system apps, homebrew and
+the plugin's own thread ever reached the file, and a game's entire life
+appeared in the log as two lines written by the shell's thread (proc: create
+and proc: kill). Since 1.6.7 klog compares ksceKernelGetProcessId() with
+KERNEL_PID: kernel context writes directly, everything else is queued in a
+48-slot ring that the plugin thread drains every 250 ms, counting drops.
+This is also the last file I/O removed from the hook path (section on the
+1.5.1 lesson).
+
+## T. The flip is a frame time too (1.6.7)
+
+sceDisplaySetFrameBuf with SETBUF_NEXTFRAME blocks until the next output
+period: 16.7 ms at 60 Hz, 33 ms at 30 Hz. Every rule here rescaled the wait
+calls and ignored the flip, so on a 30 Hz head a 30 fps game paid one period
+in the flip plus a full period in its wait (15 fps), and a 60 fps game under
+frameskip could not exceed 30 logic frames no matter how many waits were
+skipped. hook_SetFrameBuf now records one unit of "flip debt" per vsynced
+flip below 60 Hz and flip_debt_take() subtracts it from the next computed
+real wait (bounded at two, so a mistake cannot free-run a game); frameskip
+additionally forces flips to IMMEDIATE below 60 Hz, which is what novsync did
+by hand.

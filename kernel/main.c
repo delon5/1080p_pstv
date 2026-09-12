@@ -339,6 +339,7 @@ typedef struct {
     volatile uint32_t cb_synced;    /* registered a vblank callback: never inject */
     volatile SceInt64 created_us;   /* when the entry was resolved (eviction tiebreak) */
     volatile SceInt64 checked_us;   /* 1.6.6: last title re-check on the hit path */
+    volatile uint32_t flip_debt;    /* 1.6.7: output periods already spent inside vsynced flips */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -467,6 +468,73 @@ static int g_verbose = 0;
 #define kvlog(...) do { if (g_verbose) klog(__VA_ARGS__); } while (0)
 
 /* Append one line to the log.  Never called from the frame-pacing hooks. */
+/* 1.6.7 log ring.  A retail game is sandboxed: ksceIoOpen("ux0:...") called
+ * on ITS thread (every display hook runs there) fails, so until now every line
+ * a game produced was silently dropped and the log showed system apps and
+ * homebrew only -- which made "no process: line for this game" look like "the
+ * plugin never saw this game".  Lines produced outside a kernel thread are
+ * queued here and written by the plugin thread, which also removes the last
+ * file I/O from the hook path. */
+#define KLOG_SLOTS                    48
+#define KLOG_LINE                     192
+static char g_ring[KLOG_SLOTS][KLOG_LINE];
+static volatile uint32_t g_ring_ready[KLOG_SLOTS];
+static volatile uint32_t g_ring_head = 0;
+static volatile uint32_t g_ring_tail = 0;
+static volatile uint32_t g_ring_lost = 0;
+
+static void klog_enqueue(const char *line, int len)
+{
+    uint32_t idx = __atomic_fetch_add(&g_ring_head, 1, __ATOMIC_RELAXED);
+    uint32_t slot = idx % KLOG_SLOTS;
+
+    if (idx - g_ring_tail >= KLOG_SLOTS) {           /* full: drop, count it */
+        __atomic_fetch_add(&g_ring_lost, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    if (len > KLOG_LINE - 1)
+        len = KLOG_LINE - 1;
+    memcpy(g_ring[slot], line, (size_t)len);
+    g_ring[slot][len] = 0;
+    __atomic_store_n(&g_ring_ready[slot], idx + 1, __ATOMIC_RELEASE);
+}
+
+static void klog_write_raw(const char *line, int len)
+{
+    SceUID fd;
+    ensure_log_dir();
+    if (!g_log_dir_ok)
+        return;
+    fd = ksceIoOpen(PSTV1080P_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 6);
+    if (fd < 0)
+        return;
+    ksceIoWrite(fd, line, (SceSize)len);
+    ksceIoClose(fd);
+}
+
+/* Plugin thread only: write out everything the hooks queued. */
+static void klog_flush(void)
+{
+    while (g_ring_tail != g_ring_head) {
+        uint32_t idx = g_ring_tail;
+        uint32_t slot = idx % KLOG_SLOTS;
+        int len;
+        if (__atomic_load_n(&g_ring_ready[slot], __ATOMIC_ACQUIRE) != idx + 1)
+            break;                                   /* still being filled */
+        len = (int)strlen(g_ring[slot]);
+        klog_write_raw(g_ring[slot], len);
+        __atomic_store_n(&g_ring_ready[slot], 0, __ATOMIC_RELAXED);
+        g_ring_tail = idx + 1;
+    }
+    if (g_ring_lost) {
+        char b[80];
+        uint32_t n = __atomic_exchange_n(&g_ring_lost, 0, __ATOMIC_RELAXED);
+        int l = snprintf(b, sizeof(b), "[log] %u line(s) dropped (ring full)\n", (unsigned)n);
+        if (l > 0)
+            klog_write_raw(b, l);
+    }
+}
+
 static void klog(const char *fmt, ...)
 {
     char buf[256];
@@ -474,9 +542,6 @@ static void klog(const char *fmt, ...)
     int n, m;
 
     if (!g_verbose)
-        return;
-    ensure_log_dir();
-    if (!g_log_dir_ok)
         return;
 
     {
@@ -500,13 +565,13 @@ static void klog(const char *fmt, ...)
     buf[n++] = '\n';
     buf[n] = 0;
 
-    SceUID fd = ksceIoOpen(PSTV1080P_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 6);
-    if (fd < 0)
-        return;
-    ksceIoWrite(fd, buf, (SceSize)n);
-    ksceIoClose(fd);
+    /* Kernel thread: write it now.  Anything else (a hook on a game's thread,
+     * a process event on the shell's thread): queue it. */
+    if (ksceKernelGetProcessId() == KERNEL_PID)
+        klog_write_raw(buf, n);
+    else
+        klog_enqueue(buf, n);
 }
-
 static int file_exists(const char *path)
 {
     SceUID fd = ksceIoOpen(path, SCE_O_RDONLY, 0);
@@ -516,16 +581,6 @@ static int file_exists(const char *path)
     return 1;
 }
 
-static int file_touch(const char *path)
-{
-    SceUID fd;
-    ensure_dir();
-    fd = ksceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
-    if (fd < 0)
-        return (int)fd;
-    ksceIoClose(fd);
-    return 0;
-}
 
 
 /* ------------------------------------------------------------------------- */
@@ -717,6 +772,16 @@ static void config_load(void)
     ret = ksceIoRead(fd, &tmp, sizeof(tmp));
     ksceIoClose(fd);
 
+    /* 1.6.6: a state file is never rejected because of its version: that turned
+     * a console back to Sony's defaults (1080p off) whenever the version moved.
+     * Anything from v1 on is accepted and stamped with the current version. */
+    if (ret == (int)sizeof(tmp) && tmp.magic == PSTV1080P_CFG_MAGIC
+        && tmp.version != 0 && tmp.version < PSTV1080P_CFG_VERSION) {
+        klog("config: state file v%u accepted as v%u", (unsigned)tmp.version, (unsigned)PSTV1080P_CFG_VERSION);
+        tmp.version = PSTV1080P_CFG_VERSION;
+        g_target_fixed = 1;             /* write the upgraded file back once */
+    }
+
     /* 1.6.6: the FORCE target default became 60 (Framecapper60 semantics: one
      * vblank per wait at 30 Hz).  A state file still carrying the old default
      * 30 is corrected in place and written back once; 20 is a deliberate
@@ -779,6 +844,7 @@ static void proc_clear(void)
         g_procs[i].cb_synced = 0;
         g_procs[i].created_us = 0;
         g_procs[i].checked_us = 0;
+        g_procs[i].flip_debt = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -1342,6 +1408,7 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
                         if (e->pid == pid) {
                             e->pid = 0;
                             e->acc = 0;
+                            e->flip_debt = 0;
                             e->last_sync_us = 0;
                             e->cb_synced = 0;
                             e->created_us = now;
@@ -1383,6 +1450,7 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
     e = &g_procs[slot];
     e->pid = 0;                 /* invalidate first: readers never pair a new pid with old data */
     e->acc = 0;
+    e->flip_debt = 0;
     e->last_sync_us = 0;
     e->cb_synced = 0;
     e->created_us = now_us();
@@ -1418,6 +1486,13 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         if (f & OVRF_INJECT)  out->inject = 2;
         if (f & OVRF_NOVSYNC) out->novsync = 1;
     }
+    /* 1.6.7: "frameskip" means 60 logic frames per second on a 30 Hz head.
+     * A flip that waits for the next frame blocks a whole 33 ms period, which
+     * alone caps the game at 30 logic frames, so such a flip must not wait.
+     * (Hardware: Bloodstained: Curse of the Moon ran at 30 fps in slow motion
+     * until novsync was added by hand; this makes the rule complete.) */
+    if (out->mode == PACE_FRAMESKIP && g_refresh_hz && g_refresh_hz < 60)
+        out->novsync = 1;
 }
 
 static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
@@ -1484,6 +1559,30 @@ static inline unsigned int frameskip_count(proc_entry_t *e, unsigned int n)
         nw = acc - w * 60;
     } while (!__atomic_compare_exchange_n(&e->acc, &old, nw, 0,
                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return w;
+}
+
+/* 1.6.7: a flip that waits for the next frame costs a WHOLE output period:
+ * 16.7 ms at 60 Hz but 33 ms at 30 Hz, i.e. two 60 Hz frame times.  The game
+ * then waits for the rest of its frame budget on top, so a 30 fps game that
+ * vsyncs its flip and waits two vblanks spends two periods per frame and runs
+ * at 15 fps on a 30 Hz head (hardware: Persona 4 Golden).  Every vsynced flip
+ * is counted here and the next wait is shortened by what the flip already
+ * spent.  Bounded at two periods so a mistake can never free-run a game. */
+static inline void flip_debt_add(proc_entry_t *e)
+{
+    if (e && e->flip_debt < 2u)
+        e->flip_debt++;
+}
+
+static inline unsigned int flip_debt_take(proc_entry_t *e, unsigned int w)
+{
+    if (!e)
+        return w;
+    while (w > 0 && e->flip_debt > 0) {
+        e->flip_debt--;
+        w--;
+    }
     return w;
 }
 
@@ -1953,6 +2052,12 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
     if (pc.novsync && sync != 0)
         sync = 0;                                   /* SCE_DISPLAY_SETBUF_IMMEDIATE */
     ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
+    /* 1.6.7: that flip has just spent a whole output period; let the wait that
+     * follows spend one less (only where we pace at all, and only below 60 Hz
+     * where a period is longer than the 60 Hz frame time the game assumes). */
+    if (sync != 0 && ret >= 0 && g_refresh_hz && g_refresh_hz < 60
+        && pc.mode != PSTV1080P_FPS_OFF && pc.mode != PACE_NOWAIT)
+        flip_debt_add(e);
 
     /* Inject: an explicit "inject" extra applies with any rule (Framecapper
      * Inject); the automatic kind only where the rule allows it. */
@@ -2528,6 +2633,7 @@ static int pstv1080p_thread(SceSize args, void *argp)
         if (g_thread_stop)
             break;
 
+        klog_flush();
         marker_tick();
         trace_profile_tick();
 
@@ -2886,32 +2992,81 @@ static void release_hooks(void)
 /* Safe boot                                                                  */
 /* ------------------------------------------------------------------------- */
 
+/* 1.6.6: the marker carries how many boots in a row did not survive the safe
+ * window ('1'..'9'; an empty file written by <= 1.6.5 counts as one).  Reading
+ * it is one small file read at module start. */
+static int marker_strikes(void)
+{
+    SceUID fd;
+    char c = 0;
+    int n;
+
+    fd = ksceIoOpen(PSTV1080P_BOOT_MARKER_PATH, SCE_O_RDONLY, 0);
+    if (fd < 0)
+        return 0;                       /* no marker: the last boot ended cleanly */
+    n = ksceIoRead(fd, &c, 1);
+    ksceIoClose(fd);
+    if (n != 1 || c < '1' || c > '9')
+        return 1;
+    return c - '0';
+}
+
+static int marker_write(int strikes)
+{
+    SceUID fd;
+    char c = (char)('0' + (strikes < 1 ? 1 : (strikes > 9 ? 9 : strikes)));
+    int w;
+
+    ensure_dir();
+    fd = ksceIoOpen(PSTV1080P_BOOT_MARKER_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 6);
+    if (fd < 0)
+        return (int)fd;
+    w = ksceIoWrite(fd, &c, 1);
+    ksceIoClose(fd);
+    return w == 1 ? 0 : (w < 0 ? w : -1);
+}
+
+/* Revert 1080p only after SAFE_BOOT_STRIKES boots in a row failed to stay up
+ * for safe_boot_seconds.  One short boot is normal: installing a plugin and
+ * rebooting, or powering the console off again right away, used to be enough
+ * to disable 1080p permanently (hardware report: console came up in 1080i
+ * after a plugin update).  A display mode the TV really cannot show still
+ * disables itself, just after three attempts instead of one. */
+#define SAFE_BOOT_STRIKES             3
+
 static void safe_boot_check(void)
 {
-    int marker = file_exists(PSTV1080P_BOOT_MARKER_PATH);
+    int strikes = marker_strikes();
 
-    if (g_cfg.mode_1080p && marker) {
-        g_cfg.mode_1080p = 0;
-        config_save();
-        ksceIoRemove(PSTV1080P_BOOT_MARKER_PATH);
-        klog("safeboot: marker found from a previous boot -> 1080p reverted (disabled)");
-        marker = 0;
+    if (g_cfg.mode_1080p && strikes) {
+        if (strikes + 1 >= SAFE_BOOT_STRIKES) {
+            g_cfg.mode_1080p = 0;
+            config_save();
+            ksceIoRemove(PSTV1080P_BOOT_MARKER_PATH);
+            klog("safeboot: %d boots in a row did not stay up %us -> 1080p disabled; pick it again in Settings to retry",
+                 strikes + 1, (unsigned)g_cfg.safe_boot_seconds);
+            g_marker_pending = 0;
+            return;
+        }
+        klog("safeboot: the previous boot did not stay up %us (attempt %d of %d); 1080p stays on",
+             (unsigned)g_cfg.safe_boot_seconds, strikes + 1, SAFE_BOOT_STRIKES);
     }
 
     if (g_cfg.mode_1080p) {
         if (g_cfg.safe_boot_seconds == 0) {
-            if (marker)
+            if (strikes)
                 ksceIoRemove(PSTV1080P_BOOT_MARKER_PATH);
             g_marker_pending = 0;
             klog("safeboot: disabled by config");
         } else {
-            int r = file_touch(PSTV1080P_BOOT_MARKER_PATH);
+            int r = marker_write(strikes + 1);
             g_marker_pending = (r == 0);
             if (r != 0 || g_verbose)
-                klog("safeboot: marker created (0x%08X), window %us", (unsigned)r, (unsigned)g_cfg.safe_boot_seconds);
+                klog("safeboot: marker %d (0x%08X), window %us", strikes + 1, (unsigned)r,
+                     (unsigned)g_cfg.safe_boot_seconds);
         }
     } else {
-        if (marker)
+        if (strikes)
             ksceIoRemove(PSTV1080P_BOOT_MARKER_PATH);
         g_marker_pending = 0;
     }
@@ -2988,6 +3143,12 @@ int module_start(SceSize argc, const void *args)
 
 int module_stop(SceSize argc, const void *args)
 {
+    klog_flush();
+    /* 1.6.6: an orderly stop (shutdown, module unload) is not a failed boot. */
+    if (g_marker_pending) {
+        ksceIoRemove(PSTV1080P_BOOT_MARKER_PATH);
+        g_marker_pending = 0;
+    }
     g_thread_stop = 1;
     if (g_thread_uid >= 0) {
         SceUInt timeout = 5u * 1000u * 1000u;

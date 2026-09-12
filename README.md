@@ -48,6 +48,29 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.7 (2026-09-12)** — **The log was lying, the flip was the missing frame
+  time, and a rejected state file was booting the console into 1080i.**
+  (1) A retail game is sandboxed: `ksceIoOpen("ux0:...")` on its own thread
+  fails, and every display hook runs on that thread, so every log line a game
+  produced was dropped without a trace. The log showed system apps and
+  homebrew only, which made "no `process:` line for this game" look like "the
+  plugin never saw this game". Lines from any non-kernel thread are now queued
+  in a small ring and written by the plugin thread, which also takes the last
+  file I/O out of the hook path. (2) A flip that waits for the next frame
+  costs a whole output period: 33 ms at 30 Hz against the 16.7 ms the game was
+  written for. Nothing accounted for it, so a 30 fps game that vsyncs its flip
+  and then waits for its frame budget spent two periods per frame and ran at
+  15 (Persona 4 Golden). Each vsynced flip is now counted and the wait that
+  follows is shortened by what the flip already spent, and `frameskip` stops
+  vsyncing flips below 60 Hz, since a blocking flip alone caps a game at 30
+  logic frames (Curse of the Moon ran at 30 fps in slow motion). (3) A state
+  file is no longer rejected because of its version. 1.6.6 briefly used
+  version 3, and the build that followed used 2 again and threw those files
+  away: the console came up with 1080p off, i.e. in 1080i, on every boot.
+  Any version from 1 on is now accepted and stamped forward. (4) Reverting
+  1080p after a short boot needs three such boots in a row, not one: rebooting
+  the console within two minutes of a boot, which is what installing a plugin
+  looks like, used to disable 1080p permanently.
 - **1.6.6 (2026-09-12)** — **Per-game rules reach games again, `force` target
   is 60.** Two fixes and one regression of my own. (1) The per-process entry
   is resolved inside the *first display syscall* of a game, so that code must
