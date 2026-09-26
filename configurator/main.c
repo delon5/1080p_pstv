@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.7.2"
+#define APP_VERSION      "1.7.4"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -103,7 +103,7 @@ static const char *k_sw_desc[SW_COUNT] = {
     "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.",
     "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.",
     "smooth: with frameskip, space the logic steps as evenly as the game's own timing allows. Judder, not tearing.",
-    "triple: with frameskip, present every frame from a plugin-owned copy (6.75 MB). Removes tearing; ignored under nowait.",
+    "triple: with frameskip, present every frame from a plugin-owned copy. Removes tearing; ignored under nowait.",
     "inject: always wait one period after each frame flip (Framecapper \"Inject\"). nowait+inject = novsync+Framecapper60Inject.",
     "spoof720: diagnostic, answer display queries as if the output were 720p60.",
     "trace: diagnostic, log this title's display calls every 5 s and its allocations (slower start). Any rule.",
@@ -334,6 +334,7 @@ static int is_own_header(const char *s, int len)
 {
     return (len >= 31 && strncmp(s, "# pstv1080p per-title overrides", 31) == 0) ||
            (len >= 8  && strncmp(s, "# modes:", 8) == 0) ||
+           (len >= 8  && strncmp(s, "# rules:", 8) == 0) ||
            (len >= 35 && strncmp(s, "# written by pstv1080p Configurator", 35) == 0);
 }
 
@@ -498,7 +499,7 @@ static int save_games_file(void)
 
     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
                     "# pstv1080p per-title overrides: \"TITLEID mode\" per line\n"
-                    "# modes: frameskip nowait off inject force scale spoof720 trace\n"
+                    "# rules: scale frameskip nowait force off | switches: novsync syncflip smooth triple inject spoof720 trace\n"
                     "# written by pstv1080p Configurator " APP_VERSION "\n");
     {
         static const game_t *order[MAX_GAMES];

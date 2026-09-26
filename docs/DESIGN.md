@@ -374,3 +374,110 @@ a per-frame copy; 1.7.1 uses `ksceDmacMemcpy` with the CPU path as a counted
 fallback. `SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW` for 6.75 MB fails with
 0x80024309 under Bloodstained; 1.7.1 falls back to
 `SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW` with `ATTR_PHYCONT`, 1 MB aligned.
+
+## W. `triple` 1.7.3: fitting into what the game leaves
+
+**Evidence (1.7.0 trace, Bloodstained PCSE01262, two boots).** Before its
+first flip the game allocates, through `sceKernelAllocMemBlock`: 80 MB and
+144 MB of main memory, a 16 MB `SceGxmParamBuffer` in CDRAM (+1.0 s), a
+96 MB `Graphics` block in CDRAM (+3.0 s). Round sizes, byte-identical on
+both boots, no failed attempt before either, and not one call to
+`sceKernelGetFreeMemorySize` (hooked and logged when traced). The plugin's
+6.75 MB CDRAM request at +3.9 s was refused (0x80024309), so the free
+remainder after the game is under 6.75 MB contiguous. Iconoclasts allocates
+16 + 78 MB and later two 2.25 MB blocks, and the same request succeeded at
+0x27280000.
+
+**Rejected: reserve at process creation.** Designed, written (an event ring
+filled by the process-lifecycle handlers, an event flag waking the plugin
+thread, a reserve adopted by the entry at its first flip) and dropped before
+release. With a fixed 112 MB demand the game's 96 MB request would be the
+one to fail; a give-back at that moment frees the reserve, but a 96 MB
+contiguous hole only reappears if the reserve sat at the end of the free
+region, which depends on the allocator's placement and is not something to
+gamble a game launch on. It stays the next experiment only if both routes
+below fail; the give-back below would then show in the log whether the
+game adapts its request or not.
+
+**1. Right-sized separate blocks, two accepted.** `tb_want_bytes` is set at
+the first flip from the game's own frame buffer parameters (pitch × height
+× 4, rounded up to 256 KB; main-memory pools to 1 MB), and `tb_alloc_slots`
+takes one memblock per slot from the first pool that gives at least
+`TB_MIN_SLOTS = 2`. Two suffice because the invariant is only "never copy
+into the slot on screen or the pending one": with two, a second flip inside
+the same refresh finds neither free and is *dropped* (the hook returns
+success without presenting; `tb_drops` counts it). Under `frameskip` that
+costs nothing visible: of the two frames rendered per refresh only one ever
+reaches the screen, and the pending copy simply stands. Three slots keep
+the old behaviour (every frame copied, none dropped).
+
+**2. Pools.** CDRAM; `KERNEL_ROOT_UMAIN_NC_RW` + `PHYCONT` (the user main
+pool, where 6.75 MB contiguous certainly exists on a 512 MB console);
+`USER_MAIN_PHYCONT_NC_RW`; `KERNEL_ROOT_PHYCONT_NC_RW`. Each main pool is
+tried with `HAS_ALIGNMENT` 256 KB first, then plain. 0x80024302 in 1.7.1
+was `NO_FREE_PHYSICAL_PAGE` in the kernel's own small pool, not an attribute
+refusal, so 1.7.2's third candidate (same pool) could never have helped.
+Whether the display scans main memory at all is still unproven; a refusal
+shows as eight submit failures and "off for this process".
+
+**3. Give-back.** `hook_AllocMemBlock` (kernel hook on the user export, on
+the game's thread) sees every allocation result. On 0x80024309 for a
+process that holds CDRAM blocks: `tb_failed = 1`, `TB_RETIRING` under the
+table lock, wake the plugin thread through the event flag, then retry the
+game's request every 20 ms for up to 500 ms (the tick frees the blocks on
+its first pass with no copy in flight). Sound for blocks taken *after* the
+game's own allocations: freeing them restores exactly the state the game
+allocated from. Triple then stays off for that process (`TB_FAILED`); a new
+process reusing the pid starts clean (`tb_new_occupant`).
+
+**4. Regrow.** A frame larger than `tb_slot_bytes` but within the 2.25 MB
+maximum sets `tb_regrow` and `TB_RETIRING`; `triple_tick` treats
+`tb_failed || tb_regrow` as give-up, retires in two steps and ends in
+`TB_NONE` (regrow) rather than `TB_FAILED`, so the next flip asks again with
+the new size. `tb_new_occupant` deliberately does not clear `tb_regrow`:
+blocks the previous occupant outgrew finish retiring instead of being
+re-armed for the newcomer.
+
+**5. Wake.** The plugin thread's sleep is `ksceKernelWaitEventFlag` with the
+250 ms tick as timeout (`EVF_WAKE` from the give-back, `EVF_STOP` from
+module_stop); on a flag error it falls back to the plain delay so it can
+never spin. The flag is created before the hooks and deleted after they are
+released.
+
+**6. Hardware, 1.7.3 test build (Bloodstained, 2026-09-26).** CDRAM refused
+even the first 2 MB block (0x80024309). `KERNEL_ROOT_UMAIN_NC_RW` +
+`PHYCONT`: 0x80024A00 (both variants). `USER_MAIN_PHYCONT_NC_RW` from the
+kernel thread: 0x80020005 aligned, 0x80024802 plain. `KERNEL_ROOT_PHYCONT_NC_RW`:
+3 x 2 MB at 0x30500000, and the display accepted them: 4133 frames from
+copies, 22 passed through (before the blocks existed), 0 dropped, 0 submit
+failures, 60 flips/s for 85 s, copy 3.7 ms average / 5.6 ms max over the
+DMA (CDRAM to main memory), no CPU fallback; no tearing seen. So the
+display scans main memory, and the chain in 1.7.4 is CDRAM, kernel phycont,
+kernel pool.
+
+**7. `shrink` (tried once, removed).** The first `>= 32 MB` CDRAM request
+of a `triple shrink` title was granted 6.75 MB smaller (96 MB asked, 89.25
+granted). The game ran its first 5 s (378 flips), then stopped flipping
+and was killed by the system 14 s after creation: the engine maps or
+checks the full block. Removed in 1.7.4; the word stays accepted and
+ignored so an old rules line keeps its rule. A trace-mode sampler of the
+game's block (how much of it is written) shipped in the same build but
+never resolved the block: the uid a user process receives is a process
+UID, which `ksceKernelGetMemBlockBase` does not take without conversion.
+Also removed.
+
+**8. Give-back, tightened (1.7.4, from review).** Triggers on the family
+of "no free physical page" codes matching the pool the blocks are in
+(0x80024309 for CDRAM, 0x80024302/3 for main memory), and also when the
+allocation is still in flight (state `TB_WANTED`, nothing published: the
+thread then frees what it took and ends in `TB_FAILED`). The game's retry
+waits for `tb_free_gen` to change, which the plugin thread bumps only after
+the frees have completed, not when the uids are zeroed under the lock. If
+the retry still fails with the blocks gone, the shortage was the game's own
+and the entry goes back to `TB_NONE` so triple re-arms. `g_giveback_busy`
+counts loops in flight; `module_stop` waits for zero before `release_hooks`
+so no loop can call through a released hook. `triple_tick` runs before
+`klog_flush` so a waiting game is not held behind file I/O. With two slots
+a game that has not done a real vblank wait for 100 ms passes through
+(`TBR_NO_WAITS`): its on-screen slot is unknown and a copy would land on
+the picture.

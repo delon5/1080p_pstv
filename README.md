@@ -48,6 +48,46 @@ for how they differ.
 
 ## Changelog
 
+- **1.7.4 (2026-09-26)** — **Bloodstained tear-free from main memory; `shrink`
+  removed.** The 1.7.3 test build settled it on hardware. Bloodstained's
+  process had no video memory left at all (even one 2 MB block was refused),
+  and the buffers came from the kernel's physically contiguous main-memory
+  pool instead: 3 x 2 MB at 0x30500000, the display accepted every one of
+  4133 frames presented from them at 60 flips a second, no submit failure,
+  no dropped flip, the DMA copy averaging 3.7 ms, and the user saw no
+  tearing. So the display scans main memory just as well, which is the
+  answer to a question open since 1.7.1. The two other main-memory pools
+  were refused by the kernel (0x80024A00 for the user-main pool, 0x80020005
+  / 0x80024802 for the user phycont type from a kernel thread) and are gone;
+  the chain is now CDRAM, kernel phycont, kernel pool. The `shrink`
+  experiment (granting the game's 96 MB video-memory request 6.75 MB smaller)
+  was tried once and killed the game 14 s in: the engine needs, or checks,
+  the full block. It is removed; the word is still accepted in the rules
+  file and ignored. The give-back (a game refused memory the plugin holds
+  gets it back) was reviewed and tightened: it now also covers main-memory
+  blocks, an allocation still in flight, waits for the blocks to be really
+  freed before the game's retry, re-arms triple when the refusal turns out
+  not to be the plugin's doing, and cannot outlive the hooks at unload. With
+  only two slots, a game that does no vblank waits passes through instead
+  of copying onto its own picture. The plugin thread frees before it flushes
+  the log.
+- **1.7.3 (2026-09-26, test build)** — **`triple` fits into what the game
+  leaves.** The 1.7.0 trace of Bloodstained shows the game taking a fixed
+  112 MB of the 128 MB of video memory before its first flip (a 16 MB
+  parameter buffer, then a 96 MB "Graphics" block; round numbers, identical
+  on two boots, no free-memory query, no failed attempt). Reserving the
+  memory first, at process creation, was designed and dropped on that
+  evidence: the game's own 96 MB request would then fail. Instead: one block
+  per slot, sized to the game's actual frame (960x544 needs 2 MB), two slots
+  accepted when the third is refused (a second flip inside the same refresh
+  is then not presented; under `frameskip` only one of the two reaches the
+  screen anyway); a wider main-memory fallback (the 1.7.1 refusal 0x80024302
+  was "no free physical page" in the kernel's small pool, not an alignment
+  complaint); frames that outgrow the slots retire them and the next flip
+  asks for the right size; a give-back for a game refused video memory
+  while the plugin holds some; the trace line reports slots, size, pool and
+  dropped flips; the plugin thread sleeps on an event flag so a hook can
+  wake it. Also carried, and removed again in 1.7.4: the `shrink` switch.
 - **1.7.2 (2026-09-26)** — **`triple` proven; the memory fallback fixed.**
   Second hardware run: Iconoclasts at full speed with no tearing, 2026 frames
   from copies, the DMA copy averaging 2.1 ms with two CPU fallbacks in 80

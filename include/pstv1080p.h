@@ -12,8 +12,8 @@
 extern "C" {
 #endif
 
-#define PSTV1080P_VERSION            0x0172u      /* 1.7.2 (0xMMmp: major, minor, patch) */
-#define PSTV1080P_VERSION_STR        "1.7.2"
+#define PSTV1080P_VERSION            0x0174u      /* 1.7.4 (0xMMmp: major, minor, patch) */
+#define PSTV1080P_VERSION_STR        "1.7.4"
 
 /* 1.6: everything the plugin owns lives in ONE directory on ur0 (always
  * mounted when kernel plugins start).  Users of 1.x move their files from

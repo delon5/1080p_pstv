@@ -363,8 +363,13 @@ enum {
 #define TB_FAILED                     3u    /* allocation or submit failed: off for this process */
 #define TB_RETIRING                   4u    /* no new copies may start; freed once none is in flight */
 #define TB_SLOTS                      3u
-#define TB_SLOT_BYTES                 0x240000u   /* 2.25 MB: pitch 1024 x 544 lines x 4 = 2,228,224 fits */
+#define TB_MIN_SLOTS                  2u          /* 1.7.3: two are enough (one on screen, one pending; a third
+                                                   * frame in the same refresh is dropped, not presented) */
+#define TB_SLOT_BYTES                 0x240000u   /* 2.25 MB: pitch 1024 x 544 lines x 4 = 2,228,224 fits (the maximum) */
+#define TB_SLOT_UNIT                  0x40000u    /* 1.7.3: slots are sized to the game's frame, in 256 KB units */
+#define TB_MAIN_UNIT                  0x100000u   /*   main-memory pools: whole megabytes */
 #define TB_MAX_SUBMIT_FAILS           8u
+#define TB_GIVEBACK_TRIES             25u         /* 1.7.3: a game refused memory we hold: how long its call retries (x 20 ms) */
 /* Why a flip was passed through (first one recorded, logged once by the thread). */
 #define TBR_NOT_READY                 1u
 #define TBR_BAD_STRUCT                2u
@@ -372,6 +377,18 @@ enum {
 #define TBR_COPY_FAILED               4u
 #define TBR_SUBMIT_FAILED             5u
 #define TBR_NOWAIT_RULE               6u
+#define TBR_NO_WAITS                  7u    /* 1.7.4: two slots and the game does no vblank waits */
+
+/* 1.7.3: pools tried for the blocks, in order (tb_alloc_slots). */
+static const char *tb_pool_name(uint32_t p)
+{
+    switch (p) {
+    case 1u:  return "CDRAM";
+    case 2u:  return "main memory (kernel phycont)";
+    case 3u:  return "main memory (kernel pool)";
+    default:  return "-";
+    }
+}
 #define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
 #define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
@@ -387,8 +404,16 @@ typedef struct {
     volatile SceInt64 step_us;      /* 1.6.14 ("smooth"): when this process's last REAL wait returned */
     volatile SceInt64 pair_us;      /* 1.6.15: the one before that, to measure a skip+wait pair */
     volatile uint32_t pause_us;     /* 1.6.15: how long a skipped wait may currently sleep (adaptive) */
-    volatile SceUID    tb_uid;      /* 1.7.0 "triple": memblock holding the frame copies, 0 = none */
-    volatile uintptr_t tb_base;     /*   its kernel-virtual base */
+    volatile SceUID    tb_uid[TB_SLOTS];  /* 1.7.0 "triple": the blocks holding the frame copies, [0] == 0 = none
+                                           *   (1.7.3: one block per slot, sized to the game's frame) */
+    volatile uintptr_t tb_base[TB_SLOTS]; /*   their kernel-virtual bases */
+    volatile uint32_t  tb_nslots;   /*   1.7.3: blocks in hand (TB_MIN_SLOTS..TB_SLOTS) */
+    volatile uint32_t  tb_slot_bytes; /* 1.7.3: size of each block */
+    volatile uint32_t  tb_want_bytes; /* 1.7.3: size the first flip asked for (TB_WANTED) */
+    volatile uint32_t  tb_drops;    /*   1.7.3: flips not presented because both slots were spoken for */
+    volatile uint32_t  tb_regrow;   /*   1.7.3: frames outgrew the slots: retire, then ask again */
+    volatile uint32_t  tb_free_gen; /*   1.7.4: bumped by the plugin thread each time this entry's blocks are gone
+                                     *   (freed, or a refused allocation settled); the give-back waits for it */
     volatile uint32_t  tb_state;    /*   TB_* */
     volatile uint32_t  tb_next;     /*   next slot to copy into */
     volatile uint32_t  tb_copies;   /*   frames presented from a copy */
@@ -399,7 +424,7 @@ typedef struct {
     volatile uint32_t  tb_fails;    /*   consecutive submit failures */
     volatile uint32_t  tb_failed;   /*   this occupant gave up (8 refusals): retire, end in TB_FAILED */
     volatile uint32_t  tb_cpu;      /*   1.7.1: copies that fell back to the CPU (DMA refused) */
-    volatile uint32_t  tb_pool;     /*   1.7.1: 1 = CDRAM, 2 = main memory (CDRAM was full) */
+    volatile uint32_t  tb_pool;     /*   1.7.1: which pool the blocks came from (tb_pool_name) */
     volatile uint32_t  tb_us_max;   /*   copy time, microseconds */
     volatile uint32_t  tb_us_sum;
     volatile uintptr_t tb_last;     /*   base of the slot submitted last (pending until the vblank) */
@@ -911,8 +936,19 @@ static void proc_clear(void)
         g_procs[i].step_us = 0;
         g_procs[i].pair_us = 0;
         g_procs[i].pause_us = 0;
-        g_procs[i].tb_uid = 0;
-        g_procs[i].tb_base = 0;
+        {
+            uint32_t k;
+            for (k = 0; k < TB_SLOTS; k++) {
+                g_procs[i].tb_uid[k] = 0;
+                g_procs[i].tb_base[k] = 0;
+            }
+        }
+        g_procs[i].tb_nslots = 0;
+        g_procs[i].tb_slot_bytes = 0;
+        g_procs[i].tb_want_bytes = 0;
+        g_procs[i].tb_drops = 0;
+        g_procs[i].tb_regrow = 0;
+        g_procs[i].tb_free_gen = 0;
         g_procs[i].tb_state = 0;
         g_procs[i].tb_next = 0;
         g_procs[i].tb_copies = 0;
@@ -1169,6 +1205,7 @@ static void games_list_load(int do_log)
                 else if (str_ieq(buf + m_start, tl, "syncflip"))  flags |= OVRF_SYNCFLIP;
                 else if (str_ieq(buf + m_start, tl, "smooth"))    flags |= OVRF_SMOOTH;
                 else if (str_ieq(buf + m_start, tl, "triple"))    flags |= OVRF_TRIPLE;
+                else if (str_ieq(buf + m_start, tl, "shrink"))    { /* 1.7.4: removed (crashed the game), accepted and ignored */ }
                 else if (str_ieq(buf + m_start, tl, "spoof720"))  flags |= OVRF_SPOOF720;
                 else if (str_ieq(buf + m_start, tl, "trace"))     flags |= OVRF_TRACE;
                 else { unknown = 1; break; }
@@ -1296,6 +1333,13 @@ static void proc_resolve(proc_entry_t *e, SceUID pid)
  * evicted and re-assigned (a spoof720 title published with override NONE). */
 static SceUID g_procevent_uid = -1;
 
+/* 1.7.3: wakes the plugin thread out of its tick sleep (a game that was
+ * refused CDRAM needs the frame-copy blocks back at once, see
+ * hook_AllocMemBlock); module_stop sets EVF_STOP. */
+static SceUID g_evf = -1;
+#define EVF_WAKE                      1u
+#define EVF_STOP                      2u
+
 static void proc_forget(SceUID pid)
 {
     int i;
@@ -1396,12 +1440,12 @@ static void trace_profile_tick(void)
              d[PF_WAITVB], d[PF_WAITVBCB], d[PF_WAITVBMULTI], now[PF_MULTI_MAX],
              d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
              e->cb_synced ? "yes" : "no", ovr_desc(e->override, e->flags, od, sizeof(od)), (unsigned)g_refresh_hz);
-        if (e->tb_uid != 0 || e->tb_state != TB_NONE)
-            klog("trace: triple: state=%u copies=%u passed=%u | copy max=%u us avg=%u us | cpu fallbacks=%u pool=%s | reason=%u",
-                 (unsigned)e->tb_state, (unsigned)e->tb_copies, (unsigned)e->tb_passes,
+        if (e->tb_uid[0] != 0 || e->tb_state != TB_NONE)
+            klog("trace: triple: state=%u copies=%u passed=%u dropped=%u | slots=%u x %u KB pool=%s | copy max=%u us avg=%u us | cpu fallbacks=%u | reason=%u",
+                 (unsigned)e->tb_state, (unsigned)e->tb_copies, (unsigned)e->tb_passes, (unsigned)e->tb_drops,
+                 (unsigned)e->tb_nslots, (unsigned)(e->tb_slot_bytes / 1024u), tb_pool_name(e->tb_pool),
                  (unsigned)e->tb_us_max, e->tb_copies ? (unsigned)(e->tb_us_sum / e->tb_copies) : 0u,
-                 (unsigned)e->tb_cpu, e->tb_pool == 1 ? "cdram" : e->tb_pool == 2 ? "main-user" : e->tb_pool == 3 ? "main-kernel" : "-",
-                 (unsigned)e->tb_reason);
+                 (unsigned)e->tb_cpu, (unsigned)e->tb_reason);
     }
 }
 
@@ -1521,11 +1565,15 @@ static const SceProcEventHandler g_procevent_handler = {
  * be in flight on the old occupant's thread. */
 static inline void tb_new_occupant(proc_entry_t *e)
 {
-    if (e->tb_uid == 0)
+    if (e->tb_uid[0] == 0)
         e->tb_state = TB_NONE;
     else if (e->tb_state == TB_FAILED || e->tb_failed)
         e->tb_state = TB_RETIRING;      /* a verdict never crosses occupants: re-armed or freed clean */
     e->tb_failed = 0;
+    /* tb_regrow is NOT reset: blocks the last occupant outgrew finish
+     * retiring, and the new occupant's first flip sizes fresh ones. */
+    e->tb_drops = 0;
+    e->tb_want_bytes = 0;
     e->tb_cpu = 0;
     e->tb_next = 0;
     e->tb_copies = 0;
@@ -2259,10 +2307,87 @@ static int hook_GetRefreshRate(float *pFps)
  * queries of the traced title.  Pass-through (one pid compare) for every
  * other process; the traced pid is known from the process-create event so no
  * table lookup is needed here. */
+/* 1.7.3/1.7.4 give-back.  A game refused memory from the pool the plugin's
+ * frame-copy blocks live in (CDRAM: 0x80024309; main memory: 0x80024302/3)
+ * gets them back: the blocks are retired under the table lock, the plugin
+ * thread is woken to free them, and the game's request is retried every
+ * 20 ms until it succeeds or the blocks are certainly gone (tb_free_gen).
+ * Also covers an allocation still in flight on the plugin thread (state
+ * TB_WANTED with nothing published: the thread then frees what it took).
+ * If the request still fails with the blocks gone, the refusal was not the
+ * plugin's doing and triple is re-armed instead of staying off.  Never
+ * outlives module_stop: g_giveback_busy is waited for before the hooks go. */
+static volatile uint32_t g_giveback_busy = 0;
+
 static int hook_AllocMemBlock(const char *name, int type, SceSize size, void *opt)
 {
     SceUID pid = ksceKernelGetProcessId();
     int ret = HOOK_NEXT(hook_AllocMemBlock, g_pacing_ref[PH_ALLOCMEMBLOCK], name, type, size, opt);
+    uint32_t nofree = (ret == (int)0x80024309) ? 1u                                     /* NO_FREE_PHYSICAL_PAGE_CDRAM */
+                    : (ret == (int)0x80024302 || ret == (int)0x80024303) ? 2u : 0u;     /* NO_FREE_PHYSICAL_PAGE(_UNIT) */
+    if (nofree != 0 && pid > 0 && pid != KERNEL_PID && !g_thread_stop) {
+        proc_entry_t *e = proc_find(pid);
+        int giving = 0, held = 0;
+        uint32_t gen0 = 0;
+        char title[TITLE_ID_LEN];
+        title[0] = 0;
+        if (e && e->pid == pid && (e->flags & OVRF_TRIPLE) && !e->tb_failed) {
+            __atomic_add_fetch(&g_giveback_busy, 1u, __ATOMIC_ACQUIRE);
+            tbl_lock();
+            if (e->pid == pid && (e->flags & OVRF_TRIPLE) && !e->tb_failed) {
+                int in_pool = (e->tb_uid[0] != 0) && ((nofree == 1u) == (e->tb_pool == 1u));
+                int pending = (e->tb_uid[0] == 0) && (e->tb_state == TB_WANTED);
+                if (in_pool || pending) {
+                    gen0 = e->tb_free_gen;
+                    held = in_pool;
+                    e->tb_failed = 1;
+                    if (held)
+                        e->tb_state = TB_RETIRING;
+                    memcpy(title, e->title, TITLE_ID_LEN);
+                    title[TITLE_ID_LEN - 1] = 0;
+                    giving = 1;
+                }
+            }
+            tbl_unlock();
+            if (!giving)
+                __atomic_sub_fetch(&g_giveback_busy, 1u, __ATOMIC_RELEASE);
+        }
+        if (giving) {
+            uint32_t i, waited = 0;
+            int freed = 0;
+            klog("triple: %s: the game asked for %u KB of %s and was refused (0x%08X): the frame-copy blocks are %s",
+                 title, (unsigned)(size >> 10), nofree == 1u ? "video memory" : "main memory", (unsigned)ret,
+                 held ? "given back" : "not taken");
+            for (i = 0; i < TB_GIVEBACK_TRIES && !g_thread_stop; i++) {
+                if (g_evf >= 0)
+                    ksceKernelSetEventFlag(g_evf, EVF_WAKE);
+                ksceKernelDelayThread(20000);
+                waited += 20u;
+                freed = (e->pid != pid) || (e->tb_free_gen != gen0);   /* the frees have completed */
+                ret = HOOK_NEXT(hook_AllocMemBlock, g_pacing_ref[PH_ALLOCMEMBLOCK], name, type, size, opt);
+                if (ret >= 0 || freed)
+                    break;
+            }
+            if (ret >= 0) {
+                klog("triple: %s: the game's request succeeded after %u ms; triple stays off for this process", title, waited);
+            } else if (freed) {
+                /* Still refused with nothing of ours in the way: the shortage
+                 * is the game's own.  Do not punish triple for it. */
+                tbl_lock();
+                if (e->pid == pid && e->tb_failed && e->tb_uid[0] == 0 && e->tb_state == TB_FAILED) {
+                    e->tb_failed = 0;
+                    e->tb_state = TB_NONE;      /* the next flip asks again */
+                }
+                tbl_unlock();
+                klog("triple: %s: the game's request still fails (0x%08X) with the blocks gone after %u ms: not the plugin's memory; triple re-arms",
+                     title, (unsigned)ret, waited);
+            } else {
+                klog("triple: %s: the game's request still fails (0x%08X) after %u ms; the blocks could not be freed in time",
+                     title, (unsigned)ret, waited);
+            }
+            __atomic_sub_fetch(&g_giveback_busy, 1u, __ATOMIC_RELEASE);
+        }
+    }
     if (pid != 0 && pid == g_trace_pid) {
         char nm[32];
         nm[0] = 0;
@@ -2342,38 +2467,72 @@ static inline void tb_note(proc_entry_t *e, uint32_t reason)
     }
 }
 
+/* Reads and validates the game's frame buffer struct; 0 = fine, else TBR_*. */
+static inline uint32_t tb_read_fb(const void *pFrameBuf, SceDisplayFrameBuf *fb, uint32_t *bytes)
+{
+    if (ksceKernelCopyFromUser(fb, pFrameBuf, sizeof(*fb)) < 0
+        || fb->size != sizeof(*fb) || fb->base == NULL || fb->pitch == 0 || fb->height == 0
+        || fb->pitch > 4096u || fb->height > 1088u)
+        return TBR_BAD_STRUCT;
+    *bytes = fb->pitch * fb->height * 4u;      /* every SceDisplay pixel format is 32 bpp */
+    if (*bytes > TB_SLOT_BYTES)
+        return TBR_TOO_BIG;                     /* an HD-patched game: leave it alone */
+    return 0;
+}
+
 /* Returns 1 if the frame was presented from a copy (*pret set), 0 to pass through.
  * Runs on the game's thread inside its own flip syscall.  Announces itself in
  * tb_busy for the whole copy+submit so the plugin thread never frees the
- * block underneath it, and re-checks the state after announcing. */
+ * blocks underneath it, and re-checks the state after announcing. */
 static int triple_present(proc_entry_t *e, const void *pFrameBuf, int sync, int *pret)
 {
     SceDisplayFrameBuf fb, kfb;
-    uintptr_t base, disp, target;
-    uint32_t bytes, slot, k;
+    uintptr_t disp, target;
+    uint32_t bytes, slot, k, n, why;
     SceInt64 t0;
     int ret;
 
-    if (e->tb_state == TB_NONE && e->tb_uid == 0) {
-        e->tb_state = TB_WANTED;                /* the plugin thread allocates; expected, not noted */
+    if (e->tb_state == TB_NONE && e->tb_uid[0] == 0) {
+        /* First flip: size the slots to this frame, then let the plugin
+         * thread allocate (expected, not noted). */
+        why = tb_read_fb(pFrameBuf, &fb, &bytes);
+        if (why != 0) {
+            tb_note(e, why);
+            return 0;
+        }
+        e->tb_want_bytes = (bytes + TB_SLOT_UNIT - 1u) & ~(TB_SLOT_UNIT - 1u);
+        __atomic_store_n(&e->tb_state, TB_WANTED, __ATOMIC_RELEASE);   /* the size is visible before the state */
         return 0;
     }
     __atomic_add_fetch(&e->tb_busy, 1u, __ATOMIC_ACQUIRE);
-    base = e->tb_base;
-    if (e->tb_state != TB_READY || base == 0) {
+    n = e->tb_nslots;
+    if (e->tb_state != TB_READY || e->tb_base[0] == 0 || n < TB_MIN_SLOTS || n > TB_SLOTS) {
         if (e->tb_state != TB_WANTED)           /* waiting for the allocation is normal */
             tb_note(e, TBR_NOT_READY);
         goto out_pass;
     }
-    if (ksceKernelCopyFromUser(&fb, pFrameBuf, sizeof(fb)) < 0
-        || fb.size != sizeof(fb) || fb.base == NULL || fb.pitch == 0 || fb.height == 0
-        || fb.pitch > 4096u || fb.height > 1088u) {
-        tb_note(e, TBR_BAD_STRUCT);
+    why = tb_read_fb(pFrameBuf, &fb, &bytes);
+    if (why != 0) {
+        tb_note(e, why);
         goto out_pass;
     }
-    bytes = fb.pitch * fb.height * 4u;          /* every SceDisplay pixel format is 32 bpp */
-    if (bytes > TB_SLOT_BYTES) {
-        tb_note(e, TBR_TOO_BIG);                /* an HD-patched game: leave it alone */
+    if (n == 2u && now_us() - e->last_sync_us > 100000LL) {
+        /* With two slots the on-screen one must be known, and it is known
+         * only from the game's real vblank waits (tb_shown).  A game that
+         * has not waited for 100 ms paces itself some other way: with two
+         * slots every second copy would land on the picture.  Pass through. */
+        tb_note(e, TBR_NO_WAITS);
+        goto out_pass;
+    }
+    if (bytes > e->tb_slot_bytes) {
+        /* Frames larger than the slots were sized for (a mode change, or
+         * blocks inherited from a smaller game): retire them; the plugin
+         * thread frees them and the next flip asks for the right size. */
+        if (!e->tb_regrow) {
+            e->tb_regrow = 1;
+            __atomic_store_n(&e->tb_state, TB_RETIRING, __ATOMIC_RELEASE);
+        }
+        tb_note(e, TBR_TOO_BIG);
         goto out_pass;
     }
 
@@ -2383,17 +2542,29 @@ static int triple_present(proc_entry_t *e, const void *pFrameBuf, int sync, int 
      * the on-screen slot is tracked by the plugin itself: whenever one of the
      * game's real vblank waits returns, the vblank just passed has latched
      * whatever was pending, and the wait hooks record tb_shown = tb_last at
-     * that moment.  With three slots one always remains. */
+     * that moment.  With three slots one always remains; with two (1.7.3,
+     * CDRAM nearly full) a second flip inside the same refresh finds none. */
     disp = e->tb_shown;
     slot = e->tb_next;
-    for (k = 0; k < TB_SLOTS; k++) {
-        target = base + slot * TB_SLOT_BYTES;
-        if (target != e->tb_last && target != disp)
+    target = 0;
+    for (k = 0; k < n; k++) {
+        uintptr_t c = e->tb_base[slot];
+        if (c != 0 && c != e->tb_last && c != disp) {
+            target = c;
             break;
-        slot = (slot + 1u) % TB_SLOTS;
+        }
+        slot = (slot + 1u) % n;
     }
-    target = base + slot * TB_SLOT_BYTES;
-    e->tb_next = (slot + 1u) % TB_SLOTS;
+    if (target == 0) {
+        /* Both slots spoken for: this frame is not presented.  Under
+         * frameskip only one of the two frames per refresh ever reaches the
+         * screen, so the pending copy simply stands; the game sees success. */
+        e->tb_drops++;
+        __atomic_sub_fetch(&e->tb_busy, 1u, __ATOMIC_RELEASE);
+        *pret = 0;
+        return 1;
+    }
+    e->tb_next = (slot + 1u) % n;
 
     t0 = now_us();
     if (ksceDmacMemcpy((void *)target, fb.base, bytes) < 0) {
@@ -2440,58 +2611,169 @@ static const char *tb_reason_text(uint32_t r)
     switch (r) {
     case TBR_NOT_READY:     return "buffers not ready yet";
     case TBR_BAD_STRUCT:    return "unexpected framebuffer parameters";
-    case TBR_TOO_BIG:       return "frame larger than a 2.25 MB slot (HD patch?)";
+    case TBR_TOO_BIG:       return "frame larger than the slots (HD patch, or a mode change: re-sized)";
     case TBR_COPY_FAILED:   return "copy from the game's buffer failed";
     case TBR_SUBMIT_FAILED: return "driver refused the copied buffer";
     case TBR_NOWAIT_RULE:   return "ignored under the nowait rule";
+    case TBR_NO_WAITS:      return "two slots only and the game does no vblank waits (on-screen slot unknown)";
     default:                return "?";
     }
+}
+
+/* 1.7.3: one block per slot, sized to the frame, from the first pool that
+ * gives at least TB_MIN_SLOTS of them.  Hardware so far: CDRAM can be nearly
+ * full by the first flip (Bloodstained takes a fixed 112 MB of the 128 up
+ * front, 0x80024309 for 6.75 MB more), and the kernel's own main-memory pool
+ * cannot give 6.75 MB contiguous (0x80024302 is "no free physical page", not
+ * an alignment complaint).  Smaller separate blocks fit where one big one
+ * did not; the main-memory pools are the fallback when CDRAM has no room at
+ * all.  Every refusal is logged with the pool and the code.  Returns the
+ * pool (0 = none), *nslots = blocks obtained, *slot_bytes = their size. */
+static uint32_t tb_alloc_slots(const char *title, uint32_t want, SceUID *uids, uintptr_t *bases,
+                               uint32_t *nslots, uint32_t *slot_bytes)
+{
+    /* 1.7.4, hardware (Bloodstained, CDRAM full): the display scans main
+     * memory: KERNEL_ROOT_PHYCONT_NC_RW gave 3 x 2 MB at 0x30500000 and 4133
+     * frames were presented from them at 60 flips/s, no submit failure.  The
+     * user-main pool with PHYCONT was refused 0x80024A00 and the user phycont
+     * type 0x80020005 / 0x80024802 from a kernel thread, so they are gone. */
+    static const struct { uint32_t type; uint32_t attr; uint32_t pool; } cand[] = {
+        { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,           0u,                                     1u },
+        { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW, 0u,                                     2u },
+        { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,         SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT, 3u },
+    };
+    uint32_t c, k, v;
+    *nslots = 0;
+    *slot_bytes = 0;
+    if (want == 0 || want > TB_SLOT_BYTES)
+        return 0;
+    for (c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
+        uint32_t size = (cand[c].pool == 1u) ? want : ((want + TB_MAIN_UNIT - 1u) & ~(TB_MAIN_UNIT - 1u));
+        for (v = 0; v < 2u; v++) {              /* v0: 256 KB aligned, v1: as the pool gives it */
+            int err = 0;
+            uint32_t got = 0;
+            if (cand[c].pool == 1u && v == 1u)
+                break;                          /* CDRAM: one plain attempt, proven in 1.7.0 */
+            for (k = 0; k < TB_SLOTS; k++) {
+                uids[k] = 0;
+                bases[k] = 0;
+            }
+            for (k = 0; k < TB_SLOTS; k++) {
+                SceKernelAllocMemBlockKernelOpt opt;
+                SceUID uid;
+                void *base = NULL;
+                uint32_t attr = cand[c].attr;
+                if (cand[c].pool != 1u && v == 0u)
+                    attr |= SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+                memset(&opt, 0, sizeof(opt));
+                opt.size = sizeof(opt);
+                opt.attr = attr;
+                opt.alignment = TB_SLOT_UNIT;
+                uid = ksceKernelAllocMemBlock("pstv1080p_triple", cand[c].type, size, attr ? &opt : NULL);
+                if (uid < 0) {
+                    err = uid;
+                    break;
+                }
+                if (ksceKernelGetMemBlockBase(uid, &base) < 0 || base == NULL) {
+                    ksceKernelFreeMemBlock(uid);
+                    err = -1;
+                    break;
+                }
+                uids[k] = uid;
+                bases[k] = (uintptr_t)base;
+                got++;
+            }
+            if (got >= TB_MIN_SLOTS) {
+                if (got < TB_SLOTS)
+                    klog("triple: %s: pool %u (%s) gave %u of %u blocks of %u KB (block %u refused 0x%08X): running on %u",
+                         title, (unsigned)cand[c].pool, tb_pool_name(cand[c].pool), (unsigned)got, (unsigned)TB_SLOTS,
+                         (unsigned)(size / 1024u), (unsigned)got + 1u, (unsigned)err, (unsigned)got);
+                *nslots = got;
+                *slot_bytes = size;
+                return cand[c].pool;
+            }
+            klog("triple: %s: pool %u (type 0x%08X%s) refused block %u of %u (%u KB): 0x%08X", title,
+                 (unsigned)cand[c].pool, (unsigned)cand[c].type,
+                 (cand[c].pool != 1u && v == 0u) ? ", 256 KB aligned" : "",
+                 (unsigned)got + 1u, (unsigned)TB_SLOTS, (unsigned)(size / 1024u), (unsigned)err);
+            for (k = 0; k < TB_SLOTS; k++) {
+                if (uids[k] > 0)
+                    ksceKernelFreeMemBlock(uids[k]);
+                uids[k] = 0;
+                bases[k] = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Arms the blocks for the entry's current occupant (fresh or inherited):
+ * the same fields in every case.  Under g_tbl_mutex. */
+static inline void tb_arm(proc_entry_t *e)
+{
+    e->tb_next = 0;
+    e->tb_fails = 0;
+    e->tb_last = 0;
+    e->tb_shown = 0;
+    e->tb_reason = 0;
+    e->tb_reason_logged = 0;
+    e->tb_state = TB_READY;
 }
 
 /* Plugin thread, every tick.  Every decision about a slot's buffers is taken
  * under g_tbl_mutex, against the occupant seen under that same lock, so a
  * slot that changes hands between two ticks cannot be freed for its old
- * occupant or armed for the wrong one.  The block itself is allocated outside
- * the lock and published under it; it is freed only after two consecutive
- * ticks in RETIRING with no copy in flight. */
+ * occupant or armed for the wrong one.  The blocks are allocated outside
+ * the lock and published under it; they are freed only after two
+ * consecutive ticks in RETIRING with no copy in flight. */
 static void triple_tick(void)
 {
     int i;
     for (i = 0; i < PROC_ENTRIES; i++) {
         proc_entry_t *e = &g_procs[i];
-        SceUID pid, uid_free = 0, uid_alloc_for = 0;
-        uint32_t st, freed_state = TB_NONE, copies = 0, passes = 0, reason = 0, log_reuse = 0;
-        int wants;
+        SceUID pid, uid_free[TB_SLOTS], uid_alloc_for = 0;
+        uint32_t st, k, want = 0, freed_state = TB_NONE, copies = 0, passes = 0, drops = 0, reason = 0, log_reuse = 0;
+        int wants, giveup, settled = 0;
 
+        for (k = 0; k < TB_SLOTS; k++)
+            uid_free[k] = 0;
         tbl_lock();
         pid = e->pid;
         wants = (pid > 0) && (e->flags & OVRF_TRIPLE);
-        st = e->tb_state;
-        if (wants && e->tb_uid == 0 && st == TB_WANTED) {
-            uid_alloc_for = pid;
-        } else if (wants && !e->tb_failed && e->tb_uid != 0 && (st == TB_WANTED || st == TB_NONE || st == TB_RETIRING)) {
-            /* a new or returning occupant inherits the block */
-            e->tb_next = 0;
-            e->tb_fails = 0;
-            e->tb_last = 0;
-            e->tb_shown = 0;
-            e->tb_reason = 0;
-            e->tb_reason_logged = 0;
-            e->tb_state = TB_READY;
+        st = __atomic_load_n(&e->tb_state, __ATOMIC_ACQUIRE);   /* pairs with the hook's release stores */
+        giveup = e->tb_failed || e->tb_regrow;
+        if (wants && e->tb_uid[0] == 0 && st == TB_WANTED) {
+            if (e->tb_failed) {                 /* refused memory while the blocks were pending: off, nothing to free */
+                e->tb_state = TB_FAILED;
+                settled = 1;
+            } else if (e->tb_want_bytes != 0) { /* 0: the size store is not visible yet, next tick */
+                uid_alloc_for = pid;
+                want = e->tb_want_bytes;
+            }
+        } else if (wants && !giveup && e->tb_uid[0] != 0 && (st == TB_WANTED || st == TB_NONE || st == TB_RETIRING)) {
+            /* a new or returning occupant inherits the blocks (its first
+             * flip retires them if they are too small for its frames) */
+            tb_arm(e);
             log_reuse = 1;
-        } else if (e->tb_uid != 0 && (!wants || e->tb_failed)) {
+        } else if (e->tb_uid[0] != 0 && (!wants || giveup)) {
             if (st != TB_RETIRING) {
                 e->tb_state = TB_RETIRING;      /* step 1: no new copy may start */
             } else if (__atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) == 0) {   /* step 2 */
-                uid_free = e->tb_uid;
+                for (k = 0; k < TB_SLOTS; k++) {
+                    uid_free[k] = e->tb_uid[k];
+                    e->tb_uid[k] = 0;
+                    e->tb_base[k] = 0;
+                }
                 copies = e->tb_copies;
                 passes = e->tb_passes;
-                e->tb_uid = 0;
-                e->tb_base = 0;
+                drops = e->tb_drops;
+                e->tb_nslots = 0;
+                e->tb_slot_bytes = 0;
                 e->tb_last = 0;
                 e->tb_shown = 0;
+                e->tb_regrow = 0;
                 freed_state = e->tb_failed ? TB_FAILED : TB_NONE;
-                e->tb_state = freed_state;
+                e->tb_state = freed_state;      /* NONE: the next flip asks again (re-sized) */
             }
         }
         if (wants && e->tb_reason != 0 && !e->tb_reason_logged) {
@@ -2504,71 +2786,52 @@ static void triple_tick(void)
             klog("triple: %s inherits the buffers of the previous occupant", e->title);
         if (reason)
             klog("triple: %s: first pass-through: %s", e->title, tb_reason_text(reason));
-        if (uid_free > 0) {
-            ksceKernelFreeMemBlock(uid_free);
-            klog("triple: buffers released (%u frames from copies, %u passed through%s)",
-                 copies, passes, freed_state == TB_FAILED ? "; off for this process" : "");
+        if (uid_free[0] > 0) {
+            for (k = 0; k < TB_SLOTS; k++)
+                if (uid_free[k] > 0)
+                    ksceKernelFreeMemBlock(uid_free[k]);
+            settled = 1;
+            klog("triple: buffers released (%u frames from copies, %u passed through, %u dropped%s)",
+                 copies, passes, drops, freed_state == TB_FAILED ? "; off for this process" : "");
         }
         if (uid_alloc_for > 0) {
-            void *base = NULL;
-            uint32_t pool = 0;
-            SceUID uid = -1;
-            /* 1.7.2: try the pools in order and remember which one answered.
-             * Hardware: CDRAM can be full (0x80024309 under Bloodstained), and
-             * a main-memory request with an alignment attribute was refused
-             * (0x80024302), so each candidate is plain and self-contained. */
-            {
-                static const struct { uint32_t type; uint32_t attr; uint32_t pool; } cand[] = {
-                    { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,          0u,                                       1u },
-                    { SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW,  0u,                                       2u },
-                    { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,        SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT,   3u },
-                };
-                uint32_t c;
-                for (c = 0; c < sizeof(cand) / sizeof(cand[0]) && uid < 0; c++) {
-                    SceKernelAllocMemBlockKernelOpt opt;
-                    memset(&opt, 0, sizeof(opt));
-                    opt.size = sizeof(opt);
-                    opt.attr = cand[c].attr;
-                    uid = ksceKernelAllocMemBlock("pstv1080p_triple", cand[c].type, TB_SLOTS * TB_SLOT_BYTES,
-                                                  cand[c].attr ? &opt : NULL);
-                    if (uid >= 0)
-                        pool = cand[c].pool;
-                    else
-                        klog("triple: %s: pool %u (type 0x%08X) refused 0x%08X", e->title, cand[c].pool,
-                             (unsigned)cand[c].type, (unsigned)uid);
-                }
-            }
-            if (uid >= 0 && ksceKernelGetMemBlockBase(uid, &base) < 0) {
-                ksceKernelFreeMemBlock(uid);
-                uid = -1;
-            }
+            SceUID uids[TB_SLOTS];
+            uintptr_t bases[TB_SLOTS];
+            uint32_t n = 0, sz = 0;
+            uint32_t pool = tb_alloc_slots(e->title, want, uids, bases, &n, &sz);
+            int published = 0;
             tbl_lock();
-            if (uid >= 0 && e->pid == uid_alloc_for && (e->flags & OVRF_TRIPLE)
-                && e->tb_uid == 0 && e->tb_state == TB_WANTED) {
-                e->tb_uid = uid;
-                e->tb_base = (uintptr_t)base;
-                e->tb_next = 0;
-                e->tb_fails = 0;
-                e->tb_last = 0;
-                e->tb_shown = 0;
-                e->tb_reason = 0;
-                e->tb_reason_logged = 0;
+            if (pool != 0 && !e->tb_failed && e->pid == uid_alloc_for && (e->flags & OVRF_TRIPLE)
+                && e->tb_uid[0] == 0 && e->tb_state == TB_WANTED) {
+                for (k = 0; k < TB_SLOTS; k++) {
+                    e->tb_uid[k] = uids[k];
+                    e->tb_base[k] = bases[k];
+                }
+                e->tb_nslots = n;
+                e->tb_slot_bytes = sz;
                 e->tb_pool = pool;
-                e->tb_state = TB_READY;
-                uid = 0;                         /* published */
-            } else if (uid < 0 && e->pid == uid_alloc_for) {
-                e->tb_state = TB_FAILED;
+                tb_arm(e);
+                published = 1;
+            } else if (e->pid == uid_alloc_for && e->tb_state == TB_WANTED && (pool == 0 || e->tb_failed)) {
+                e->tb_state = TB_FAILED;        /* nothing to give, or refused meanwhile (give-back) */
+                settled = 1;
             }
             tbl_unlock();
-            if (uid > 0)
-                ksceKernelFreeMemBlock(uid);     /* the slot changed hands meanwhile */
-            else if (uid == 0)
+            if (pool != 0 && !published) {
+                for (k = 0; k < TB_SLOTS; k++)  /* the slot changed hands, or the game was refused meanwhile */
+                    if (uids[k] > 0)
+                        ksceKernelFreeMemBlock(uids[k]);
+                settled = 1;
+            } else if (published) {
                 klog("triple: %s: %u x %u KB of %s at %p, frames are presented from copies from now on",
-                     e->title, (unsigned)TB_SLOTS, (unsigned)(TB_SLOT_BYTES / 1024u),
-                     pool == 1 ? "CDRAM" : pool == 2 ? "main memory, user phycont" : "main memory, kernel phycont", base);
-            else
-                klog("triple: %s: every pool refused the buffers, flips pass through", e->title);
+                     e->title, (unsigned)n, (unsigned)(sz / 1024u), tb_pool_name(pool), (void *)bases[0]);
+            } else {
+                klog("triple: %s: every pool refused the blocks (%u KB each), flips pass through",
+                     e->title, (unsigned)(want / 1024u));
+            }
         }
+        if (settled)
+            e->tb_free_gen++;                   /* the give-back's retry may go ahead */
     }
 }
 
@@ -2579,24 +2842,31 @@ static void triple_release_all(void)
     int i, spins;
     for (i = 0; i < PROC_ENTRIES; i++) {
         proc_entry_t *e = &g_procs[i];
-        SceUID uid;
+        SceUID uids[TB_SLOTS];
+        uint32_t k;
+        int busy;
         for (spins = 0; spins < 200 && __atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) != 0; spins++)
             ksceKernelDelayThread(1000);
         tbl_lock();
-        uid = e->tb_uid;
-        if (__atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) != 0) {
-            uid = -1;                           /* a copy is still in flight: leaking 6.75 MB once
-                                                 * at unload beats freeing memory being written */
-        } else {
-            e->tb_uid = 0;
-            e->tb_base = 0;
+        busy = __atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) != 0;
+        for (k = 0; k < TB_SLOTS; k++) {
+            uids[k] = e->tb_uid[k];
+            if (!busy) {                        /* a copy still in flight: leaking the blocks once at
+                                                 * unload beats freeing memory being written */
+                e->tb_uid[k] = 0;
+                e->tb_base[k] = 0;
+            }
         }
         e->tb_state = TB_NONE;
         tbl_unlock();
-        if (uid > 0)
-            ksceKernelFreeMemBlock(uid);
-        else if (uid == -1)
-            klog("triple: a copy was still in flight at unload; its block is left allocated");
+        if (busy) {
+            if (uids[0] > 0)
+                klog("triple: a copy was still in flight at unload; its blocks are left allocated");
+            continue;
+        }
+        for (k = 0; k < TB_SLOTS; k++)
+            if (uids[k] > 0)
+                ksceKernelFreeMemBlock(uids[k]);
     }
 }
 
@@ -3196,12 +3466,21 @@ static int pstv1080p_thread(SceSize args, void *argp)
 
     /* 3. Periodic work: marker removal, shell pid refresh, watchdog. */
     while (!g_thread_stop) {
-        ksceKernelDelayThread(THREAD_TICK_US);
+        int woke = -1;
+        if (g_evf >= 0) {
+            /* 1.7.3: the tick, or sooner when a hook asks (a game refused
+             * CDRAM is waiting for the frame-copy blocks to be freed). */
+            SceUInt to = THREAD_TICK_US;
+            unsigned int bits = 0;
+            woke = ksceKernelWaitEventFlag(g_evf, EVF_WAKE | EVF_STOP, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &bits, &to);
+        }
+        if (woke < 0 && woke != (int)0x80028005 /* SCE_KERNEL_ERROR_WAIT_TIMEOUT */)
+            ksceKernelDelayThread(THREAD_TICK_US);  /* no flag, or a refused wait: the plain tick */
         if (g_thread_stop)
             break;
 
+        triple_tick();                          /* 1.7.4: before the log flush: a give-back is waiting on it */
         klog_flush();
-        triple_tick();
         /* 1.6.9: refresh the per-game rules from the plugin thread, where ur0
          * is always readable, so an edit takes effect within a couple of
          * seconds and a game's own thread never has to read the file. */
@@ -3688,6 +3967,11 @@ int module_start(SceSize argc, const void *args)
     /* Refresh cache before hooks go live so the hot path never sees stale 60. */
     refresh_display_cache(1);
 
+    /* 1.7.3: created before the hooks that set it. */
+    g_evf = ksceKernelCreateEventFlag("pstv1080p_evf", 0, 0, NULL);
+    if (g_evf < 0)
+        klog("event flag create failed 0x%08X (the thread keeps its plain tick)", (unsigned)g_evf);
+
     install_hooks();
 
     g_procevent_uid = ksceKernelRegisterProcEventHandler("pstv1080p", &g_procevent_handler, 0);
@@ -3727,6 +4011,8 @@ int module_stop(SceSize argc, const void *args)
         g_marker_pending = 0;
     }
     g_thread_stop = 1;
+    if (g_evf >= 0)
+        ksceKernelSetEventFlag(g_evf, EVF_STOP);
     if (g_thread_uid >= 0) {
         SceUInt timeout = 5u * 1000u * 1000u;
         ksceKernelWaitThreadEnd(g_thread_uid, NULL, &timeout);
@@ -3734,6 +4020,14 @@ int module_stop(SceSize argc, const void *args)
         g_thread_uid = -1;
     }
 
+    {
+        /* 1.7.4: a give-back loop sleeps up to 500 ms inside the allocation
+         * hook; it must not call through a released hook.  It sees
+         * g_thread_stop and leaves within 20 ms; wait for that. */
+        int spins;
+        for (spins = 0; spins < 700 && __atomic_load_n(&g_giveback_busy, __ATOMIC_ACQUIRE) != 0; spins++)
+            ksceKernelDelayThread(1000);
+    }
     release_hooks();
     /* 1.7.0: only now, with no hook able to enter and the thread gone, may
      * the frame-copy buffers go; a copy that entered just before waits out. */
@@ -3743,6 +4037,10 @@ int module_stop(SceSize argc, const void *args)
     if (g_procevent_uid >= 0) {
         ksceKernelUnregisterProcEventHandler(g_procevent_uid);
         g_procevent_uid = -1;
+    }
+    if (g_evf >= 0) {                           /* after release_hooks: nothing sets it any more */
+        ksceKernelDeleteEventFlag(g_evf);
+        g_evf = -1;
     }
 
     if (g_mutex >= 0) {
