@@ -48,6 +48,17 @@ for how they differ.
 
 ## Changelog
 
+- **1.7.2 (2026-09-26)** — **`triple` proven; the memory fallback fixed.**
+  Second hardware run: Iconoclasts at full speed with no tearing, 2026 frames
+  from copies, the DMA copy averaging 2.1 ms with two CPU fallbacks in 80
+  seconds. Bloodstained still tore because both allocations failed: CDRAM was
+  full (0x80024309, as before) and the 1.7.1 main-memory request was refused
+  outright (0x80024302), so it was never a shortage of main memory but a
+  request the kernel would not accept. The allocation now walks three
+  self-contained candidates in order, CDRAM, user physically-contiguous main
+  memory, kernel physically-contiguous main memory, and logs each refusal with
+  its type and error code, so whichever the kernel accepts is used and
+  whichever it refuses is on record.
 - **1.7.1 (2026-09-26)** — **`triple` after its first hardware run.** Two
   facts from the log. Iconoclasts: the driver accepted the copied buffers and
   every frame was presented from a copy, but the CPU copy measured 51 ms per

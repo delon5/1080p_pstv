@@ -1400,7 +1400,7 @@ static void trace_profile_tick(void)
             klog("trace: triple: state=%u copies=%u passed=%u | copy max=%u us avg=%u us | cpu fallbacks=%u pool=%s | reason=%u",
                  (unsigned)e->tb_state, (unsigned)e->tb_copies, (unsigned)e->tb_passes,
                  (unsigned)e->tb_us_max, e->tb_copies ? (unsigned)(e->tb_us_sum / e->tb_copies) : 0u,
-                 (unsigned)e->tb_cpu, e->tb_pool == 2 ? "main" : (e->tb_pool == 1 ? "cdram" : "-"),
+                 (unsigned)e->tb_cpu, e->tb_pool == 1 ? "cdram" : e->tb_pool == 2 ? "main-user" : e->tb_pool == 3 ? "main-kernel" : "-",
                  (unsigned)e->tb_reason);
     }
 }
@@ -2511,21 +2511,32 @@ static void triple_tick(void)
         }
         if (uid_alloc_for > 0) {
             void *base = NULL;
-            uint32_t pool = 1;
-            SceUID uid = ksceKernelAllocMemBlock("pstv1080p_triple", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,
-                                                 TB_SLOTS * TB_SLOT_BYTES, NULL);
-            if (uid < 0) {
-                /* 1.7.1: hardware: Bloodstained leaves too little CDRAM for
-                 * 6.75 MB (0x80024309).  The display scans physically
-                 * contiguous main memory just as well; take that instead. */
-                SceKernelAllocMemBlockKernelOpt opt;
-                memset(&opt, 0, sizeof(opt));
-                opt.size = sizeof(opt);
-                opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
-                opt.alignment = 0x100000;
-                uid = ksceKernelAllocMemBlock("pstv1080p_triple", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,
-                                              TB_SLOTS * TB_SLOT_BYTES, &opt);
-                pool = 2;
+            uint32_t pool = 0;
+            SceUID uid = -1;
+            /* 1.7.2: try the pools in order and remember which one answered.
+             * Hardware: CDRAM can be full (0x80024309 under Bloodstained), and
+             * a main-memory request with an alignment attribute was refused
+             * (0x80024302), so each candidate is plain and self-contained. */
+            {
+                static const struct { uint32_t type; uint32_t attr; uint32_t pool; } cand[] = {
+                    { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,          0u,                                       1u },
+                    { SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW,  0u,                                       2u },
+                    { SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,        SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT,   3u },
+                };
+                uint32_t c;
+                for (c = 0; c < sizeof(cand) / sizeof(cand[0]) && uid < 0; c++) {
+                    SceKernelAllocMemBlockKernelOpt opt;
+                    memset(&opt, 0, sizeof(opt));
+                    opt.size = sizeof(opt);
+                    opt.attr = cand[c].attr;
+                    uid = ksceKernelAllocMemBlock("pstv1080p_triple", cand[c].type, TB_SLOTS * TB_SLOT_BYTES,
+                                                  cand[c].attr ? &opt : NULL);
+                    if (uid >= 0)
+                        pool = cand[c].pool;
+                    else
+                        klog("triple: %s: pool %u (type 0x%08X) refused 0x%08X", e->title, cand[c].pool,
+                             (unsigned)cand[c].type, (unsigned)uid);
+                }
             }
             if (uid >= 0 && ksceKernelGetMemBlockBase(uid, &base) < 0) {
                 ksceKernelFreeMemBlock(uid);
@@ -2554,10 +2565,9 @@ static void triple_tick(void)
             else if (uid == 0)
                 klog("triple: %s: %u x %u KB of %s at %p, frames are presented from copies from now on",
                      e->title, (unsigned)TB_SLOTS, (unsigned)(TB_SLOT_BYTES / 1024u),
-                     pool == 1 ? "CDRAM" : "main memory (CDRAM was full)", base);
+                     pool == 1 ? "CDRAM" : pool == 2 ? "main memory, user phycont" : "main memory, kernel phycont", base);
             else
-                klog("triple: %s: allocation failed in CDRAM and main memory (0x%08X), flips pass through",
-                     e->title, (unsigned)uid);
+                klog("triple: %s: every pool refused the buffers, flips pass through", e->title);
         }
     }
 }
