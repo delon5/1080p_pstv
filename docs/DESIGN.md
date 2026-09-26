@@ -327,3 +327,41 @@ to succeed kept its rule. Fix: the plugin thread (kernel context) reloads the
 table every 2 s under g_tbl_mutex, proc_resolve only reads the cached table,
 and a failed open or read keeps whatever is already loaded. The process log
 line reports g_games_count so this class of failure is visible.
+
+## V. `triple`: plugin-owned frame copies (1.7.0)
+
+The tearing on 60 fps games under `frameskip` is buffer reuse, not flip
+timing (section T's correction and the Curse of the Moon / Iconoclasts traces:
+`imm=0`, one wait and one next-frame flip per frame). The game renders into
+its two buffers at 60 Hz; the display holds one for 33 ms; the game comes back
+around and draws into it. The only fix from outside the game is to stop the
+display scanning the game's buffers: `hook_SetFrameBuf` copies the finished
+frame (`ksceKernelCopyFromUser`, 2 MB, on the game's own thread inside its own
+syscall) into one of three kernel-owned CDRAM buffers
+(`SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW`, 3 x 2.25 MB so a 1024-pixel
+stride fits, allocated by the plugin thread on request) and submits the copy
+with `ksceDisplaySetFrameBuf`. The slot is chosen to be neither the one
+submitted last (pending) nor the one on screen. The driver's getter is no use
+for the latter on FW 3.60 (it reports the process slot, which is the pending
+one, and the ForDriver export's argument count is disputed), so the plugin
+tracks it: every wait hook, when a real vblank wait returns, records
+`tb_shown = tb_last`, because the vblank that just passed latched whatever was
+pending. Three slots then always leave one free; the switch is ignored under
+`nowait` where no wait ever returns. Lifetime:
+every state transition happens in `triple_tick` under `g_tbl_mutex` against the
+pid seen under that lock (the first cut decided lock-free and could free a
+block a new occupant had just inherited); the hook announces itself in
+`tb_busy` for the whole copy+submit and retire waits for zero; a slot's
+buffers survive an occupant change but are re-armed only by the thread; eight
+consecutive submit failures mark the process `TB_FAILED` and the block is
+freed; `module_stop` releases the blocks only after the hooks are gone. The
+switch is ignored under the `nowait` rule (unbounded flip rate). The first
+pass-through reason per process is logged once; the expected "not ready yet"
+before allocation is never recorded, and a later real failure replaces and
+re-logs it. Per-occupant bookkeeping restarts through one helper on both the
+miss path and the pid-reuse re-resolve. Sharpscale is unaffected because it hooks
+`sceIftuSetInputFrameBuffer` and two offsets inside SceDisplay, below the
+submit call. Every failure path passes the original flip through and counts a
+pass-through, reported on the `trace` line. Hard rules kept: no allocation,
+free or file I/O in a hook; the copy is the only new work on a game thread and
+it is bounded (2 MB) and skipped for anything larger.

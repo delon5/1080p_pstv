@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.16"
+#define APP_VERSION      "1.7.0"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -93,16 +93,17 @@ static const char *k_mode_desc[M_COUNT] = {
 };
 
 /* Switches: any combination, on top of any rule.  Order = picker order. */
-enum { SW_NOVSYNC = 0, SW_SYNCFLIP, SW_SMOOTH, SW_INJECT, SW_SPOOF720, SW_TRACE, SW_COUNT };
+enum { SW_NOVSYNC = 0, SW_SYNCFLIP, SW_SMOOTH, SW_TRIPLE, SW_INJECT, SW_SPOOF720, SW_TRACE, SW_COUNT };
 
 static const char *k_sw_name[SW_COUNT] = {
-    "novsync", "syncflip", "smooth", "inject", "spoof720", "trace"
+    "novsync", "syncflip", "smooth", "triple", "inject", "spoof720", "trace"
 };
 
 static const char *k_sw_desc[SW_COUNT] = {
     "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.",
     "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.",
     "smooth: with frameskip, space the logic steps as evenly as the game's own timing allows. Judder, not tearing.",
+    "triple: with frameskip, present every frame from a plugin-owned copy (6.75 MB). Removes tearing; ignored under nowait.",
     "inject: always wait one period after each frame flip (Framecapper \"Inject\"). nowait+inject = novsync+Framecapper60Inject.",
     "spoof720: diagnostic, answer display queries as if the output were 720p60.",
     "trace: diagnostic, log this title's display calls every 5 s and its allocations (slower start). Any rule.",

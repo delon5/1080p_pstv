@@ -48,6 +48,44 @@ for how they differ.
 
 ## Changelog
 
+- **1.7.0 (2026-09-26)** — **New `triple` switch: tearing-free 60 fps games
+  on a 30 Hz output.** Trace evidence (Bloodstained: Curse of the Moon,
+  Iconoclasts): one vblank wait and one vsynced flip per frame, no immediate
+  flips, no counter reads. Under `frameskip` such a game renders 60 frames a
+  second into two buffers while the display holds each for 33 ms, so every
+  other frame is drawn into the buffer still on screen. That is the tearing,
+  and no wait or flip flag can change which buffer a game draws into. With
+  `triple` the display is never pointed at the game's buffers: on every flip
+  the finished frame is copied into one of three plugin-owned buffers, chosen
+  so it is neither the one pending nor the one on screen (the plugin knows the
+  latter itself: when one of the game's real vblank waits returns, the vblank
+  just passed has latched whatever was pending), and that copy is what gets
+  submitted. The game keeps its own schedule; nothing it draws
+  afterwards is visible. Cost: 6.75 MB of CDRAM while the title runs (slots
+  fit the common 1024-pixel stride), and one 2 MB copy per flip on the game's
+  own thread. That copy is uncached memory to uncached memory and its real
+  cost is unmeasured until the first hardware run: the `trace` line reports
+  the maximum and average copy time, and if it turns out heavy the kernel's
+  DMA engine is the next step. Latency stays one frame, as for any vsynced
+  flip. Buffers are allocated and freed only by the plugin thread, every
+  transition under the table lock against the occupant seen under that lock,
+  never while a copy is in flight; any doubt (not ready, unexpected
+  parameters, frame too large, copy or submit failure) passes the flip
+  through untouched, and the first such reason is logged once. Eight submit
+  failures in a row switch it off for that process. Ignored under `nowait`,
+  where a game with no waits flips faster than three slots can absorb. Use as
+  `frameskip triple`, with `smooth` if you like; pointless on a 30 fps game.
+  Not for titles running an HD framebuffer patch. Configurator gains the tick
+  box. Three review passes before release: the first cut had a use-after-free
+  between a slot being retired and re-occupied, a dead state that silently
+  disabled the feature, slots too small for the 1024 stride, and a blind slot
+  rotation; the rewrite was then checked finding by finding. Known residual,
+  documented rather than hidden: the on-screen slot is inferred from the
+  game's own vblank waits, so a game that presents from one thread and waits
+  on another, or a 24 Hz output with two skipped waits in a row, can still
+  place one frame into the slot being scanned on rare timings. That costs a
+  torn frame, never memory safety. Both traced titles present and wait on the
+  same thread at 30 Hz, where the exclusion is exact.
 - **1.6.16 (2026-09-26)** — **Configurator only: `inject`, `spoof720` and
   `trace` are switches, not rules.** The kernel has always treated them as
   extras that sit on top of one pacing rule, but the app's picker listed them

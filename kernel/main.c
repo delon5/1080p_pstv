@@ -135,6 +135,8 @@
 #include <psp2kern/kernel/sysclib.h>
 #include <psp2kern/kernel/sysroot.h>
 #include <psp2kern/kernel/proc_event.h>
+#include <psp2kern/kernel/sysmem.h>
+#include <psp2kern/kernel/sysmem/memtype.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/stat.h>
@@ -347,6 +349,28 @@ enum {
                                *             frameskip_smooth_pause): it grows while the game keeps meeting its
                                *             vblank and is cut back as soon as it does not, so a game with no
                                *             slack ends up behaving like plain frameskip. */
+#define OVRF_TRIPLE    0x80u  /* "triple":   1.7.0.  The plugin owns three frame buffers for this title and
+                               *             copies every finished frame into the next one before the display
+                               *             sees it, so the game's own buffers are never scanned out.  For a
+                               *             game that renders 60 frames into 30 display slots and draws into
+                               *             the buffer still on screen (Curse of the Moon, Iconoclasts under
+                               *             frameskip): removes the tearing, one frame of latency, 6 MB of
+                               *             CDRAM while the title runs. */
+#define TB_NONE                       0u
+#define TB_WANTED                     1u    /* hook asked; plugin thread allocates or re-publishes */
+#define TB_READY                      2u
+#define TB_FAILED                     3u    /* allocation or submit failed: off for this process */
+#define TB_RETIRING                   4u    /* no new copies may start; freed once none is in flight */
+#define TB_SLOTS                      3u
+#define TB_SLOT_BYTES                 0x240000u   /* 2.25 MB: pitch 1024 x 544 lines x 4 = 2,228,224 fits */
+#define TB_MAX_SUBMIT_FAILS           8u
+/* Why a flip was passed through (first one recorded, logged once by the thread). */
+#define TBR_NOT_READY                 1u
+#define TBR_BAD_STRUCT                2u
+#define TBR_TOO_BIG                   3u
+#define TBR_COPY_FAILED               4u
+#define TBR_SUBMIT_FAILED             5u
+#define TBR_NOWAIT_RULE               6u
 #define OVRF_SPOOF720  0x4u   /* "spoof720": the display-info queries answer as a 720p60 head */
 #define OVRF_TRACE     0x8u   /* "trace":    DIAGNOSTIC: lifecycle, allocations, display-call profile */
 typedef struct {
@@ -362,6 +386,21 @@ typedef struct {
     volatile SceInt64 step_us;      /* 1.6.14 ("smooth"): when this process's last REAL wait returned */
     volatile SceInt64 pair_us;      /* 1.6.15: the one before that, to measure a skip+wait pair */
     volatile uint32_t pause_us;     /* 1.6.15: how long a skipped wait may currently sleep (adaptive) */
+    volatile SceUID    tb_uid;      /* 1.7.0 "triple": memblock holding the frame copies, 0 = none */
+    volatile uintptr_t tb_base;     /*   its kernel-virtual base */
+    volatile uint32_t  tb_state;    /*   TB_* */
+    volatile uint32_t  tb_next;     /*   next slot to copy into */
+    volatile uint32_t  tb_copies;   /*   frames presented from a copy */
+    volatile uint32_t  tb_passes;   /*   frames passed through untouched (not ready, too big, error) */
+    volatile uint32_t  tb_busy;     /*   copies in flight on the game's threads (retire waits for 0) */
+    volatile uint32_t  tb_reason;   /*   TBR_* of the first pass-through, 0 = none yet */
+    volatile uint32_t  tb_reason_logged;
+    volatile uint32_t  tb_fails;    /*   consecutive submit failures */
+    volatile uint32_t  tb_failed;   /*   this occupant gave up (8 refusals): retire, end in TB_FAILED */
+    volatile uint32_t  tb_us_max;   /*   copy time, microseconds */
+    volatile uint32_t  tb_us_sum;
+    volatile uintptr_t tb_last;     /*   base of the slot submitted last (pending until the vblank) */
+    volatile uintptr_t tb_shown;    /*   base of the slot on screen: tb_last as of the last real vblank wait */
     char title[TITLE_ID_LEN];
     volatile uint32_t cnt[10];      /* 1.6.2 display-call profile (PF_*), reported for "trace" titles */
 } proc_entry_t;
@@ -869,6 +908,21 @@ static void proc_clear(void)
         g_procs[i].step_us = 0;
         g_procs[i].pair_us = 0;
         g_procs[i].pause_us = 0;
+        g_procs[i].tb_uid = 0;
+        g_procs[i].tb_base = 0;
+        g_procs[i].tb_state = 0;
+        g_procs[i].tb_next = 0;
+        g_procs[i].tb_copies = 0;
+        g_procs[i].tb_passes = 0;
+        g_procs[i].tb_busy = 0;
+        g_procs[i].tb_reason = 0;
+        g_procs[i].tb_reason_logged = 0;
+        g_procs[i].tb_fails = 0;
+        g_procs[i].tb_failed = 0;
+        g_procs[i].tb_us_max = 0;
+        g_procs[i].tb_us_sum = 0;
+        g_procs[i].tb_last = 0;
+        g_procs[i].tb_shown = 0;
         g_procs[i].title[0] = 0;
     }
 }
@@ -1007,6 +1061,7 @@ static const char *ovr_desc(uint32_t mode, uint32_t flags, char *buf, int len)
     if (flags & OVRF_NOVSYNC)  ovr_append(buf, len, &n, "novsync");
     if (flags & OVRF_SYNCFLIP) ovr_append(buf, len, &n, "syncflip");
     if (flags & OVRF_SMOOTH)   ovr_append(buf, len, &n, "smooth");
+    if (flags & OVRF_TRIPLE)   ovr_append(buf, len, &n, "triple");
     if (flags & OVRF_INJECT)   ovr_append(buf, len, &n, "inject");
     if (flags & OVRF_SPOOF720) ovr_append(buf, len, &n, "spoof720");
     if (flags & OVRF_TRACE)    ovr_append(buf, len, &n, "trace");
@@ -1108,6 +1163,7 @@ static void games_list_load(int do_log)
                 else if (str_ieq(buf + m_start, tl, "immflip"))   { /* removed in 1.6.12, accepted and ignored */ }
                 else if (str_ieq(buf + m_start, tl, "syncflip"))  flags |= OVRF_SYNCFLIP;
                 else if (str_ieq(buf + m_start, tl, "smooth"))    flags |= OVRF_SMOOTH;
+                else if (str_ieq(buf + m_start, tl, "triple"))    flags |= OVRF_TRIPLE;
                 else if (str_ieq(buf + m_start, tl, "spoof720"))  flags |= OVRF_SPOOF720;
                 else if (str_ieq(buf + m_start, tl, "trace"))     flags |= OVRF_TRACE;
                 else { unknown = 1; break; }
@@ -1335,6 +1391,11 @@ static void trace_profile_tick(void)
              d[PF_WAITVB], d[PF_WAITVBCB], d[PF_WAITVBMULTI], now[PF_MULTI_MAX],
              d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
              e->cb_synced ? "yes" : "no", ovr_desc(e->override, e->flags, od, sizeof(od)), (unsigned)g_refresh_hz);
+        if (e->tb_uid != 0 || e->tb_state != TB_NONE)
+            klog("trace: triple: state=%u copies=%u passed=%u | copy max=%u us avg=%u us | reason=%u",
+                 (unsigned)e->tb_state, (unsigned)e->tb_copies, (unsigned)e->tb_passes,
+                 (unsigned)e->tb_us_max, e->tb_copies ? (unsigned)(e->tb_us_sum / e->tb_copies) : 0u,
+                 (unsigned)e->tb_reason);
     }
 }
 
@@ -1447,6 +1508,30 @@ static const SceProcEventHandler g_procevent_handler = {
  * publishes the pid.  A pid never has two entries, so cb_synced / acc /
  * override cannot be split across slots, and a live game is not pushed out
  * by newly started background processes. */
+/* 1.7.0: per-occupant "triple" bookkeeping restarts whenever a slot gets a
+ * new process, on the miss path and on the pid-reuse re-resolve alike.  A
+ * block left by the previous occupant stays (only the plugin thread re-arms
+ * or frees it, under the lock) and tb_busy is never touched here: a copy may
+ * be in flight on the old occupant's thread. */
+static inline void tb_new_occupant(proc_entry_t *e)
+{
+    if (e->tb_uid == 0)
+        e->tb_state = TB_NONE;
+    else if (e->tb_state == TB_FAILED || e->tb_failed)
+        e->tb_state = TB_RETIRING;      /* a verdict never crosses occupants: re-armed or freed clean */
+    e->tb_failed = 0;
+    e->tb_next = 0;
+    e->tb_copies = 0;
+    e->tb_passes = 0;
+    e->tb_reason = 0;
+    e->tb_reason_logged = 0;
+    e->tb_fails = 0;
+    e->tb_us_max = 0;
+    e->tb_us_sum = 0;
+    e->tb_last = 0;
+    e->tb_shown = 0;
+}
+
 #define PROC_RECHECK_US               (3000000LL)   /* 1.6.6: title re-check period on the hit path */
 
 static proc_entry_t *proc_lookup(SceUID pid, int create)
@@ -1477,6 +1562,7 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
                             e->last_sync_us = 0;
                             e->cb_synced = 0;
                             e->created_us = now;
+                            tb_new_occupant(e);
                             proc_resolve(e, pid);
                             e->pid = pid;
                         }
@@ -1519,6 +1605,7 @@ static proc_entry_t *proc_lookup(SceUID pid, int create)
     e->cb_synced = 0;
     e->created_us = now_us();
     e->checked_us = e->created_us;
+    tb_new_occupant(e);                 /* 1.7.0 */
     proc_resolve(e, pid);
     e->pid = pid;
     tbl_unlock();
@@ -1539,6 +1626,7 @@ typedef struct {
     uint32_t inject;    /* 0 off, 1 auto, 2 always (explicit: honoured with every rule) */
     uint32_t syncflip;  /* 1.6.11: force SETBUF_NEXTFRAME on every flip ("syncflip") */
     uint32_t smooth;    /* 1.6.14: even out frameskip's skipped waits ("smooth") */
+    uint32_t triple;    /* 1.7.0: present every frame from a plugin-owned copy ("triple") */
 } pace_t;
 
 static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out);
@@ -1552,6 +1640,7 @@ static inline void pace_for(SceUID pid, proc_entry_t **pe, pace_t *out)
         if (f & OVRF_NOVSYNC) out->mode = PACE_NOWAIT;   /* every vblank wait returns at once */
         if (f & OVRF_SYNCFLIP) out->syncflip = 1;   /* 1.6.11 */
         if (f & OVRF_SMOOTH)   out->smooth = 1;     /* 1.6.14 */
+        if (f & OVRF_TRIPLE)   out->triple = (out->mode != PACE_NOWAIT);   /* 1.7.0; never under nowait */
     }
 }
 
@@ -1563,6 +1652,7 @@ static inline void pace_base(SceUID pid, proc_entry_t **pe, pace_t *out)
     out->inject = 0;
     out->syncflip = 0;
     out->smooth = 0;
+    out->triple = 0;
     *pe = NULL;
     if (pid <= 0 || pid == KERNEL_PID || pid == shell_pid_now())
         return;
@@ -1776,6 +1866,8 @@ static int hook_WaitVblankStartMulti(unsigned int vcount)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1803,6 +1895,8 @@ static int hook_WaitVblankStartMultiCB(unsigned int vcount)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1825,6 +1919,8 @@ static int hook_WaitVblankStart(void)
             proc_mark_sync(e);
             if (pc.smooth)
                 frameskip_mark_step(e);
+            if (pc.triple && e)
+                e->tb_shown = e->tb_last;
             return ret;
         }
     } else if (pc.mode == PSTV1080P_FPS_FORCE) {
@@ -1832,6 +1928,8 @@ static int hook_WaitVblankStart(void)
         if (interval > 1) {
             ret = ksceDisplayWaitVblankStartMulti(interval);
             proc_mark_sync(e);
+            if (pc.triple && e)
+                e->tb_shown = e->tb_last;
             return ret;
         }
     }
@@ -1840,6 +1938,8 @@ static int hook_WaitVblankStart(void)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1864,6 +1964,8 @@ static int hook_WaitVblankStartCB(void)
             proc_mark_sync(e);
             if (pc.smooth)
                 frameskip_mark_step(e);
+            if (pc.triple && e)
+                e->tb_shown = e->tb_last;
             return ret;
         }
     } else if (pc.mode == PSTV1080P_FPS_FORCE) {
@@ -1871,6 +1973,8 @@ static int hook_WaitVblankStartCB(void)
         if (interval > 1) {
             ret = ksceDisplayWaitVblankStartMultiCB(interval);
             proc_mark_sync(e);
+            if (pc.triple && e)
+                e->tb_shown = e->tb_last;
             return ret;
         }
     }
@@ -1878,6 +1982,8 @@ static int hook_WaitVblankStartCB(void)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1903,6 +2009,8 @@ static int hook_WaitSetFrameBufMulti(unsigned int vcount)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1930,6 +2038,8 @@ static int hook_WaitSetFrameBufMultiCB(unsigned int vcount)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1951,6 +2061,8 @@ static int hook_WaitSetFrameBuf(void)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -1972,6 +2084,8 @@ static int hook_WaitSetFrameBufCB(void)
     proc_mark_sync(e);
     if (pc.smooth)                  /* 1.6.14: a real wait resets the spacing clock */
         frameskip_mark_step(e);
+    if (pc.triple && e)             /* 1.7.0: the vblank just passed latched the pending slot */
+        e->tb_shown = e->tb_last;
     return ret;
 }
 
@@ -2194,6 +2308,258 @@ static inline int inject_wanted(proc_entry_t *e, uint32_t inject)
     return idle > limit;
 }
 
+/* 1.7.0 "triple": plugin-owned frame copies.
+ *
+ * Why: on a 30 Hz head a game that renders 60 frames a second into two
+ * buffers draws every other frame into the buffer that is still being scanned
+ * out.  No wait or flip flag can change which buffer the game draws into, so
+ * instead the display is never pointed at the game's buffers at all: on every
+ * flip the finished frame is copied into one of three plugin-owned buffers and
+ * THAT is submitted.  The game keeps its own schedule and its own two buffers;
+ * nothing it draws afterwards is visible.  Three copies suffice for up to two
+ * flips per output period, which is what frameskip produces.
+ *
+ * Where: the copy runs inside the game's own sceDisplaySetFrameBuf syscall, on
+ * the game's thread (about 2 MB, one to two milliseconds on this CPU).  The
+ * buffers are allocated and freed by the plugin thread, never in a hook.  Any
+ * doubt -- not ready, frame too large, copy or submit error -- passes the flip
+ * through untouched, so the worst case is the tearing you had. */
+
+static inline void tb_note(proc_entry_t *e, uint32_t reason)
+{
+    /* Record the first reason, but let any real failure replace the expected
+     * "not ready yet", and re-arm the once-per-reason log when it changes. */
+    if (e->tb_reason == 0 || (e->tb_reason == TBR_NOT_READY && reason != TBR_NOT_READY)) {
+        e->tb_reason = reason;
+        e->tb_reason_logged = 0;
+    }
+}
+
+/* Returns 1 if the frame was presented from a copy (*pret set), 0 to pass through.
+ * Runs on the game's thread inside its own flip syscall.  Announces itself in
+ * tb_busy for the whole copy+submit so the plugin thread never frees the
+ * block underneath it, and re-checks the state after announcing. */
+static int triple_present(proc_entry_t *e, const void *pFrameBuf, int sync, int *pret)
+{
+    SceDisplayFrameBuf fb, kfb;
+    uintptr_t base, disp, target;
+    uint32_t bytes, slot, k;
+    SceInt64 t0;
+    int ret;
+
+    if (e->tb_state == TB_NONE && e->tb_uid == 0) {
+        e->tb_state = TB_WANTED;                /* the plugin thread allocates; expected, not noted */
+        return 0;
+    }
+    __atomic_add_fetch(&e->tb_busy, 1u, __ATOMIC_ACQUIRE);
+    base = e->tb_base;
+    if (e->tb_state != TB_READY || base == 0) {
+        if (e->tb_state != TB_WANTED)           /* waiting for the allocation is normal */
+            tb_note(e, TBR_NOT_READY);
+        goto out_pass;
+    }
+    if (ksceKernelCopyFromUser(&fb, pFrameBuf, sizeof(fb)) < 0
+        || fb.size != sizeof(fb) || fb.base == NULL || fb.pitch == 0 || fb.height == 0
+        || fb.pitch > 4096u || fb.height > 1088u) {
+        tb_note(e, TBR_BAD_STRUCT);
+        goto out_pass;
+    }
+    bytes = fb.pitch * fb.height * 4u;          /* every SceDisplay pixel format is 32 bpp */
+    if (bytes > TB_SLOT_BYTES) {
+        tb_note(e, TBR_TOO_BIG);                /* an HD-patched game: leave it alone */
+        goto out_pass;
+    }
+
+    /* Pick a slot that is neither pending (submitted last, shown from the
+     * next vblank) nor on screen.  The driver's getter cannot tell us the
+     * latter on this firmware (it reports the process slot, i.e. tb_last), so
+     * the on-screen slot is tracked by the plugin itself: whenever one of the
+     * game's real vblank waits returns, the vblank just passed has latched
+     * whatever was pending, and the wait hooks record tb_shown = tb_last at
+     * that moment.  With three slots one always remains. */
+    disp = e->tb_shown;
+    slot = e->tb_next;
+    for (k = 0; k < TB_SLOTS; k++) {
+        target = base + slot * TB_SLOT_BYTES;
+        if (target != e->tb_last && target != disp)
+            break;
+        slot = (slot + 1u) % TB_SLOTS;
+    }
+    target = base + slot * TB_SLOT_BYTES;
+    e->tb_next = (slot + 1u) % TB_SLOTS;
+
+    t0 = now_us();
+    if (ksceKernelCopyFromUser((void *)target, fb.base, bytes) < 0) {
+        tb_note(e, TBR_COPY_FAILED);
+        goto out_pass;
+    }
+    {
+        uint32_t dt = (uint32_t)(now_us() - t0);
+        if (dt > e->tb_us_max)
+            e->tb_us_max = dt;
+        e->tb_us_sum += dt;
+    }
+    kfb = fb;
+    kfb.base = (void *)target;
+    ret = ksceDisplaySetFrameBuf(&kfb, sync);
+    if (ret < 0) {
+        tb_note(e, TBR_SUBMIT_FAILED);
+        if (++e->tb_fails >= TB_MAX_SUBMIT_FAILS) {
+            e->tb_failed = 1;                   /* stop paying for copies; the thread retires and */
+            e->tb_state = TB_RETIRING;          /* frees through the same two-step path as an exit */
+        }
+        goto out_pass;
+    }
+    e->tb_fails = 0;
+    e->tb_last = target;
+    e->tb_copies++;
+    __atomic_sub_fetch(&e->tb_busy, 1u, __ATOMIC_RELEASE);
+    *pret = ret;
+    return 1;
+
+out_pass:
+    __atomic_sub_fetch(&e->tb_busy, 1u, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static const char *tb_reason_text(uint32_t r)
+{
+    switch (r) {
+    case TBR_NOT_READY:     return "buffers not ready yet";
+    case TBR_BAD_STRUCT:    return "unexpected framebuffer parameters";
+    case TBR_TOO_BIG:       return "frame larger than a 2.25 MB slot (HD patch?)";
+    case TBR_COPY_FAILED:   return "copy from the game's buffer failed";
+    case TBR_SUBMIT_FAILED: return "driver refused the copied buffer";
+    case TBR_NOWAIT_RULE:   return "ignored under the nowait rule";
+    default:                return "?";
+    }
+}
+
+/* Plugin thread, every tick.  Every decision about a slot's buffers is taken
+ * under g_tbl_mutex, against the occupant seen under that same lock, so a
+ * slot that changes hands between two ticks cannot be freed for its old
+ * occupant or armed for the wrong one.  The block itself is allocated outside
+ * the lock and published under it; it is freed only after two consecutive
+ * ticks in RETIRING with no copy in flight. */
+static void triple_tick(void)
+{
+    int i;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        proc_entry_t *e = &g_procs[i];
+        SceUID pid, uid_free = 0, uid_alloc_for = 0;
+        uint32_t st, freed_state = TB_NONE, copies = 0, passes = 0, reason = 0, log_reuse = 0;
+        int wants;
+
+        tbl_lock();
+        pid = e->pid;
+        wants = (pid > 0) && (e->flags & OVRF_TRIPLE);
+        st = e->tb_state;
+        if (wants && e->tb_uid == 0 && st == TB_WANTED) {
+            uid_alloc_for = pid;
+        } else if (wants && !e->tb_failed && e->tb_uid != 0 && (st == TB_WANTED || st == TB_NONE || st == TB_RETIRING)) {
+            /* a new or returning occupant inherits the block */
+            e->tb_next = 0;
+            e->tb_fails = 0;
+            e->tb_last = 0;
+            e->tb_shown = 0;
+            e->tb_reason = 0;
+            e->tb_reason_logged = 0;
+            e->tb_state = TB_READY;
+            log_reuse = 1;
+        } else if (e->tb_uid != 0 && (!wants || e->tb_failed)) {
+            if (st != TB_RETIRING) {
+                e->tb_state = TB_RETIRING;      /* step 1: no new copy may start */
+            } else if (__atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) == 0) {   /* step 2 */
+                uid_free = e->tb_uid;
+                copies = e->tb_copies;
+                passes = e->tb_passes;
+                e->tb_uid = 0;
+                e->tb_base = 0;
+                e->tb_last = 0;
+                e->tb_shown = 0;
+                freed_state = e->tb_failed ? TB_FAILED : TB_NONE;
+                e->tb_state = freed_state;
+            }
+        }
+        if (wants && e->tb_reason != 0 && !e->tb_reason_logged) {
+            e->tb_reason_logged = 1;
+            reason = e->tb_reason;
+        }
+        tbl_unlock();
+
+        if (log_reuse)
+            klog("triple: %s inherits the buffers of the previous occupant", e->title);
+        if (reason)
+            klog("triple: %s: first pass-through: %s", e->title, tb_reason_text(reason));
+        if (uid_free > 0) {
+            ksceKernelFreeMemBlock(uid_free);
+            klog("triple: buffers released (%u frames from copies, %u passed through%s)",
+                 copies, passes, freed_state == TB_FAILED ? "; off for this process" : "");
+        }
+        if (uid_alloc_for > 0) {
+            void *base = NULL;
+            SceUID uid = ksceKernelAllocMemBlock("pstv1080p_triple", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,
+                                                 TB_SLOTS * TB_SLOT_BYTES, NULL);
+            if (uid >= 0 && ksceKernelGetMemBlockBase(uid, &base) < 0) {
+                ksceKernelFreeMemBlock(uid);
+                uid = -1;
+            }
+            tbl_lock();
+            if (uid >= 0 && e->pid == uid_alloc_for && (e->flags & OVRF_TRIPLE)
+                && e->tb_uid == 0 && e->tb_state == TB_WANTED) {
+                e->tb_uid = uid;
+                e->tb_base = (uintptr_t)base;
+                e->tb_next = 0;
+                e->tb_fails = 0;
+                e->tb_last = 0;
+                e->tb_shown = 0;
+                e->tb_reason = 0;
+                e->tb_reason_logged = 0;
+                e->tb_state = TB_READY;
+                uid = 0;                         /* published */
+            } else if (uid < 0 && e->pid == uid_alloc_for) {
+                e->tb_state = TB_FAILED;
+            }
+            tbl_unlock();
+            if (uid > 0)
+                ksceKernelFreeMemBlock(uid);     /* the slot changed hands meanwhile */
+            else if (uid == 0)
+                klog("triple: %s: %u x %u KB of CDRAM at %p, frames are presented from copies from now on",
+                     e->title, (unsigned)TB_SLOTS, (unsigned)(TB_SLOT_BYTES / 1024u), base);
+            else
+                klog("triple: %s: CDRAM allocation failed 0x%08X, flips pass through", e->title, (unsigned)uid);
+        }
+    }
+}
+
+/* module_stop only, after the hooks are released and the thread is gone:
+ * waits briefly for any copy that entered before the release to finish. */
+static void triple_release_all(void)
+{
+    int i, spins;
+    for (i = 0; i < PROC_ENTRIES; i++) {
+        proc_entry_t *e = &g_procs[i];
+        SceUID uid;
+        for (spins = 0; spins < 200 && __atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) != 0; spins++)
+            ksceKernelDelayThread(1000);
+        tbl_lock();
+        uid = e->tb_uid;
+        if (__atomic_load_n(&e->tb_busy, __ATOMIC_ACQUIRE) != 0) {
+            uid = -1;                           /* a copy is still in flight: leaking 6.75 MB once
+                                                 * at unload beats freeing memory being written */
+        } else {
+            e->tb_uid = 0;
+            e->tb_base = 0;
+        }
+        e->tb_state = TB_NONE;
+        tbl_unlock();
+        if (uid > 0)
+            ksceKernelFreeMemBlock(uid);
+        else if (uid == -1)
+            klog("triple: a copy was still in flight at unload; its block is left allocated");
+    }
+}
+
 static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
 {
     SceUID pid = ksceKernelGetProcessId();
@@ -2207,7 +2573,16 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
      * tearing from a game that flips immediately by itself). */
     if (pc.syncflip && sync == 0)
         sync = 1;                                   /* SCE_DISPLAY_SETBUF_NEXTFRAME */
-    ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
+    if (pc.triple && e && triple_present(e, pFrameBuf, sync, &ret)) {
+        /* presented from a plugin-owned copy; fall through to inject below */
+    } else {
+        if (e && (e->flags & OVRF_TRIPLE)) {
+            e->tb_passes++;
+            if (!pc.triple)
+                tb_note(e, TBR_NOWAIT_RULE);
+        }
+        ret = HOOK_NEXT(hook_SetFrameBuf, g_pacing_ref[PH_SETFRAMEBUF], pFrameBuf, sync, pOpt);
+    }
 
     /* Inject: an explicit "inject" extra applies with any rule (Framecapper
      * Inject); the automatic kind only where the rule allows it. */
@@ -2217,6 +2592,8 @@ static int hook_SetFrameBuf(const void *pFrameBuf, int sync, void *pOpt)
         unsigned int n = (pc.mode == PSTV1080P_FPS_FORCE) ? force_interval() : 1u;
         ksceDisplayWaitVblankStartMulti(n);
         proc_mark_sync(e);
+        if (pc.triple && e)
+            e->tb_shown = e->tb_last;   /* 1.7.0: this real wait passed a vblank too */
     }
     /* After the flip: run a scheduled HD apply from SceShell's context (A9). */
     shell_apply_check_pid(pid);
@@ -2784,6 +3161,7 @@ static int pstv1080p_thread(SceSize args, void *argp)
             break;
 
         klog_flush();
+        triple_tick();
         /* 1.6.9: refresh the per-game rules from the plugin thread, where ur0
          * is always readable, so an edit takes effect within a couple of
          * seconds and a game's own thread never has to read the file. */
@@ -3317,6 +3695,10 @@ int module_stop(SceSize argc, const void *args)
     }
 
     release_hooks();
+    /* 1.7.0: only now, with no hook able to enter and the thread gone, may
+     * the frame-copy buffers go; a copy that entered just before waits out. */
+    ksceKernelDelayThread(20000);
+    triple_release_all();
 
     if (g_procevent_uid >= 0) {
         ksceKernelUnregisterProcEventHandler(g_procevent_uid);
