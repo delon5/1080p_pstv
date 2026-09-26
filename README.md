@@ -48,6 +48,15 @@ for how they differ.
 
 ## Changelog
 
+- **1.6.16 (2026-09-26)** — **Configurator only: `inject`, `spoof720` and
+  `trace` are switches, not rules.** The kernel has always treated them as
+  extras that sit on top of one pacing rule, but the app's picker listed them
+  next to `frameskip` and `nowait` as if choosing one excluded the other, so
+  `frameskip` plus `trace` could not be set without editing the file by hand.
+  The picker now has five rules and six tick boxes (`novsync`, `syncflip`,
+  `smooth`, `inject`, `spoof720`, `trace`), any combination allowed. Existing
+  file lines load unchanged, including a switch word on its own. The kernel
+  module and the Settings plugin are untouched; only the VPK changed.
 - **1.6.15 (2026-09-12)** — **Fixes `smooth`, which 1.6.14 got wrong twice.**
   Review before it reached hardware, with both cases traced: (1) a fixed half
   period pause does not merely fill idle time, it moves the start of the

@@ -36,7 +36,7 @@
 
 #include "pstv1080p.h"
 
-#define APP_VERSION      "1.6.15"
+#define APP_VERSION      "1.6.16"
 #define OWN_TITLE_ID     "PSTV10801"
 
 #define SCREEN_W         960
@@ -74,10 +74,13 @@
 /* Override modes (must match kernel/main.c games_list_load)                  */
 /* ------------------------------------------------------------------------- */
 
-enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_INJECT, M_FORCE, M_SCALE, M_SPOOF720, M_TRACE, M_COUNT };
+/* 1.6.16: the kernel's model is ONE pacing rule per title plus any number of
+ * extras.  The picker used to show inject/spoof720/trace as rules, so they
+ * could not be combined with frameskip or nowait; they are switches now. */
+enum { M_NONE = 0, M_FRAMESKIP, M_NOWAIT, M_OFF, M_FORCE, M_SCALE, M_COUNT };
 
 static const char *k_mode_name[M_COUNT] = {
-    "none", "frameskip", "nowait", "off", "inject", "force", "scale", "spoof720", "trace"
+    "none", "frameskip", "nowait", "off", "force", "scale"
 };
 
 static const char *k_mode_desc[M_COUNT] = {
@@ -85,11 +88,24 @@ static const char *k_mode_desc[M_COUNT] = {
     "Skip every second vblank wait at 30 Hz. Fixes games that run at half speed.",
     "Never wait for vblank (like novsync) for this title. For games stuck at 15 fps.",
     "No pacing change and no inject for this title.",
-    "Always wait one period after each frame flip (Framecapper \"Inject\").",
     "Framecapper-style fixed target (the global target fps) for this title.",
     "The default rule; use it to exempt a title from a global FORCE mode.",
-    "Diagnostic: answer display queries as if the output were 720p60.",
-    "Diagnostic: log this title's process lifecycle and allocations (slower start).",
+};
+
+/* Switches: any combination, on top of any rule.  Order = picker order. */
+enum { SW_NOVSYNC = 0, SW_SYNCFLIP, SW_SMOOTH, SW_INJECT, SW_SPOOF720, SW_TRACE, SW_COUNT };
+
+static const char *k_sw_name[SW_COUNT] = {
+    "novsync", "syncflip", "smooth", "inject", "spoof720", "trace"
+};
+
+static const char *k_sw_desc[SW_COUNT] = {
+    "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.",
+    "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.",
+    "smooth: with frameskip, space the logic steps as evenly as the game's own timing allows. Judder, not tearing.",
+    "inject: always wait one period after each frame flip (Framecapper \"Inject\"). nowait+inject = novsync+Framecapper60Inject.",
+    "spoof720: diagnostic, answer display queries as if the output were 720p60.",
+    "trace: diagnostic, log this title's display calls every 5 s and its allocations (slower start). Any rule.",
 };
 
 static unsigned mode_color(int m)
@@ -99,7 +115,6 @@ static unsigned mode_color(int m)
     case M_FRAMESKIP: return C_OK;
     case M_NOWAIT:    return C_WARN;
     case M_OFF:       return C_ERR;
-    case M_INJECT:    return C_ACCENT;
     case M_FORCE:     return RGBA8(220, 140, 255, 255);
     case M_SCALE:     return C_OK;
     default:          return RGBA8(255, 230, 120, 255);
@@ -132,12 +147,8 @@ typedef struct {
     char tail[TAIL_LEN];   /* whatever followed the mode on its line (a note), written back */
     int  mode;
     int  orig_mode;
-    int  novsync;          /* 1.6.3: the "novsync" switch attached to the option */
-    int  orig_novsync;
-    int  syncflip;         /* 1.6.11: the "syncflip" switch (flips latched at a vblank) */
-    int  orig_syncflip;
-    int  smooth;           /* 1.6.14: the "smooth" switch (even spacing for frameskip) */
-    int  orig_smooth;
+    int  sw[SW_COUNT];     /* 1.6.16: the switches (SW_*), each 0/1 */
+    int  orig_sw[SW_COUNT];
     int  installed;
     int  from_file;        /* this title had a line in the file (first line wins, like the kernel) */
     int  file_order;       /* 1.6.6: 1-based position of its line in the file (0 = not from the file) */
@@ -145,12 +156,6 @@ typedef struct {
     int  note_len;         /*        g_comments[note_off .. note_off+note_len), written back above it */
 } game_t;
 
-static const char k_novsync_desc[] =
-    "novsync: all eight vblank waits return at once, exactly like novsync.suprx. Same effect as the nowait option.";
-static const char k_smooth_desc[] =
-    "smooth: with frameskip, space the logic steps as evenly as the game's own timing allows. Judder, not tearing.";
-static const char k_syncflip_desc[] =
-    "syncflip: every flip is latched at a vblank instead of mid-scan. Against tearing, e.g. with frameskip.";
 
 static game_t g_games[MAX_GAMES];
 static int g_ngames;
@@ -187,14 +192,53 @@ static void set_status(unsigned color, const char *fmt, ...)
     g_status_frames = 60 * 5;
 }
 
+static int any_switch(const game_t *g)
+{
+    int i;
+    for (i = 0; i < SW_COUNT; i++)
+        if (g->sw[i])
+            return 1;
+    return 0;
+}
+
 static int game_changed(const game_t *g)
 {
-    return g->mode != g->orig_mode || g->novsync != g->orig_novsync || g->syncflip != g->orig_syncflip || g->smooth != g->orig_smooth;
+    int i;
+    if (g->mode != g->orig_mode)
+        return 1;
+    for (i = 0; i < SW_COUNT; i++)
+        if (g->sw[i] != g->orig_sw[i])
+            return 1;
+    return 0;
 }
 
 static int game_active(const game_t *g)
 {
-    return g->mode != M_NONE || g->novsync || g->syncflip || g->smooth;
+    return g->mode != M_NONE || any_switch(g);
+}
+
+/* "frameskip+novsync+trace", or "novsync" alone, or "none". */
+static const char *override_text(const game_t *g, char *buf, int len)
+{
+    int n = 0, i;
+    buf[0] = 0;
+    if (g->mode != M_NONE)
+        n += snprintf(buf + n, (size_t)(len - n), "%s", k_mode_name[g->mode]);
+    for (i = 0; i < SW_COUNT && n < len - 1; i++)
+        if (g->sw[i])
+            n += snprintf(buf + n, (size_t)(len - n), "%s%s", n ? "+" : "", k_sw_name[i]);
+    if (n == 0)
+        snprintf(buf, (size_t)len, "none");
+    return buf;
+}
+
+static int sw_from_name(const char *s, int len)
+{
+    int i;
+    for (i = 0; i < SW_COUNT; i++)
+        if ((int)strlen(k_sw_name[i]) == len && strncasecmp(s, k_sw_name[i], (size_t)len) == 0)
+            return i;
+    return -1;
 }
 
 static int dirty(void)
@@ -345,16 +389,12 @@ static void load_games_file(void)
             m_end = m_start;
             while (m_end < e && buf[m_end] != ' ' && buf[m_end] != '\t') m_end++;
             mode = (m_start < e) ? mode_from_name(buf + m_start, m_end - m_start) : -1;
-            /* "TITLEID novsync ..." / "TITLEID immflip ...": a switch alone. */
-            if (mode < 0 && m_start < e && (m_end - m_start) == 7 &&
-                (strncasecmp(buf + m_start, "novsync", 7) == 0 ||
-                 strncasecmp(buf + m_start, "immflip", 7) == 0))   /* immflip: dropped on save */
-                mode = M_NONE;
-            if (mode < 0 && m_start < e && (m_end - m_start) == 6 &&
-                strncasecmp(buf + m_start, "smooth", 6) == 0)
-                mode = M_NONE;
-            if (mode < 0 && m_start < e && (m_end - m_start) == 8 &&
-                strncasecmp(buf + m_start, "syncflip", 8) == 0)
+            /* "TITLEID novsync ...", "TITLEID trace ...": a switch as the first
+             * word means no rule; the switch is picked up from the tail below.
+             * ("immflip", removed in 1.6.12, is accepted here and dropped.) */
+            if (mode < 0 && m_start < e &&
+                (sw_from_name(buf + m_start, m_end - m_start) >= 0 ||
+                 ((m_end - m_start) == 7 && strncasecmp(buf + m_start, "immflip", 7) == 0)))
                 mode = M_NONE;
             if ((t_end - s0) != 9 || mode < 0) {
                 /* The kernel ignores such a line too; keep it so nothing is lost. */
@@ -395,17 +435,16 @@ static void load_games_file(void)
                     tl = TAIL_LEN - 1;
                 memcpy(g->tail, buf + ts, (size_t)tl);
                 g->tail[tl] = 0;
-                if (strip_word(g->tail, "novsync"))
-                    g->novsync = 1;
-                strip_word(g->tail, "immflip");     /* 1.6.12: removed, drop it from the line */
-                if (strip_word(g->tail, "syncflip"))
-                    g->syncflip = 1;
-                if (strip_word(g->tail, "smooth"))
-                    g->smooth = 1;
-                g->orig_mode = g->mode;
-                g->orig_novsync = g->novsync;
-                g->orig_syncflip = g->syncflip;
-                g->orig_smooth = g->smooth;
+                {
+                    int k;
+                    for (k = 0; k < SW_COUNT; k++)
+                        if (strip_word(g->tail, k_sw_name[k]))
+                            g->sw[k] = 1;
+                    strip_word(g->tail, "immflip");     /* 1.6.12: removed, drop it from the line */
+                    g->orig_mode = g->mode;
+                    for (k = 0; k < SW_COUNT; k++)
+                        g->orig_sw[k] = g->sw[k];
+                }
             }
         }
     }
@@ -470,8 +509,8 @@ static int save_games_file(void)
 
         for (i = 0; i < n_order; i++) {
             const game_t *g = order[i];
-            char line[128];     /* id + "frameskip force" + " novsync" + " syncflip" + tail + NUL */
-            int n = 0, ok;
+            char line[160];     /* id + rule + up to six switch words + tail + NUL */
+            int n = 0, ok, k;
             /* 1.6.6: the comment lines that sat above this entry go back above
              * it; an entry added here gets the game's name as its comment. */
             if (g->note_len > 0) {
@@ -486,12 +525,9 @@ static int save_games_file(void)
             n += snprintf(line + n, sizeof(line) - (size_t)n, "%s", g->id);
             if (g->mode != M_NONE)
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_mode_name[g->mode]);
-            if (g->novsync)
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " novsync");
-            if (g->syncflip)
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " syncflip");
-            if (g->smooth)
-                n += snprintf(line + n, sizeof(line) - (size_t)n, " smooth");
+            for (k = 0; k < SW_COUNT; k++)
+                if (g->sw[k])
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", k_sw_name[k]);
             if (g->tail[0])
                 n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", g->tail);
             n += snprintf(line + n, sizeof(line) - (size_t)n, "\n");
@@ -514,10 +550,10 @@ static int save_games_file(void)
         return r;
     }
     for (i = 0; i < g_ngames; i++) {
+        int k;
         g_games[i].orig_mode = g_games[i].mode;
-        g_games[i].orig_novsync = g_games[i].novsync;
-        g_games[i].orig_syncflip = g_games[i].syncflip;
-        g_games[i].orig_smooth = g_games[i].smooth;
+        for (k = 0; k < SW_COUNT; k++)
+            g_games[i].orig_sw[k] = g_games[i].sw[k];
     }
     g_file_present = 1;
     /* Re-read what is on disk so the comment blocks and the file order of
@@ -881,10 +917,12 @@ static void draw_games(void)
         fit_text(nm, sizeof(nm), g->name, NAME_MAX_W);
         text(COL_NAME_X, y + 20, name_col, nm);
         text(COL_ID_X, y + 20, C_DIM, g->id);
-        textf(COL_MODE_X, y + 20, game_active(g) ? mode_color(g->mode == M_NONE ? M_NOWAIT : g->mode) : (unsigned)C_DIM,
-              "%s%s%s", (g->mode == M_NONE && (g->novsync || g->syncflip)) ? "" : k_mode_name[g->mode],
-              g->novsync ? ((g->mode == M_NONE) ? "novsync" : "+novsync") : "",
-              game_changed(g) ? " *" : "");
+        {
+            char ov[96];
+            override_text(g, ov, sizeof(ov));
+            textf(COL_MODE_X, y + 20, game_active(g) ? mode_color(g->mode == M_NONE ? M_NOWAIT : g->mode) : (unsigned)C_DIM,
+                  "%s%s", ov, game_changed(g) ? " *" : "");
+        }
     }
     if (g_ngames > LIST_ROWS) {
         /* scrollbar */
@@ -915,7 +953,7 @@ static void draw_popup_box(int w, int h, const char *title)
     text(x + 20, y + 32, C_TEXT, title);
 }
 
-#define PICK_ROWS (M_COUNT + 3)          /* the options + the novsync, syncflip and smooth switches */
+#define PICK_ROWS (M_COUNT + SW_COUNT)   /* the rules, then the switches */
 
 static void draw_modepick(void)
 {
@@ -934,23 +972,18 @@ static void draw_modepick(void)
             text(x + 160, ry + 20, C_DIM, "(current)");
     }
     {
-        int ry = y + 50 + M_COUNT * 30 + 6;
+        int ry = y + 50 + M_COUNT * 30 + 6, k;
         vita2d_draw_rectangle(x + 12, ry - 4, w - 24, 1, C_POPUP_BRD);
-        if (g_pick_sel == M_COUNT)
-            vita2d_draw_rectangle(x + 12, ry, w - 24, 28, C_SEL);
-        textf(x + 24, ry + 20, g->novsync ? C_WARN : C_DIM, "[%s] novsync", g->novsync ? "X" : " ");
-        if (g_pick_sel == M_COUNT + 1)
-            vita2d_draw_rectangle(x + 12, ry + 30, w - 24, 26, C_SEL);
-        textf(x + 24, ry + 50, g->syncflip ? C_WARN : C_DIM, "[%s] syncflip", g->syncflip ? "X" : " ");
-        if (g_pick_sel == M_COUNT + 2)
-            vita2d_draw_rectangle(x + 12, ry + 60, w - 24, 26, C_SEL);
-        textf(x + 24, ry + 80, g->smooth ? C_WARN : C_DIM, "[%s] smooth", g->smooth ? "X" : " ");
-        text(x + 160, ry + 20, C_DIM, "attach to any option (X toggles)");
+        for (k = 0; k < SW_COUNT; k++) {
+            int sy = ry + k * 30;
+            if (g_pick_sel == M_COUNT + k)
+                vita2d_draw_rectangle(x + 12, sy, w - 24, 28, C_SEL);
+            textf(x + 24, sy + 20, g->sw[k] ? C_WARN : C_DIM, "[%s] %s", g->sw[k] ? "X" : " ", k_sw_name[k]);
+        }
+        text(x + 160, ry + 20, C_DIM, "switches: any of these on top of any rule (X toggles)");
     }
     text(x + 20, y + h - 40, C_DIM,
-         g_pick_sel == M_COUNT ? k_novsync_desc :
-         g_pick_sel == M_COUNT + 1 ? k_syncflip_desc :
-         g_pick_sel == M_COUNT + 2 ? k_smooth_desc : k_mode_desc[g_pick_sel]);
+         g_pick_sel >= M_COUNT ? k_sw_desc[g_pick_sel - M_COUNT] : k_mode_desc[g_pick_sel]);
     text(x + 20, y + h - 14, C_DIM, "X choose / toggle   O close");
 }
 
@@ -971,15 +1004,11 @@ static void draw_help(void)
         text(190, y, C_TEXT, k_mode_desc[i]);
         y += 28;
     }
-    textf(70, y, C_WARN, "%-10s", "novsync");
-    text(190, y, C_TEXT, "Same as the nowait option: all vblank waits return at once, like novsync.suprx.");
-    y += ROW_H;
-    textf(70, y, C_WARN, "%-10s", "syncflip");
-    text(190, y, C_TEXT, "Latch each flip at a vblank instead of mid-scan. Against tearing, e.g. together with frameskip.");
-    y += ROW_H;
-    textf(70, y, C_WARN, "%-10s", "smooth");
-    text(190, y, C_TEXT, "With frameskip: space the logic steps evenly instead of in pairs. Against judder, not tearing.");
-    y += 28;
+    for (i = 0; i < SW_COUNT; i++) {
+        textf(70, y, C_WARN, "%-10s", k_sw_name[i]);
+        text(190, y, C_TEXT, k_sw_desc[i]);
+        y += 28;
+    }
     text(70, y + 12, C_DIM, "Changes apply the next time the game is started; no reboot needed.");
     text(70, y + 40, C_DIM, "O close");
 }
@@ -1136,10 +1165,10 @@ static void input_games(unsigned b)
     if (g && (b & SCE_CTRL_RIGHT)) g->mode = (g->mode + 1) % M_COUNT;
     if (g && (b & SCE_CTRL_LEFT))  g->mode = (g->mode + M_COUNT - 1) % M_COUNT;
     if (g && (b & SCE_CTRL_SQUARE)) {
+        int k;
         g->mode = M_NONE;
-        g->novsync = 0;
-        g->syncflip = 0;
-        g->smooth = 0;
+        for (k = 0; k < SW_COUNT; k++)
+            g->sw[k] = 0;
         set_status(C_DIM, "Override removed for %s (press START to save)", g->id);
     }
     if (g && (b & SCE_CTRL_CROSS)) { g_pick_sel = g->mode; g_screen = SCR_MODEPICK; }
@@ -1157,12 +1186,9 @@ static void input_modepick(unsigned b)
     if (b & SCE_CTRL_UP)   g_pick_sel = (g_pick_sel + PICK_ROWS - 1) % PICK_ROWS;
     if (b & SCE_CTRL_DOWN) g_pick_sel = (g_pick_sel + 1) % PICK_ROWS;
     if (b & SCE_CTRL_CROSS) {
-        if (g_pick_sel == M_COUNT) {
-            g_games[g_sel].novsync = !g_games[g_sel].novsync;   /* toggle, stay open */
-        } else if (g_pick_sel == M_COUNT + 1) {
-            g_games[g_sel].syncflip = !g_games[g_sel].syncflip; /* toggle, stay open */
-        } else if (g_pick_sel == M_COUNT + 2) {
-            g_games[g_sel].smooth = !g_games[g_sel].smooth;     /* toggle, stay open */
+        if (g_pick_sel >= M_COUNT) {
+            int k = g_pick_sel - M_COUNT;
+            g_games[g_sel].sw[k] = !g_games[g_sel].sw[k];       /* toggle, stay open */
         } else {
             g_games[g_sel].mode = g_pick_sel;
             g_screen = SCR_GAMES;
