@@ -49,7 +49,11 @@ for how they differ.
 ## Changelog
 
 - **1.7.4 (2026-09-26)** — **Bloodstained tear-free from main memory; `shrink`
-  removed.** The 1.7.3 test build settled it on hardware. Bloodstained's
+  removed.** Confirmed on hardware the same evening: Bloodstained 7770 frames
+  from copies over 146 s at 60 flips a second (one video-memory refusal,
+  then 3 x 2 MB of kernel phycont main memory), Iconoclasts 4131 frames from
+  3 x 2.25 MB of video memory over 89 s, nothing passed through after
+  start-up, nothing dropped, both released cleanly at exit. The 1.7.3 test build settled it on hardware. Bloodstained's
   process had no video memory left at all (even one 2 MB block was refused),
   and the buffers came from the kernel's physically contiguous main-memory
   pool instead: 3 x 2 MB at 0x30500000, the display accepted every one of
