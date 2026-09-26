@@ -48,6 +48,18 @@ for how they differ.
 
 ## Changelog
 
+- **1.7.1 (2026-09-26)** — **`triple` after its first hardware run.** Two
+  facts from the log. Iconoclasts: the driver accepted the copied buffers and
+  every frame was presented from a copy, but the CPU copy measured 51 ms per
+  frame (uncached memory to uncached memory, as the review had warned), which
+  is why the game fell to 15 fps. The copy now goes through the kernel's DMA
+  controller, the same engine the console uses for frame-sized moves, with
+  the CPU path kept only as a counted fallback. Bloodstained: the 6.75 MB
+  video-memory allocation failed (0x80024309, the game leaves too little
+  free), so every flip passed through and nothing changed. When video memory
+  is short the buffers are now taken from physically contiguous main memory,
+  which the display scans just as well. The trace line reports the copy time,
+  the number of CPU fallbacks and which pool is in use.
 - **1.7.0 (2026-09-26)** — **New `triple` switch: tearing-free 60 fps games
   on a 30 Hz output.** Trace evidence (Bloodstained: Curse of the Moon,
   Iconoclasts): one vblank wait and one vsynced flip per frame, no immediate

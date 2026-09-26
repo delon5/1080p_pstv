@@ -365,3 +365,12 @@ submit call. Every failure path passes the original flip through and counts a
 pass-through, reported on the `trace` line. Hard rules kept: no allocation,
 free or file I/O in a hook; the copy is the only new work on a game thread and
 it is bounded (2 MB) and skipped for anything larger.
+
+Hardware, 2026-09-26 (1.7.0 log): submitting a kernel-owned buffer via
+`ksceDisplaySetFrameBuf` from inside the game's syscall works (Iconoclasts:
+607 frames from copies, reason 0). `ksceKernelCopyFromUser` of 2 MB
+uncached-to-uncached costs 51 ms (max 57), i.e. the CPU path is unusable for
+a per-frame copy; 1.7.1 uses `ksceDmacMemcpy` with the CPU path as a counted
+fallback. `SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW` for 6.75 MB fails with
+0x80024309 under Bloodstained; 1.7.1 falls back to
+`SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW` with `ATTR_PHYCONT`, 1 MB aligned.

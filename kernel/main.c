@@ -141,6 +141,7 @@
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/stat.h>
 #include <psp2kern/display.h>
+#include <psp2kern/kernel/dmac.h>
 
 #include "pstv1080p.h"
 
@@ -397,6 +398,8 @@ typedef struct {
     volatile uint32_t  tb_reason_logged;
     volatile uint32_t  tb_fails;    /*   consecutive submit failures */
     volatile uint32_t  tb_failed;   /*   this occupant gave up (8 refusals): retire, end in TB_FAILED */
+    volatile uint32_t  tb_cpu;      /*   1.7.1: copies that fell back to the CPU (DMA refused) */
+    volatile uint32_t  tb_pool;     /*   1.7.1: 1 = CDRAM, 2 = main memory (CDRAM was full) */
     volatile uint32_t  tb_us_max;   /*   copy time, microseconds */
     volatile uint32_t  tb_us_sum;
     volatile uintptr_t tb_last;     /*   base of the slot submitted last (pending until the vblank) */
@@ -919,6 +922,8 @@ static void proc_clear(void)
         g_procs[i].tb_reason_logged = 0;
         g_procs[i].tb_fails = 0;
         g_procs[i].tb_failed = 0;
+        g_procs[i].tb_cpu = 0;
+        g_procs[i].tb_pool = 0;
         g_procs[i].tb_us_max = 0;
         g_procs[i].tb_us_sum = 0;
         g_procs[i].tb_last = 0;
@@ -1392,9 +1397,10 @@ static void trace_profile_tick(void)
              d[PF_WAITSETFB], d[PF_WAITSETFBMULTI], d[PF_GETVCOUNT],
              e->cb_synced ? "yes" : "no", ovr_desc(e->override, e->flags, od, sizeof(od)), (unsigned)g_refresh_hz);
         if (e->tb_uid != 0 || e->tb_state != TB_NONE)
-            klog("trace: triple: state=%u copies=%u passed=%u | copy max=%u us avg=%u us | reason=%u",
+            klog("trace: triple: state=%u copies=%u passed=%u | copy max=%u us avg=%u us | cpu fallbacks=%u pool=%s | reason=%u",
                  (unsigned)e->tb_state, (unsigned)e->tb_copies, (unsigned)e->tb_passes,
                  (unsigned)e->tb_us_max, e->tb_copies ? (unsigned)(e->tb_us_sum / e->tb_copies) : 0u,
+                 (unsigned)e->tb_cpu, e->tb_pool == 2 ? "main" : (e->tb_pool == 1 ? "cdram" : "-"),
                  (unsigned)e->tb_reason);
     }
 }
@@ -1520,6 +1526,7 @@ static inline void tb_new_occupant(proc_entry_t *e)
     else if (e->tb_state == TB_FAILED || e->tb_failed)
         e->tb_state = TB_RETIRING;      /* a verdict never crosses occupants: re-armed or freed clean */
     e->tb_failed = 0;
+    e->tb_cpu = 0;
     e->tb_next = 0;
     e->tb_copies = 0;
     e->tb_passes = 0;
@@ -2389,9 +2396,15 @@ static int triple_present(proc_entry_t *e, const void *pFrameBuf, int sync, int 
     e->tb_next = (slot + 1u) % TB_SLOTS;
 
     t0 = now_us();
-    if (ksceKernelCopyFromUser((void *)target, fb.base, bytes) < 0) {
-        tb_note(e, TBR_COPY_FAILED);
-        goto out_pass;
+    if (ksceDmacMemcpy((void *)target, fb.base, bytes) < 0) {
+        /* 1.7.1: the DMA controller does the 2 MB move without touching the
+         * CPU.  The CPU path is uncached-to-uncached and measured 51 ms per
+         * frame on hardware, so it is a fallback, counted so the log shows it. */
+        e->tb_cpu++;
+        if (ksceKernelCopyFromUser((void *)target, fb.base, bytes) < 0) {
+            tb_note(e, TBR_COPY_FAILED);
+            goto out_pass;
+        }
     }
     {
         uint32_t dt = (uint32_t)(now_us() - t0);
@@ -2498,8 +2511,22 @@ static void triple_tick(void)
         }
         if (uid_alloc_for > 0) {
             void *base = NULL;
+            uint32_t pool = 1;
             SceUID uid = ksceKernelAllocMemBlock("pstv1080p_triple", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_CDRAM_RW,
                                                  TB_SLOTS * TB_SLOT_BYTES, NULL);
+            if (uid < 0) {
+                /* 1.7.1: hardware: Bloodstained leaves too little CDRAM for
+                 * 6.75 MB (0x80024309).  The display scans physically
+                 * contiguous main memory just as well; take that instead. */
+                SceKernelAllocMemBlockKernelOpt opt;
+                memset(&opt, 0, sizeof(opt));
+                opt.size = sizeof(opt);
+                opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+                opt.alignment = 0x100000;
+                uid = ksceKernelAllocMemBlock("pstv1080p_triple", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,
+                                              TB_SLOTS * TB_SLOT_BYTES, &opt);
+                pool = 2;
+            }
             if (uid >= 0 && ksceKernelGetMemBlockBase(uid, &base) < 0) {
                 ksceKernelFreeMemBlock(uid);
                 uid = -1;
@@ -2515,6 +2542,7 @@ static void triple_tick(void)
                 e->tb_shown = 0;
                 e->tb_reason = 0;
                 e->tb_reason_logged = 0;
+                e->tb_pool = pool;
                 e->tb_state = TB_READY;
                 uid = 0;                         /* published */
             } else if (uid < 0 && e->pid == uid_alloc_for) {
@@ -2524,10 +2552,12 @@ static void triple_tick(void)
             if (uid > 0)
                 ksceKernelFreeMemBlock(uid);     /* the slot changed hands meanwhile */
             else if (uid == 0)
-                klog("triple: %s: %u x %u KB of CDRAM at %p, frames are presented from copies from now on",
-                     e->title, (unsigned)TB_SLOTS, (unsigned)(TB_SLOT_BYTES / 1024u), base);
+                klog("triple: %s: %u x %u KB of %s at %p, frames are presented from copies from now on",
+                     e->title, (unsigned)TB_SLOTS, (unsigned)(TB_SLOT_BYTES / 1024u),
+                     pool == 1 ? "CDRAM" : "main memory (CDRAM was full)", base);
             else
-                klog("triple: %s: CDRAM allocation failed 0x%08X, flips pass through", e->title, (unsigned)uid);
+                klog("triple: %s: allocation failed in CDRAM and main memory (0x%08X), flips pass through",
+                     e->title, (unsigned)uid);
         }
     }
 }
